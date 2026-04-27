@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 # sync-deploy.sh
 # Syncs OpenShift deploy changes across Bitbucket repos with per-repo name
-# substitution. Sealed Secrets are never blindly overwritten — encrypted values
-# are blanked on new files so each team re-seals for their own cluster.
+# substitution, image tag preservation, and Sealed Secret handling.
+#
+# Sealed Secret rules:
+#   Modified  → skipped (cluster-specific encryption, re-seal manually)
+#   Added     → if it's a copy of an existing secret (same metadata.name),
+#               the target's own version is copied to the new path.
+#               If truly new, encryptedData is blanked for re-sealing.
+#   Renamed   → target's own sealed secret is moved; if not found, blanked.
+#   Deleted   → deleted normally
+#
+# Image tag rules:
+#   image/imageTag/tag YAML values are NEVER copied from source.
+#   For modified/renamed files, original target values are restored.
+#   For new files no original exists, so source values are kept as-is
+#   and the PR body notes which files contain image references.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,12 +35,6 @@ Usage: sync-deploy.sh [OPTIONS]
 
 Syncs OpenShift deploy repo changes to all configured Bitbucket repos,
 substitutes app/service/namespace names, pushes a branch, and opens a PR.
-
-Sealed Secrets are handled specially:
-  - Modified  → skipped (each cluster keeps its own encrypted values)
-  - Added     → copied with encryptedData blanked (team must re-seal)
-  - Deleted   → deleted in target
-  - Renamed   → renamed; encryptedData blanked (team must re-seal)
 
 Options:
   --from <ref>       Start ref in source repo  (default: HEAD~1)
@@ -77,11 +84,11 @@ for cmd in jq git curl awk; do
 done
 
 # ── Load config ───────────────────────────────────────────────────────────────
-SOURCE_REPO=$(jq -r '.source.repo'           "$CONFIG_FILE")
-SOURCE_SUBS=$(jq -c '.source.substitutions'  "$CONFIG_FILE")
-BASE_BRANCH=$(jq -r '.pr.base_branch // "main"'          "$CONFIG_FILE")
+SOURCE_REPO=$(jq -r '.source.repo'                        "$CONFIG_FILE")
+SOURCE_SUBS=$(jq -c '.source.substitutions'               "$CONFIG_FILE")
+BASE_BRANCH=$(jq -r '.pr.base_branch    // "main"'        "$CONFIG_FILE")
 PR_TITLE_PREFIX=$(jq -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
-TARGET_COUNT=$(jq '.targets | length'        "$CONFIG_FILE")
+TARGET_COUNT=$(jq '.targets | length'                     "$CONFIG_FILE")
 
 mkdir -p "$WORK_DIR"
 
@@ -96,6 +103,23 @@ is_target_included() {
 
 is_text_file()     { grep -qI '' "$1" 2>/dev/null; }
 is_sealed_secret() { is_text_file "$1" && grep -q 'kind:[[:space:]]*SealedSecret' "$1" 2>/dev/null; }
+
+# Extracts metadata.name from a SealedSecret YAML file.
+get_sealed_secret_name() {
+  awk '/^metadata:/{m=1;next} m && /^  name:/{print $2;exit} /^[a-zA-Z]/{m=0}' "$1"
+}
+
+# Finds the first SealedSecret file in a directory tree with a given metadata.name.
+# Optional third argument: path to exclude from the search (to skip the file itself).
+find_sealed_secret_by_name() {
+  local name="$1" dir="$2" exclude="${3:-}"
+  while IFS= read -r -d '' f; do
+    [[ -n "$exclude" && "$f" == "$exclude" ]] && continue
+    is_sealed_secret "$f" || continue
+    [[ "$(get_sealed_secret_name "$f")" == "$name" ]] && echo "$f" && return 0
+  done < <(find "$dir" \( -name "*.yaml" -o -name "*.yml" \) -print0 2>/dev/null)
+  return 1
+}
 
 clone_or_update() {
   local repo="$1" dir="$2"
@@ -114,8 +138,8 @@ clone_or_update() {
   git -C "$dir" config user.name  "Deploy Sync Bot"
 }
 
-# Builds a sed substitution script. Uses jq to sort source values by length
-# (longest first) so that longer values are replaced before any sub-string match.
+# Builds a sed substitution script sorted longest-source-value first to prevent
+# partial-string matches (e.g. "app" clobbering part of "app-service").
 build_sed_script() {
   local src="$1" tgt="$2" sed_script="" sv tv src_esc tgt_esc
   while IFS=$'\t' read -r sv tv; do
@@ -138,8 +162,8 @@ apply_subs() {
   sed -i "$sed_script" "$file"
 }
 
-# Blanks all values under spec.encryptedData, keeping the YAML structure so
-# the developer can identify which keys need to be re-sealed with kubeseal.
+# Blanks all values under spec.encryptedData so the team knows exactly which
+# keys to re-seal with kubeseal for their own cluster.
 strip_encrypted_data() {
   awk '
     /^  encryptedData:/ { in_enc=1; print; next }
@@ -151,8 +175,37 @@ strip_encrypted_data() {
   ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-# Copies a file from source to target dir and applies substitutions.
-# Returns 1 (non-fatal) if source file is missing.
+# After copying a file from source, restores image/imageTag/tag lines from the
+# original target file so environment-specific image tags are never overwritten.
+# Matches by YAML key + indentation level to handle multi-container pods correctly.
+restore_image_lines() {
+  local file="$1" original="$2"
+  [[ -f "$original" ]] || return 0
+  is_text_file "$file" || return 0
+  awk '
+    NR == FNR {
+      if (/^[[:space:]]*(image|imageTag|tag):[[:space:]]/) {
+        key = $0; sub(/:[[:space:]].*$/, "", key)
+        kc[key]++; kl[key, kc[key]] = $0
+      }
+      next
+    }
+    /^[[:space:]]*(image|imageTag|tag):[[:space:]]/ {
+      key = $0; sub(/:[[:space:]].*$/, "", key)
+      ku[key]++
+      if (ku[key] <= kc[key]) { print kl[key, ku[key]]; next }
+    }
+    { print }
+  ' "$original" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
+# Checks whether a file contains any image/imageTag/tag YAML keys.
+has_image_lines() {
+  grep -qE '^[[:space:]]*(image|imageTag|tag):[[:space:]]' "$1" 2>/dev/null
+}
+
+# Copies a file from the source repo to the target dir and applies substitutions.
+# Returns 1 (non-fatal) when the source file is missing.
 copy_and_apply() {
   local src_rel="$1" tgt_rel="$2" tgt_dir="$3" sed_script="$4"
   local src_abs="$SOURCE_DIR/$src_rel"
@@ -253,59 +306,139 @@ for i in $(seq 0 $((TARGET_COUNT - 1))); do
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
     HAS_CHANGES=false
     SEALED_NOTES=()
+    IMAGE_NOTES=()
 
     while IFS=$'\t' read -r status file1 file2; do
-      op="${status:0:1}"          # strip rename similarity score (R095 → R)
-      tgt_file="${file2:-$file1}" # for renames: file2 is the new path
+      op="${status:0:1}"  # strip rename/copy similarity score (R095 → R, C090 → C)
 
       case "$op" in
 
-        D)  # Deletion — safe to mirror regardless of file type
+        # ── Delete ────────────────────────────────────────────────────────────
+        D)
           if [[ -f "$TARGET_DIR/$file1" ]]; then
             git -C "$TARGET_DIR" rm -f "$file1"
             HAS_CHANGES=true
           fi
           ;;
 
-        R)  # Rename — remove old path; copy new path with sealed-secret guard
-          [[ -f "$TARGET_DIR/$file1" ]] && git -C "$TARGET_DIR" rm -f "$file1"
-          if copy_and_apply "$file2" "$file2" "$TARGET_DIR" "$SED_SCRIPT"; then
-            if is_sealed_secret "$TARGET_DIR/$file2"; then
-              strip_encrypted_data "$TARGET_DIR/$file2"
+        # ── Rename ────────────────────────────────────────────────────────────
+        # file1 = old path, file2 = new path
+        R)
+          orig=$(mktemp "$WORK_DIR/.orig_XXXXXX")
+          has_orig=false
+          if [[ -f "$TARGET_DIR/$file1" ]]; then
+            cp "$TARGET_DIR/$file1" "$orig"
+            has_orig=true
+            git -C "$TARGET_DIR" rm -f "$file1"
+          fi
+
+          mkdir -p "$(dirname "$TARGET_DIR/$file2")"
+
+          if is_sealed_secret "$SOURCE_DIR/$file2"; then
+            if $has_orig && is_sealed_secret "$orig"; then
+              # Move the target's own sealed secret to the new path with subs applied
+              cp "$orig" "$TARGET_DIR/$file2"
+              apply_subs "$TARGET_DIR/$file2" "$SED_SCRIPT"
+              SEALED_NOTES+=("- \`[RENAMED]\` \`$file1\` → \`$file2\` — target's own encrypted values moved to new path")
+            else
+              # Old path not in target or was not a sealed secret — blank and warn
+              copy_and_apply "$file2" "$file2" "$TARGET_DIR" "$SED_SCRIPT" || true
+              [[ -f "$TARGET_DIR/$file2" ]] && strip_encrypted_data "$TARGET_DIR/$file2"
               SEALED_NOTES+=("- \`[RENAMED]\` \`$file1\` → \`$file2\` — encryptedData blanked, re-seal for this cluster")
             fi
-            git -C "$TARGET_DIR" add "$file2"
-            HAS_CHANGES=true
-          fi
-          ;;
-
-        M)  # Modification — skip Sealed Secrets entirely; they are cluster-specific
-          if is_sealed_secret "$SOURCE_DIR/$file1"; then
-            SEALED_NOTES+=("- \`[MODIFIED]\` \`$file1\` — **not synced** (cluster-specific encryption); re-seal manually if the secret value changed")
           else
-            copy_and_apply "$file1" "$file1" "$TARGET_DIR" "$SED_SCRIPT"
-            git -C "$TARGET_DIR" add "$file1"
-            HAS_CHANGES=true
+            copy_and_apply "$file2" "$file2" "$TARGET_DIR" "$SED_SCRIPT"
+            # Restore image tags from the old target file (same resource, just moved)
+            $has_orig && restore_image_lines "$TARGET_DIR/$file2" "$orig"
+            if has_image_lines "$TARGET_DIR/$file2"; then
+              IMAGE_NOTES+=("- \`[RENAMED]\` \`$file2\` — image tags kept from \`$file1\`")
+            fi
           fi
+
+          git -C "$TARGET_DIR" add "$file2"
+          HAS_CHANGES=true
+          rm -f "$orig"
           ;;
 
-        A|C|*)  # Addition / copy — carry structure, blank encrypted values
-          if copy_and_apply "$file1" "$file1" "$TARGET_DIR" "$SED_SCRIPT"; then
-            if is_sealed_secret "$TARGET_DIR/$file1"; then
-              strip_encrypted_data "$TARGET_DIR/$file1"
-              SEALED_NOTES+=("- \`[ADDED]\` \`$file1\` — encryptedData blanked, re-seal for this cluster")
+        # ── Modify ────────────────────────────────────────────────────────────
+        M)
+          if is_sealed_secret "$SOURCE_DIR/$file1"; then
+            SEALED_NOTES+=("- \`[MODIFIED]\` \`$file1\` — **not synced** (cluster-specific encryption); re-seal manually if the value changed")
+          else
+            orig=$(mktemp "$WORK_DIR/.orig_XXXXXX")
+            [[ -f "$TARGET_DIR/$file1" ]] && cp "$TARGET_DIR/$file1" "$orig" || true
+
+            copy_and_apply "$file1" "$file1" "$TARGET_DIR" "$SED_SCRIPT"
+            restore_image_lines "$TARGET_DIR/$file1" "$orig"
+            rm -f "$orig"
+
+            if has_image_lines "$TARGET_DIR/$file1"; then
+              IMAGE_NOTES+=("- \`[MODIFIED]\` \`$file1\` — image tags preserved from target")
             fi
             git -C "$TARGET_DIR" add "$file1"
             HAS_CHANGES=true
           fi
           ;;
+
+        # ── Add / Copy ────────────────────────────────────────────────────────
+        # For git C (copy): file1=original path, file2=new path. Use file2 as dest.
+        # For git A (add): file1 is the only path.
+        A|C|*)
+          new_file="${file2:-$file1}"
+
+          if is_sealed_secret "$SOURCE_DIR/$new_file"; then
+            src_name=$(get_sealed_secret_name "$SOURCE_DIR/$new_file")
+
+            # Determine if this is a copy of an existing sealed secret (same
+            # metadata.name already exists elsewhere in the source repo) or truly new.
+            src_other=$(find_sealed_secret_by_name \
+              "$src_name" "$SOURCE_DIR" "$SOURCE_DIR/$new_file" || true)
+
+            mkdir -p "$(dirname "$TARGET_DIR/$new_file")"
+
+            if [[ -n "$src_other" ]]; then
+              # It's a copy to a new overlay. Find the same secret in the target
+              # by applying substitutions to the secret name (e.g. source-app →
+              # app-a) so we match the target's naming convention.
+              tgt_name=$(echo "$src_name" | sed "$SED_SCRIPT")
+              tgt_existing=$(find_sealed_secret_by_name "$tgt_name" "$TARGET_DIR" || true)
+
+              if [[ -n "$tgt_existing" ]]; then
+                cp "$tgt_existing" "$TARGET_DIR/$new_file"
+                apply_subs "$TARGET_DIR/$new_file" "$SED_SCRIPT"
+                SEALED_NOTES+=("- \`[COPIED]\` \`$new_file\` — target's own sealed secret copied from \`${tgt_existing#"$TARGET_DIR/"}\` (encrypted values preserved)")
+              else
+                copy_and_apply "$new_file" "$new_file" "$TARGET_DIR" "$SED_SCRIPT"
+                strip_encrypted_data "$TARGET_DIR/$new_file"
+                SEALED_NOTES+=("- \`[COPIED]\` \`$new_file\` — no matching secret found in target; encryptedData blanked, re-seal for this cluster")
+              fi
+            else
+              # Truly new secret — carry the structure, blank the encrypted values
+              copy_and_apply "$new_file" "$new_file" "$TARGET_DIR" "$SED_SCRIPT"
+              strip_encrypted_data "$TARGET_DIR/$new_file"
+              SEALED_NOTES+=("- \`[ADDED]\` \`$new_file\` — new secret; encryptedData blanked, re-seal for this cluster")
+            fi
+
+            git -C "$TARGET_DIR" add "$new_file"
+            HAS_CHANGES=true
+
+          else
+            if copy_and_apply "$new_file" "$new_file" "$TARGET_DIR" "$SED_SCRIPT"; then
+              if has_image_lines "$TARGET_DIR/$new_file"; then
+                IMAGE_NOTES+=("- \`[ADDED]\` \`$new_file\` — new file; image tags copied from source (update if needed)")
+              fi
+              git -C "$TARGET_DIR" add "$new_file"
+              HAS_CHANGES=true
+            fi
+          fi
+          ;;
+
       esac
     done <<< "$CHANGED_FILES"
 
     if ! $HAS_CHANGES; then
       if [[ ${#SEALED_NOTES[@]} -gt 0 ]]; then
-        log_warn "$TARGET_NAME: only sealed secret changes (no push needed)"
-        log_warn "Manual action required for:"
+        log_warn "$TARGET_NAME: only sealed secret changes (no commit needed)"
         printf '  %s\n' "${SEALED_NOTES[@]}"
       else
         log_warn "$TARGET_NAME: no effective changes — skipping"
@@ -318,7 +451,7 @@ for i in $(seq 0 $((TARGET_COUNT - 1))); do
       "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")"
     git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH"
 
-    # Build optional sealed-secret warning block for PR body
+    # ── Build PR body ─────────────────────────────────────────────────────────
     SEALED_SECTION=""
     if [[ ${#SEALED_NOTES[@]} -gt 0 ]]; then
       SEALED_SECTION="
@@ -327,7 +460,18 @@ for i in $(seq 0 $((TARGET_COUNT - 1))); do
 
 $(printf '%s\n' "${SEALED_NOTES[@]}")
 
-Run \`kubeseal\` to encrypt the values for this cluster before merging."
+Run \`kubeseal\` to encrypt values for this cluster before merging."
+    fi
+
+    IMAGE_SECTION=""
+    if [[ ${#IMAGE_NOTES[@]} -gt 0 ]]; then
+      IMAGE_SECTION="
+
+### 🏷️ Image tags
+
+$(printf '%s\n' "${IMAGE_NOTES[@]}")
+
+Image tags are environment-specific and were not copied from source."
     fi
 
     PR_BODY="## Deploy Sync
@@ -342,7 +486,7 @@ Automated sync from \`${SOURCE_REPO}\`
 | **Timestamp**   | \`${TIMESTAMP}\` |
 
 ### Changed files
-${CHANGED_FILES_MD}${SEALED_SECTION}
+${CHANGED_FILES_MD}${SEALED_SECTION}${IMAGE_SECTION}
 
 ---
 *Auto-generated by sync-deploy.sh — review before merging.*"
