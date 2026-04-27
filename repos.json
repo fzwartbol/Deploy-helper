@@ -1,0 +1,37 @@
+{
+  "source": {
+    "repo": "your-org/source-deploy-repo",
+    "substitutions": {
+      "app_name":       "source-app",
+      "namespace":      "source-namespace",
+      "service_account":"source-sa",
+      "image_name":     "source-image"
+    }
+  },
+  "pr": {
+    "base_branch":  "main",
+    "title_prefix": "chore(sync): "
+  },
+  "targets": [
+    {
+      "name": "app-a",
+      "repo": "your-org/app-a-deploy",
+      "substitutions": {
+        "app_name":       "app-a",
+        "namespace":      "ns-a",
+        "service_account":"sa-a",
+        "image_name":     "image-a"
+      }
+    },
+    {
+      "name": "app-b",
+      "repo": "your-org/app-b-deploy",
+      "substitutions": {
+        "app_name":       "app-b",
+        "namespace":      "ns-b",
+        "service_account":"sa-b",
+        "image_name":     "image-b"
+      }
+    }
+  ]
+}
