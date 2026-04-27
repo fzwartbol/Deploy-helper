@@ -251,6 +251,98 @@ create_bitbucket_pr() {
   fi
 }
 
+# ── Interactive repo-selection menu ──────────────────────────────────────────
+# Shown when --targets is not supplied and stdin is a terminal.
+# Returns a comma-separated list of selected target names via stdout.
+pick_targets() {
+  local -a names=() repos=()
+  local i
+  for ((i=0; i<TARGET_COUNT; i++)); do
+    names+=("$(jq -r ".targets[$i].name" "$CONFIG_FILE")")
+    repos+=("$(jq -r ".targets[$i].repo" "$CONFIG_FILE")")
+  done
+
+  local n=${#names[@]}
+  if [[ $n -eq 0 ]]; then
+    log_error "No targets configured in $CONFIG_FILE"
+    exit 1
+  fi
+
+  local -a sel=()
+  for ((i=0; i<n; i++)); do sel[$i]=0; done
+  local cursor=0
+  # 3 header lines + n repo lines + 2 footer lines
+  local total=$(( n + 5 ))
+
+  # Redraws the menu in-place using ANSI cursor-up + erase-line sequences.
+  _render() {
+    printf '\033[%dA' "$total"
+    printf '\033[K\033[1m  Repos to sync\033[0m\n'
+    printf '\033[K  \033[2m↑/↓ navigate   SPACE toggle   A all   N none   ENTER confirm   Q quit\033[0m\n'
+    printf '\033[K\n'
+    for ((i=0; i<n; i++)); do
+      local mark="[ ]"; [[ ${sel[$i]} -eq 1 ]] && mark="[\033[32m✓\033[0m]"
+      if [[ $i -eq $cursor ]]; then
+        printf '\033[K  \033[1;36m▶ %b  %-30s  \033[2m%s\033[0m\n' "$mark" "${names[$i]}" "${repos[$i]}"
+      else
+        printf '\033[K    %b  %-30s  \033[2m%s\033[0m\n' "$mark" "${names[$i]}" "${repos[$i]}"
+      fi
+    done
+    local sel_count=0
+    for ((i=0; i<n; i++)); do [[ ${sel[$i]} -eq 1 ]] && sel_count=$(( sel_count + 1 )) || true; done
+    printf '\033[K\n'
+    printf '\033[K  \033[1m%d\033[0m of %d repo(s) selected\n' "$sel_count" "$n"
+  }
+
+  printf '\n%.0s' $(seq 1 "$total")
+  tput civis 2>/dev/null || true
+  _render
+
+  local key seq
+  while true; do
+    IFS= read -r -s -n1 key 2>/dev/null || key=""
+    if [[ "$key" == $'\x1b' ]]; then
+      IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
+      case "$seq" in
+        '[A') [[ $cursor -gt 0 ]]         && cursor=$(( cursor - 1 )) ;;
+        '[B') [[ $cursor -lt $(( n-1 )) ]] && cursor=$(( cursor + 1 )) ;;
+      esac
+    else
+      case "$key" in
+        ' ') sel[$cursor]=$(( 1 - sel[$cursor] )) ;;
+        'a'|'A') for ((i=0; i<n; i++)); do sel[$i]=1; done ;;
+        'n'|'N') for ((i=0; i<n; i++)); do sel[$i]=0; done ;;
+        '')      break ;;   # Enter
+        'q'|'Q') tput cnorm 2>/dev/null || true; echo ""; log_warn "Aborted"; exit 0 ;;
+      esac
+    fi
+    _render
+  done
+
+  tput cnorm 2>/dev/null || true
+
+  local -a result=()
+  for ((i=0; i<n; i++)); do
+    [[ ${sel[$i]} -eq 1 ]] && result+=("${names[$i]}") || true
+  done
+
+  if [[ ${#result[@]} -eq 0 ]]; then
+    echo ""
+    log_warn "No repos selected — exiting"
+    exit 0
+  fi
+
+  printf '\n  \033[1mSyncing:\033[0m %s\n\n' "$(IFS=', '; echo "${result[*]}")"
+
+  local IFS=','
+  echo "${result[*]}"
+}
+
+# Show menu when --targets was not explicitly passed and we have a real terminal
+if [[ "$FILTER_TARGETS" == "all" ]] && [[ -t 0 ]]; then
+  FILTER_TARGETS=$(pick_targets)
+fi
+
 # ── Clone / update source ─────────────────────────────────────────────────────
 log_section "Source: $SOURCE_REPO  ($FROM_REF → $TO_REF)"
 SOURCE_DIR="$WORK_DIR/source"
