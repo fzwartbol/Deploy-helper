@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Syncs changes from one OpenShift deploy repo to all configured target repos,
-# applying per-repo name substitutions, and opens a GitHub PR for each.
+# sync-deploy.sh
+# Syncs OpenShift deploy changes across Bitbucket repos with per-repo name
+# substitution. Sealed Secrets are never blindly overwritten — encrypted values
+# are blanked on new files so each team re-seals for their own cluster.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,19 +20,26 @@ log_section() { echo -e "\n${BLUE}==> $*${NC}"; }
 usage() { cat <<'EOF'
 Usage: sync-deploy.sh [OPTIONS]
 
-Syncs OpenShift deploy repo changes to all configured target repos,
+Syncs OpenShift deploy repo changes to all configured Bitbucket repos,
 substitutes app/service/namespace names, pushes a branch, and opens a PR.
+
+Sealed Secrets are handled specially:
+  - Modified  → skipped (each cluster keeps its own encrypted values)
+  - Added     → copied with encryptedData blanked (team must re-seal)
+  - Deleted   → deleted in target
+  - Renamed   → renamed; encryptedData blanked (team must re-seal)
 
 Options:
   --from <ref>       Start ref in source repo  (default: HEAD~1)
   --to <ref>         End ref in source repo    (default: HEAD)
   --targets <names>  Comma-separated names from repos.json, or "all" (default: all)
-  --dry-run          Show what would happen without cloning or pushing
+  --dry-run          Preview changes without cloning or pushing
   --config <file>    Path to config file       (default: ./repos.json)
   -h, --help         Show this help
 
 Environment:
-  GITHUB_TOKEN  GitHub token with repo + pull_request write permissions
+  BITBUCKET_USER   Bitbucket username
+  BITBUCKET_TOKEN  Bitbucket app password with repo + PR write access
 
 Examples:
   sync-deploy.sh
@@ -61,39 +70,38 @@ done
 
 # ── Validation ────────────────────────────────────────────────────────────────
 [[ -f "$CONFIG_FILE" ]] || { log_error "Config not found: $CONFIG_FILE"; exit 1; }
-[[ -n "${GITHUB_TOKEN:-}" ]] || { log_error "GITHUB_TOKEN is not set"; exit 1; }
-for cmd in jq git curl; do
+[[ -n "${BITBUCKET_USER:-}" ]]  || { log_error "BITBUCKET_USER is not set";  exit 1; }
+[[ -n "${BITBUCKET_TOKEN:-}" ]] || { log_error "BITBUCKET_TOKEN is not set"; exit 1; }
+for cmd in jq git curl awk; do
   command -v "$cmd" >/dev/null || { log_error "'$cmd' is required but not installed"; exit 1; }
 done
 
 # ── Load config ───────────────────────────────────────────────────────────────
-SOURCE_REPO=$(jq -r '.source.repo' "$CONFIG_FILE")
-SOURCE_SUBS=$(jq -c '.source.substitutions' "$CONFIG_FILE")
-BASE_BRANCH=$(jq -r '.pr.base_branch // "main"' "$CONFIG_FILE")
+SOURCE_REPO=$(jq -r '.source.repo'           "$CONFIG_FILE")
+SOURCE_SUBS=$(jq -c '.source.substitutions'  "$CONFIG_FILE")
+BASE_BRANCH=$(jq -r '.pr.base_branch // "main"'          "$CONFIG_FILE")
 PR_TITLE_PREFIX=$(jq -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
-TARGET_COUNT=$(jq '.targets | length' "$CONFIG_FILE")
+TARGET_COUNT=$(jq '.targets | length'        "$CONFIG_FILE")
 
 mkdir -p "$WORK_DIR"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 is_target_included() {
-  local name="$1"
   [[ "$FILTER_TARGETS" == "all" ]] && return 0
   IFS=',' read -ra arr <<< "$FILTER_TARGETS"
-  for t in "${arr[@]}"; do [[ "$t" == "$name" ]] && return 0; done
+  for t in "${arr[@]}"; do [[ "$t" == "$1" ]] && return 0; done
   return 1
 }
 
-is_text_file() {
-  grep -qI '' "$1" 2>/dev/null
-}
+is_text_file()     { grep -qI '' "$1" 2>/dev/null; }
+is_sealed_secret() { is_text_file "$1" && grep -q 'kind:[[:space:]]*SealedSecret' "$1" 2>/dev/null; }
 
 clone_or_update() {
   local repo="$1" dir="$2"
-  local url="https://x-access-token:${GITHUB_TOKEN}@github.com/${repo}.git"
+  local url="https://${BITBUCKET_USER}:${BITBUCKET_TOKEN}@bitbucket.org/${repo}.git"
   if [[ -d "$dir/.git" ]]; then
-    log_info "Updating local clone of $repo"
+    log_info "Updating $repo"
     git -C "$dir" remote set-url origin "$url"
     git -C "$dir" fetch origin
     git -C "$dir" checkout "$BASE_BRANCH"
@@ -106,134 +114,130 @@ clone_or_update() {
   git -C "$dir" config user.name  "Deploy Sync Bot"
 }
 
-# Returns a sed script that replaces all source substitution values with target values.
-# Longest source values are substituted first to avoid partial-match conflicts.
+# Builds a sed substitution script. Uses jq to sort source values by length
+# (longest first) so that longer values are replaced before any sub-string match.
 build_sed_script() {
-  local src_subs="$1" tgt_subs="$2"
-  local -a pairs=()
-
-  while IFS= read -r key; do
-    local src_val tgt_val
-    src_val=$(jq -r --arg k "$key" '.[$k]' <<< "$src_subs")
-    tgt_val=$(jq -r --arg k "$key" '.[$k]' <<< "$tgt_subs")
-    [[ "$src_val" == "null" || "$tgt_val" == "null" || "$src_val" == "$tgt_val" ]] && continue
-    pairs+=("${#src_val}:${src_val}:${tgt_val}")
-  done < <(jq -r 'keys[]' <<< "$src_subs")
-
-  # Sort by source value length descending to avoid partial substitutions
-  local sed_script=""
-  while IFS= read -r entry; do
-    local rest="${entry#*:}"
-    local sv="${rest%%:*}"
-    local tv="${rest#*:}"
-    local src_esc tgt_esc
+  local src="$1" tgt="$2" sed_script="" sv tv src_esc tgt_esc
+  while IFS=$'\t' read -r sv tv; do
+    [[ -z "$sv" || -z "$tv" ]] && continue
     src_esc=$(printf '%s' "$sv" | sed 's/[[\.*^$()+?{|]/\\&/g')
     tgt_esc=$(printf '%s' "$tv" | sed 's/[&/\\]/\\&/g')
     sed_script+="s/${src_esc}/${tgt_esc}/g;"
-  done < <(printf '%s\n' "${pairs[@]}" | sort -t: -k1 -rn)
-
+  done < <(jq -rn --argjson s "$src" --argjson t "$tgt" \
+    '$s | to_entries
+     | map(select($t[.key] != null and .value != $t[.key]))
+     | sort_by(.value | length) | reverse
+     | .[] | [.value, $t[.key]] | @tsv')
   echo "$sed_script"
 }
 
-apply_subs_to_file() {
+apply_subs() {
   local file="$1" sed_script="$2"
   [[ -z "$sed_script" ]] && return 0
-  if ! is_text_file "$file"; then
-    log_warn "Skipping binary file: $file"
-    return 0
-  fi
+  is_text_file "$file" || { log_warn "Skipping binary: $(basename "$file")"; return 0; }
   sed -i "$sed_script" "$file"
 }
 
-sync_file_to_target() {
-  local src_path="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
-  local src_abs="$SOURCE_DIR/$src_path"
-  local tgt_abs="$tgt_dir/$tgt_path"
+# Blanks all values under spec.encryptedData, keeping the YAML structure so
+# the developer can identify which keys need to be re-sealed with kubeseal.
+strip_encrypted_data() {
+  awk '
+    /^  encryptedData:/ { in_enc=1; print; next }
+    in_enc && /^    [^[:space:]]/ {
+      sub(/:[[:space:]].*$/, ": \"\"  # TODO: kubeseal for this cluster")
+      print; next
+    }
+    { in_enc=0; print }
+  ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+# Copies a file from source to target dir and applies substitutions.
+# Returns 1 (non-fatal) if source file is missing.
+copy_and_apply() {
+  local src_rel="$1" tgt_rel="$2" tgt_dir="$3" sed_script="$4"
+  local src_abs="$SOURCE_DIR/$src_rel"
+  local tgt_abs="$tgt_dir/$tgt_rel"
   if [[ ! -f "$src_abs" ]]; then
-    log_warn "Source file missing: $src_path — skipping"
-    return 0
+    log_warn "Source missing: $src_rel — skipping"
+    return 1
   fi
   mkdir -p "$(dirname "$tgt_abs")"
   cp "$src_abs" "$tgt_abs"
-  apply_subs_to_file "$tgt_abs" "$sed_script"
-  git -C "$tgt_dir" add "$tgt_path"
+  apply_subs "$tgt_abs" "$sed_script"
 }
 
-create_github_pr() {
+create_bitbucket_pr() {
   local repo="$1" branch="$2" title="$3" body="$4"
-  local payload
+  local payload response http_code body_json
   payload=$(jq -n \
-    --arg title "$title" \
-    --arg body  "$body"  \
-    --arg head  "$branch" \
-    --arg base  "$BASE_BRANCH" \
-    '{title:$title, body:$body, head:$head, base:$base}')
+    --arg title  "$title"       \
+    --arg body   "$body"        \
+    --arg branch "$branch"      \
+    --arg base   "$BASE_BRANCH" \
+    '{title:$title, description:$body,
+      source:{branch:{name:$branch}},
+      destination:{branch:{name:$base}},
+      close_source_branch:true}')
 
-  local response http_code
   response=$(curl -s -w "\n%{http_code}" -X POST \
-    -H "Authorization: token $GITHUB_TOKEN" \
-    -H "Accept: application/vnd.github.v3+json" \
-    "https://api.github.com/repos/$repo/pulls" \
+    -u "${BITBUCKET_USER}:${BITBUCKET_TOKEN}" \
+    -H "Content-Type: application/json" \
+    "https://api.bitbucket.org/2.0/repositories/${repo}/pullrequests" \
     -d "$payload")
 
-  http_code=$(tail -n1 <<< "$response")
-  local body_json
-  body_json=$(head -n -1 <<< "$response")
+  http_code=$(tail  -n1  <<< "$response")
+  body_json=$(head  -n-1 <<< "$response")
 
   if [[ "$http_code" == "201" ]]; then
-    jq -r '.html_url' <<< "$body_json"
-  elif [[ "$http_code" == "422" ]] && grep -q "already exists" <<< "$body_json"; then
-    log_warn "PR already exists for branch $branch on $repo — skipping PR creation"
-    jq -r '.errors[0].message // "already exists"' <<< "$body_json" || true
+    jq -r '.links.html.href' <<< "$body_json"
+  elif grep -q "already exists" <<< "$body_json" 2>/dev/null; then
+    log_warn "PR already open for branch $branch on $repo — skipping"
   else
-    log_error "GitHub API error $http_code: $(jq -r '.message // .' <<< "$body_json")"
+    log_error "Bitbucket API $http_code: $(jq -r '.error.message // .' <<< "$body_json")"
     return 1
   fi
 }
 
 # ── Clone / update source ─────────────────────────────────────────────────────
-log_section "Source: $SOURCE_REPO ($FROM_REF → $TO_REF)"
+log_section "Source: $SOURCE_REPO  ($FROM_REF → $TO_REF)"
 SOURCE_DIR="$WORK_DIR/source"
 
 if $DRY_RUN; then
   log_info "[DRY RUN] Would clone $SOURCE_REPO and diff $FROM_REF..$TO_REF"
-  CHANGED_FILES="M	example/deployment.yaml
-M	example/service.yaml"
+  CHANGED_FILES=$'M\texample/deployment.yaml\nA\tsecrets/new-secret.yaml\nD\texample/old.yaml'
 else
   clone_or_update "$SOURCE_REPO" "$SOURCE_DIR"
-  CHANGED_FILES=$(git -C "$SOURCE_DIR" diff --name-status "$FROM_REF" "$TO_REF" || true)
+  CHANGED_FILES=$(git -C "$SOURCE_DIR" diff --find-renames --name-status "$FROM_REF" "$TO_REF" || true)
 fi
 
-if [[ -z "$CHANGED_FILES" ]]; then
-  log_warn "No changes found between $FROM_REF and $TO_REF in $SOURCE_REPO"
-  exit 0
-fi
+[[ -n "$CHANGED_FILES" ]] || { log_warn "No changes between $FROM_REF and $TO_REF"; exit 0; }
 
 log_info "Changed files:"
-while IFS=$'\t' read -r status file rest; do
-  printf "  [%s] %s\n" "$status" "${rest:-$file}"
+while IFS=$'\t' read -r status f1 f2; do
+  printf "  [%s] %s\n" "$status" "${f2:-$f1}"
 done <<< "$CHANGED_FILES"
 
-# Pre-build human-readable change list for PR body
-CHANGED_FILES_MD=$(while IFS=$'\t' read -r s f r; do printf '- `[%s]` `%s`\n' "$s" "${r:-$f}"; done <<< "$CHANGED_FILES")
+CHANGED_FILES_MD=$(while IFS=$'\t' read -r s f1 f2; do
+  printf '- `[%s]` `%s`\n' "$s" "${f2:-$f1}"
+done <<< "$CHANGED_FILES")
 
 # ── Process each target ───────────────────────────────────────────────────────
 PASS=()
 FAIL=()
 
 for i in $(seq 0 $((TARGET_COUNT - 1))); do
-  TARGET_NAME=$(jq -r ".targets[$i].name" "$CONFIG_FILE")
-  TARGET_REPO=$(jq -r ".targets[$i].repo" "$CONFIG_FILE")
+  TARGET_NAME=$(jq -r ".targets[$i].name"          "$CONFIG_FILE")
+  TARGET_REPO=$(jq -r ".targets[$i].repo"          "$CONFIG_FILE")
   TARGET_SUBS=$(jq -c ".targets[$i].substitutions" "$CONFIG_FILE")
 
   is_target_included "$TARGET_NAME" || continue
 
-  log_section "[$((i+1))/$TARGET_COUNT] $TARGET_NAME  →  $TARGET_REPO"
+  log_section "[$((i+1))/$TARGET_COUNT] $TARGET_NAME → $TARGET_REPO"
 
   if $DRY_RUN; then
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
     log_info "[DRY RUN] Branch : $SYNC_BRANCH"
-    log_info "[DRY RUN] Sed    : ${SED_SCRIPT:-<no substitutions>}"
+    log_info "[DRY RUN] Subs   : ${SED_SCRIPT:-<none>}"
     log_info "[DRY RUN] Would push and open PR against $BASE_BRANCH"
     PASS+=("$TARGET_NAME (dry-run)")
     continue
@@ -248,59 +252,105 @@ for i in $(seq 0 $((TARGET_COUNT - 1))); do
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
     HAS_CHANGES=false
+    SEALED_NOTES=()
 
     while IFS=$'\t' read -r status file1 file2; do
-      case "${status:0:1}" in
-        D)
+      op="${status:0:1}"          # strip rename similarity score (R095 → R)
+      tgt_file="${file2:-$file1}" # for renames: file2 is the new path
+
+      case "$op" in
+
+        D)  # Deletion — safe to mirror regardless of file type
           if [[ -f "$TARGET_DIR/$file1" ]]; then
             git -C "$TARGET_DIR" rm -f "$file1"
             HAS_CHANGES=true
           fi
           ;;
-        R)
-          # file1 = old path, file2 = new path
+
+        R)  # Rename — remove old path; copy new path with sealed-secret guard
           [[ -f "$TARGET_DIR/$file1" ]] && git -C "$TARGET_DIR" rm -f "$file1"
-          sync_file_to_target "$file2" "$file2" "$TARGET_DIR" "$SED_SCRIPT"
-          HAS_CHANGES=true
+          if copy_and_apply "$file2" "$file2" "$TARGET_DIR" "$SED_SCRIPT"; then
+            if is_sealed_secret "$TARGET_DIR/$file2"; then
+              strip_encrypted_data "$TARGET_DIR/$file2"
+              SEALED_NOTES+=("- \`[RENAMED]\` \`$file1\` → \`$file2\` — encryptedData blanked, re-seal for this cluster")
+            fi
+            git -C "$TARGET_DIR" add "$file2"
+            HAS_CHANGES=true
+          fi
           ;;
-        A|M|C|*)
-          sync_file_to_target "$file1" "$file1" "$TARGET_DIR" "$SED_SCRIPT"
-          HAS_CHANGES=true
+
+        M)  # Modification — skip Sealed Secrets entirely; they are cluster-specific
+          if is_sealed_secret "$SOURCE_DIR/$file1"; then
+            SEALED_NOTES+=("- \`[MODIFIED]\` \`$file1\` — **not synced** (cluster-specific encryption); re-seal manually if the secret value changed")
+          else
+            copy_and_apply "$file1" "$file1" "$TARGET_DIR" "$SED_SCRIPT"
+            git -C "$TARGET_DIR" add "$file1"
+            HAS_CHANGES=true
+          fi
+          ;;
+
+        A|C|*)  # Addition / copy — carry structure, blank encrypted values
+          if copy_and_apply "$file1" "$file1" "$TARGET_DIR" "$SED_SCRIPT"; then
+            if is_sealed_secret "$TARGET_DIR/$file1"; then
+              strip_encrypted_data "$TARGET_DIR/$file1"
+              SEALED_NOTES+=("- \`[ADDED]\` \`$file1\` — encryptedData blanked, re-seal for this cluster")
+            fi
+            git -C "$TARGET_DIR" add "$file1"
+            HAS_CHANGES=true
+          fi
           ;;
       esac
     done <<< "$CHANGED_FILES"
 
     if ! $HAS_CHANGES; then
-      log_warn "No effective changes for $TARGET_NAME — skipping"
+      if [[ ${#SEALED_NOTES[@]} -gt 0 ]]; then
+        log_warn "$TARGET_NAME: only sealed secret changes (no push needed)"
+        log_warn "Manual action required for:"
+        printf '  %s\n' "${SEALED_NOTES[@]}"
+      else
+        log_warn "$TARGET_NAME: no effective changes — skipping"
+      fi
       exit 0
     fi
 
-    COMMIT_MSG="$(printf 'chore(sync): deploy changes from %s\n\nSource: %s\nRef:    %s → %s\nRun:    %s' \
+    git -C "$TARGET_DIR" commit -m "$(printf \
+      'chore(sync): deploy changes from %s\n\nSource: %s\nRef:    %s → %s\nRun:    %s' \
       "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")"
-    git -C "$TARGET_DIR" commit -m "$COMMIT_MSG"
     git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH"
 
-    PR_TITLE="${PR_TITLE_PREFIX}sync from ${SOURCE_REPO##*/} (${TO_REF})"
+    # Build optional sealed-secret warning block for PR body
+    SEALED_SECTION=""
+    if [[ ${#SEALED_NOTES[@]} -gt 0 ]]; then
+      SEALED_SECTION="
+
+### ⚠️ Sealed Secrets — manual action required
+
+$(printf '%s\n' "${SEALED_NOTES[@]}")
+
+Run \`kubeseal\` to encrypt the values for this cluster before merging."
+    fi
+
     PR_BODY="## Deploy Sync
 
-Automated sync from [\`${SOURCE_REPO}\`](https://github.com/${SOURCE_REPO})
+Automated sync from \`${SOURCE_REPO}\`
 
 | | |
 |---|---|
 | **Source repo** | \`${SOURCE_REPO}\` |
-| **Ref range** | \`${FROM_REF}\` → \`${TO_REF}\` |
-| **Sync branch** | \`${SYNC_BRANCH}\` |
-| **Timestamp** | \`${TIMESTAMP}\` |
+| **Ref range**   | \`${FROM_REF}\` → \`${TO_REF}\` |
+| **Branch**      | \`${SYNC_BRANCH}\` |
+| **Timestamp**   | \`${TIMESTAMP}\` |
 
 ### Changed files
-
-${CHANGED_FILES_MD}
+${CHANGED_FILES_MD}${SEALED_SECTION}
 
 ---
-*Auto-generated by sync-deploy.sh — review substitutions before merging.*"
+*Auto-generated by sync-deploy.sh — review before merging.*"
 
-    PR_URL=$(create_github_pr "$TARGET_REPO" "$SYNC_BRANCH" "$PR_TITLE" "$PR_BODY")
-    log_info "PR: $PR_URL"
+    PR_URL=$(create_bitbucket_pr "$TARGET_REPO" "$SYNC_BRANCH" \
+      "${PR_TITLE_PREFIX}sync from ${SOURCE_REPO##*/} (${TO_REF})" "$PR_BODY")
+    [[ -n "${PR_URL:-}" ]] && log_info "PR: $PR_URL"
+
   ) && PASS+=("$TARGET_NAME") || { log_error "FAILED: $TARGET_NAME"; FAIL+=("$TARGET_NAME"); }
 done
 
