@@ -60,13 +60,15 @@ EOF
 # ── Argument parsing ──────────────────────────────────────────────────────────
 FROM_REF="HEAD~1"
 TO_REF="HEAD"
+FROM_EXPLICIT=false
+TO_EXPLICIT=false
 DRY_RUN=false
 FILTER_TARGETS="all"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --from)    FROM_REF="$2";       shift 2 ;;
-    --to)      TO_REF="$2";         shift 2 ;;
+    --from)    FROM_REF="$2"; FROM_EXPLICIT=true; shift 2 ;;
+    --to)      TO_REF="$2";   TO_EXPLICIT=true;   shift 2 ;;
     --targets) FILTER_TARGETS="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true;        shift   ;;
     --config)  CONFIG_FILE="$2";    shift 2 ;;
@@ -275,7 +277,7 @@ pick_targets() {
   local total=$(( n + 5 ))
 
   # Redraws the menu in-place using ANSI cursor-up + erase-line sequences.
-  _render() {
+  _pt_render() {
     printf '\033[%dA' "$total"
     printf '\033[K\033[1m  Repos to sync\033[0m\n'
     printf '\033[K  \033[2m↑/↓ navigate   SPACE toggle   A all   N none   ENTER confirm   Q quit\033[0m\n'
@@ -296,7 +298,7 @@ pick_targets() {
 
   printf '\n%.0s' $(seq 1 "$total")
   tput civis 2>/dev/null || true
-  _render
+  _pt_render
 
   local key seq
   while true; do
@@ -316,7 +318,7 @@ pick_targets() {
         'q'|'Q') tput cnorm 2>/dev/null || true; echo ""; log_warn "Aborted"; exit 0 ;;
       esac
     fi
-    _render
+    _pt_render
   done
 
   tput cnorm 2>/dev/null || true
@@ -338,9 +340,121 @@ pick_targets() {
   echo "${result[*]}"
 }
 
-# Show menu when --targets was not explicitly passed and we have a real terminal
-if [[ "$FILTER_TARGETS" == "all" ]] && [[ -t 0 ]]; then
-  FILTER_TARGETS=$(pick_targets)
+# Fetches tags from the source repo via git ls-remote (no full clone needed).
+# Outputs one tag per line, sorted newest-first by version order.
+fetch_source_tags() {
+  local url="https://${BITBUCKET_USER}:${BITBUCKET_TOKEN}@bitbucket.org/${SOURCE_REPO}.git"
+  git ls-remote --tags "$url" 2>/dev/null \
+    | grep -v '\^{}' \
+    | awk '{print $2}' \
+    | sed 's|refs/tags/||' \
+    | sort -Vr 2>/dev/null || sort -r
+}
+
+# Single-select scrollable ref picker.
+# Args: title  default_label  default_value  [tag …]
+# Prints the chosen ref value to stdout.
+pick_ref() {
+  local title="$1" default_label="$2" default_value="$3"
+  shift 3
+  local -a labels=("$default_label") values=("$default_value")
+  for t in "$@"; do labels+=("$t"); values+=("$t"); done
+
+  local n=${#labels[@]}
+  local view=$(( n < 12 ? n : 12 ))
+  # title + hint + blank + top-indicator + VIEW rows + bottom-indicator = VIEW+5
+  local total=$(( view + 5 ))
+  local cursor=0 scroll=0 i
+
+  _pr_render() {
+    printf '\033[%dA' "$total"
+    printf '\033[K\033[1m  %s\033[0m\n' "$title"
+    printf '\033[K  \033[2m↑/↓ navigate   ENTER confirm   Q quit\033[0m\n'
+    printf '\033[K\n'
+    # top scroll indicator (always 1 line)
+    if [[ $scroll -gt 0 ]]; then
+      printf '\033[K  \033[2m  ↑ %d more above\033[0m\n' "$scroll"
+    else
+      printf '\033[K\n'
+    fi
+    # item rows — always exactly $view lines (pad with blanks at end)
+    local printed=0
+    for ((i=scroll; i<scroll+view && i<n; i++)); do
+      if [[ $i -eq $cursor ]]; then
+        printf '\033[K  \033[1;36m▶ ◉  %s\033[0m\n' "${labels[$i]}"
+      else
+        printf '\033[K    ○  %s\n' "${labels[$i]}"
+      fi
+      printed=$(( printed + 1 ))
+    done
+    for ((i=printed; i<view; i++)); do printf '\033[K\n'; done
+    # bottom scroll indicator (always 1 line)
+    local below=$(( n - scroll - view ))
+    if [[ $below -gt 0 ]]; then
+      printf '\033[K  \033[2m  ↓ %d more below\033[0m\n' "$below"
+    else
+      printf '\033[K\n'
+    fi
+  }
+
+  printf '\n%.0s' $(seq 1 "$total")
+  tput civis 2>/dev/null || true
+  _pr_render
+
+  local key seq
+  while true; do
+    IFS= read -r -s -n1 key 2>/dev/null || key=""
+    if [[ "$key" == $'\x1b' ]]; then
+      IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
+      case "$seq" in
+        '[A')
+          [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 ))
+          [[ $cursor -lt $scroll ]] && scroll=$cursor
+          ;;
+        '[B')
+          [[ $cursor -lt $(( n-1 )) ]] && cursor=$(( cursor + 1 ))
+          [[ $cursor -ge $(( scroll + view )) ]] && scroll=$(( cursor - view + 1 ))
+          ;;
+      esac
+    else
+      case "$key" in
+        '') break ;;
+        'q'|'Q') tput cnorm 2>/dev/null || true; echo ""; log_warn "Aborted"; exit 0 ;;
+      esac
+    fi
+    _pr_render
+  done
+
+  tput cnorm 2>/dev/null || true
+  printf '\n  \033[1mSelected:\033[0m %s\n\n' "${labels[$cursor]}"
+  echo "${values[$cursor]}"
+}
+
+# ── Interactive menus (only when stdin is a real terminal) ────────────────────
+if [[ -t 0 ]]; then
+  # 1. Repo selection (skip if --targets was given)
+  [[ "$FILTER_TARGETS" == "all" ]] && FILTER_TARGETS=$(pick_targets)
+
+  # 2. Ref selection (skip whichever of --from / --to was given explicitly)
+  if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
+    log_info "Fetching tags from $SOURCE_REPO ..."
+    mapfile -t _TAGS < <(fetch_source_tags)
+    if ! $FROM_EXPLICIT; then
+      FROM_REF=$(pick_ref \
+        "Select FROM ref  (start of diff)" \
+        "HEAD~1  — previous commit (default)" \
+        "HEAD~1" \
+        "${_TAGS[@]+"${_TAGS[@]}"}")
+    fi
+    if ! $TO_EXPLICIT; then
+      TO_REF=$(pick_ref \
+        "Select TO ref  (end of diff)" \
+        "HEAD  — latest commit (default)" \
+        "HEAD" \
+        "${_TAGS[@]+"${_TAGS[@]}"}")
+    fi
+    unset _TAGS
+  fi
 fi
 
 # ── Clone / update source ─────────────────────────────────────────────────────
