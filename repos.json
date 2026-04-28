@@ -17,6 +17,12 @@
     "base_branch":  "main",
     "title_prefix": "chore(sync): "
   },
+  "protected_configmap_keys": [
+    "DATABASE_URL",
+    "REDIS_URL",
+    "CLUSTER_ENDPOINT",
+    "API_BASE_URL"
+  ],
   "targets": [
     {
       "name": "app-a",

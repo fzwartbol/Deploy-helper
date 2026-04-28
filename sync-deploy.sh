@@ -91,6 +91,7 @@ SOURCE_SUBS=$(jq -c '.source.substitutions'               "$CONFIG_FILE")
 BASE_BRANCH=$(jq -r '.pr.base_branch    // "main"'        "$CONFIG_FILE")
 PR_TITLE_PREFIX=$(jq -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
 TARGET_COUNT=$(jq '.targets | length'                     "$CONFIG_FILE")
+PROTECTED_CM_KEYS=$(jq -r '.protected_configmap_keys // [] | join("|")' "$CONFIG_FILE")
 
 mkdir -p "$WORK_DIR"
 
@@ -201,6 +202,32 @@ restore_image_lines() {
   ' "$original" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
 }
 
+# For existing ConfigMap files: restores protected key lines in 'file' from 'base'
+# so cluster-specific config values are never overwritten by a three-way merge.
+# Not called for first-time copies — source values are used as-is on initial sync.
+neutralize_configmap_keys() {
+  local file="$1" base="$2"
+  [[ -z "${PROTECTED_CM_KEYS:-}" ]] && return 0
+  grep -q 'kind:[[:space:]]*ConfigMap' "$file" 2>/dev/null || return 0
+  [[ -f "$base" ]] || return 0
+  is_text_file "$file" || return 0
+  awk -v pat="$PROTECTED_CM_KEYS" '
+    BEGIN { full_pat = "^[[:space:]]+(" pat "):[[:space:]]" }
+    NR == FNR {
+      if ($0 ~ full_pat) {
+        key = $0; sub(/:[[:space:]].*$/, "", key); gsub(/^[[:space:]]+/, "", key)
+        base_val[key] = $0
+      }
+      next
+    }
+    $0 ~ full_pat {
+      key = $0; sub(/:[[:space:]].*$/, "", key); gsub(/^[[:space:]]+/, "", key)
+      if (key in base_val) { print base_val[key]; next }
+    }
+    { print }
+  ' "$base" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
 # Checks whether a file contains any image/imageTag/tag YAML keys.
 has_image_lines() {
   grep -qE '^[[:space:]]*(image|imageTag|tag):[[:space:]]' "$1" 2>/dev/null
@@ -223,16 +250,18 @@ copy_and_apply() {
 
 # Three-way merge a modified file using git merge-file.
 #
-# base  = source file at FROM_REF with substitutions applied
-#         → represents "what the target looked like before these changes"
-# theirs = source file at TO_REF with substitutions applied,
-#          then image-tag lines neutralised back to base values
-#          → represents "what we want, minus env-specific tags"
-# ours  = current target file (untouched)
+# base   = source file at FROM_REF with substitutions applied
+# theirs = source file at TO_REF with substitutions applied
+# ours   = current target file (untouched)
 #
-# git merge-file applies only the delta (base→theirs) onto ours,
-# preserving all local target modifications. Conflict markers are
-# written into the file when both sides changed the same region.
+# First-time copy (target file absent): theirs is written directly so all
+# source values, including image tags and protected ConfigMap keys, are
+# carried over as an intentional initial baseline.
+#
+# Existing file: before merging, env-specific lines in theirs are neutralised
+# back to base values (restore_image_lines + neutralize_configmap_keys) so
+# git merge-file sees "no change" there and always keeps ours (target) intact.
+# Conflict markers are written when both sides changed the same region.
 # Returns 0 clean, 1 conflict (markers written), 2+ hard error.
 three_way_merge_file() {
   local src_path="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
@@ -252,20 +281,25 @@ three_way_merge_file() {
   fi
   apply_subs "$base" "$sed_script"
 
-  # theirs — source file at TO_REF + substitutions
-  # Neutralise image-tag lines so they look identical to base → the merge
-  # will see "no change" there and always keep ours (target) value intact.
+  # theirs — source file at TO_REF + substitutions applied
   cp "$src_abs" "$theirs"
   apply_subs "$theirs" "$sed_script"
-  restore_image_lines "$theirs" "$base"
 
-  # If the file doesn't exist in target yet, just use theirs directly.
+  # First-time copy: target file does not exist yet.
+  # Use theirs as-is — all source values (image tags, protected ConfigMap keys)
+  # are carried over intentionally; the PR body will flag image references.
+  # Sealed secrets are never passed here (M case filters them out above).
   if [[ ! -f "$tgt_abs" ]]; then
     mkdir -p "$(dirname "$tgt_abs")"
     cp "$theirs" "$tgt_abs"
     rm -f "$base" "$theirs"
     return 0
   fi
+
+  # Existing file: neutralise env-specific lines in theirs so git merge-file
+  # sees "no change" there and always keeps the target's own values intact.
+  restore_image_lines "$theirs" "$base"
+  neutralize_configmap_keys "$theirs" "$base"
 
   local rc=0
   git merge-file \
@@ -585,6 +619,7 @@ for i in $(seq 0 $((TARGET_COUNT - 1))); do
         # ── Delete ────────────────────────────────────────────────────────────
         D)
           if [[ -f "$TARGET_DIR/$file1" ]]; then
+            log_info "Deleting: $file1"
             git -C "$TARGET_DIR" rm -f "$file1"
             HAS_CHANGES=true
           fi
