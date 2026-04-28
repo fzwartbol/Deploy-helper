@@ -147,9 +147,10 @@ build_sed_script() {
   local src="$1" tgt="$2" sed_script="" sv tv src_esc tgt_esc
   while IFS=$'\t' read -r sv tv; do
     [[ -z "$sv" || -z "$tv" ]] && continue
-    src_esc=$(printf '%s' "$sv" | sed 's/[[\.*^$()+?{|]/\\&/g')
-    tgt_esc=$(printf '%s' "$tv" | sed 's/[&/\\]/\\&/g')
-    sed_script+="s/${src_esc}/${tgt_esc}/g;"
+    # Use | as delimiter; escape | and / in src pattern, | in tgt replacement.
+    src_esc=$(printf '%s' "$sv" | sed 's/[[\.*^$()+?{|/]/\\&/g')
+    tgt_esc=$(printf '%s' "$tv" | sed 's/[&|\\]/\\&/g')
+    sed_script+="s|${src_esc}|${tgt_esc}|g;"
   done < <(jq -rn --argjson s "$src" --argjson t "$tgt" \
     '$s | to_entries
      | map(select($t[.key] != null and .value != $t[.key]))
@@ -202,30 +203,32 @@ restore_image_lines() {
   ' "$original" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
 }
 
-# For existing ConfigMap files: restores protected key lines in 'file' from 'base'
-# so cluster-specific config values are never overwritten by a three-way merge.
+# For existing ConfigMap files: overwrites protected key lines in 'theirs' with the
+# values from the actual target file so that git merge-file sees the same value on
+# both sides (base→theirs and base→ours both changed the key to the target value),
+# producing a clean merge that keeps the target's cluster-specific value intact.
 # Not called for first-time copies — source values are used as-is on initial sync.
 neutralize_configmap_keys() {
-  local file="$1" base="$2"
+  local theirs="$1" target="$2"
   [[ -z "${PROTECTED_CM_KEYS:-}" ]] && return 0
-  grep -q 'kind:[[:space:]]*ConfigMap' "$file" 2>/dev/null || return 0
-  [[ -f "$base" ]] || return 0
-  is_text_file "$file" || return 0
+  grep -q 'kind:[[:space:]]*ConfigMap' "$theirs" 2>/dev/null || return 0
+  [[ -f "$target" ]] || return 0
+  is_text_file "$theirs" || return 0
   awk -v pat="$PROTECTED_CM_KEYS" '
     BEGIN { full_pat = "^[[:space:]]+(" pat "):[[:space:]]" }
     NR == FNR {
       if ($0 ~ full_pat) {
         key = $0; sub(/:[[:space:]].*$/, "", key); gsub(/^[[:space:]]+/, "", key)
-        base_val[key] = $0
+        tgt_val[key] = $0
       }
       next
     }
     $0 ~ full_pat {
       key = $0; sub(/:[[:space:]].*$/, "", key); gsub(/^[[:space:]]+/, "", key)
-      if (key in base_val) { print base_val[key]; next }
+      if (key in tgt_val) { print tgt_val[key]; next }
     }
     { print }
-  ' "$base" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+  ' "$target" "$theirs" > "$theirs.tmp" && mv "$theirs.tmp" "$theirs"
 }
 
 # Checks whether a file contains any image/imageTag/tag YAML keys.
@@ -299,7 +302,7 @@ three_way_merge_file() {
   # Existing file: neutralise env-specific lines in theirs so git merge-file
   # sees "no change" there and always keeps the target's own values intact.
   restore_image_lines "$theirs" "$base"
-  neutralize_configmap_keys "$theirs" "$base"
+  neutralize_configmap_keys "$theirs" "$tgt_abs"
 
   local rc=0
   git merge-file \
@@ -573,7 +576,7 @@ while IFS=$'\t' read -r status f1 f2; do
 done <<< "$CHANGED_FILES"
 
 CHANGED_FILES_MD=$(while IFS=$'\t' read -r s f1 f2; do
-  printf '- `[%s]` `%s`\n' "$s" "${f2:-$f1}"
+  printf -- '- `[%s]` `%s`\n' "$s" "${f2:-$f1}"
 done <<< "$CHANGED_FILES")
 
 # ── Process each target ───────────────────────────────────────────────────────
@@ -618,64 +621,65 @@ for i in $(seq 0 $((TARGET_COUNT - 1))); do
 
         # ── Delete ────────────────────────────────────────────────────────────
         D)
-          if [[ -f "$TARGET_DIR/$file1" ]]; then
-            log_info "Deleting: $file1"
-            git -C "$TARGET_DIR" rm -f "$file1"
+          tgt_file=$(echo "$file1" | sed "$SED_SCRIPT")
+          if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
+            log_info "Deleting: $tgt_file"
+            git -C "$TARGET_DIR" rm -f "$tgt_file"
             HAS_CHANGES=true
           fi
           ;;
 
         # ── Rename ────────────────────────────────────────────────────────────
-        # file1 = old path, file2 = new path
+        # file1 = old path, file2 = new path (both in source naming)
         R)
+          tgt_file1=$(echo "$file1" | sed "$SED_SCRIPT")
+          tgt_file2=$(echo "$file2" | sed "$SED_SCRIPT")
           orig=$(mktemp "$WORK_DIR/.orig_XXXXXX")
           has_orig=false
-          if [[ -f "$TARGET_DIR/$file1" ]]; then
-            cp "$TARGET_DIR/$file1" "$orig"
+          if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
+            cp "$TARGET_DIR/$tgt_file1" "$orig"
             has_orig=true
-            git -C "$TARGET_DIR" rm -f "$file1"
+            git -C "$TARGET_DIR" rm -f "$tgt_file1"
           fi
 
-          mkdir -p "$(dirname "$TARGET_DIR/$file2")"
+          mkdir -p "$(dirname "$TARGET_DIR/$tgt_file2")"
 
           if is_sealed_secret "$SOURCE_DIR/$file2"; then
             if $has_orig && is_sealed_secret "$orig"; then
-              # Move the target's own sealed secret to the new path with subs applied
-              cp "$orig" "$TARGET_DIR/$file2"
-              apply_subs "$TARGET_DIR/$file2" "$SED_SCRIPT"
-              SEALED_NOTES+=("- \`[RENAMED]\` \`$file1\` → \`$file2\` — target's own encrypted values moved to new path")
+              cp "$orig" "$TARGET_DIR/$tgt_file2"
+              apply_subs "$TARGET_DIR/$tgt_file2" "$SED_SCRIPT"
+              SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — target's own encrypted values moved to new path")
             else
-              # Old path not in target or was not a sealed secret — blank and warn
-              copy_and_apply "$file2" "$file2" "$TARGET_DIR" "$SED_SCRIPT" || true
-              [[ -f "$TARGET_DIR/$file2" ]] && strip_encrypted_data "$TARGET_DIR/$file2"
-              SEALED_NOTES+=("- \`[RENAMED]\` \`$file1\` → \`$file2\` — encryptedData blanked, re-seal for this cluster")
+              copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT" || true
+              [[ -f "$TARGET_DIR/$tgt_file2" ]] && strip_encrypted_data "$TARGET_DIR/$tgt_file2"
+              SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — encryptedData blanked, re-seal for this cluster")
             fi
           else
-            copy_and_apply "$file2" "$file2" "$TARGET_DIR" "$SED_SCRIPT"
-            # Restore image tags from the old target file (same resource, just moved)
-            $has_orig && restore_image_lines "$TARGET_DIR/$file2" "$orig"
-            if has_image_lines "$TARGET_DIR/$file2"; then
-              IMAGE_NOTES+=("- \`[RENAMED]\` \`$file2\` — image tags kept from \`$file1\`")
+            copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"
+            $has_orig && restore_image_lines "$TARGET_DIR/$tgt_file2" "$orig"
+            if has_image_lines "$TARGET_DIR/$tgt_file2"; then
+              IMAGE_NOTES+=("- \`[RENAMED]\` \`$tgt_file2\` — image tags kept from \`$tgt_file1\`")
             fi
           fi
 
-          git -C "$TARGET_DIR" add "$file2"
+          git -C "$TARGET_DIR" add "$tgt_file2"
           HAS_CHANGES=true
           rm -f "$orig"
           ;;
 
         # ── Modify ────────────────────────────────────────────────────────────
         M)
+          tgt_file=$(echo "$file1" | sed "$SED_SCRIPT")
           if is_sealed_secret "$SOURCE_DIR/$file1"; then
-            SEALED_NOTES+=("- \`[MODIFIED]\` \`$file1\` — **not synced** (cluster-specific encryption); re-seal manually if the value changed")
+            SEALED_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — **not synced** (cluster-specific encryption); re-seal manually if the value changed")
           else
             merge_rc=0
-            three_way_merge_file "$file1" "$file1" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
-            [[ $merge_rc -eq 1 ]] && CONFLICT_FILES+=("$file1")
-            if has_image_lines "$TARGET_DIR/$file1"; then
-              IMAGE_NOTES+=("- \`[MODIFIED]\` \`$file1\` — image tags preserved from target")
+            three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
+            [[ $merge_rc -eq 1 ]] && CONFLICT_FILES+=("$tgt_file")
+            if has_image_lines "$TARGET_DIR/$tgt_file"; then
+              IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
             fi
-            git -C "$TARGET_DIR" add "$file1"
+            git -C "$TARGET_DIR" add "$tgt_file"
             HAS_CHANGES=true
           fi
           ;;
@@ -683,51 +687,50 @@ for i in $(seq 0 $((TARGET_COUNT - 1))); do
         # ── Add / Copy ────────────────────────────────────────────────────────
         # For git C (copy): file1=original path, file2=new path. Use file2 as dest.
         # For git A (add): file1 is the only path.
+        # For git C (copy): file1=original path, file2=new path. Use file2 as dest.
+        # For git A (add): file1 is the only path.
         A|C|*)
-          new_file="${file2:-$file1}"
+          src_new_file="${file2:-$file1}"
+          tgt_new_file=$(echo "$src_new_file" | sed "$SED_SCRIPT")
 
-          if is_sealed_secret "$SOURCE_DIR/$new_file"; then
-            src_name=$(get_sealed_secret_name "$SOURCE_DIR/$new_file")
+          if is_sealed_secret "$SOURCE_DIR/$src_new_file"; then
+            src_name=$(get_sealed_secret_name "$SOURCE_DIR/$src_new_file")
 
             # Determine if this is a copy of an existing sealed secret (same
             # metadata.name already exists elsewhere in the source repo) or truly new.
             src_other=$(find_sealed_secret_by_name \
-              "$src_name" "$SOURCE_DIR" "$SOURCE_DIR/$new_file" || true)
+              "$src_name" "$SOURCE_DIR" "$SOURCE_DIR/$src_new_file" || true)
 
-            mkdir -p "$(dirname "$TARGET_DIR/$new_file")"
+            mkdir -p "$(dirname "$TARGET_DIR/$tgt_new_file")"
 
             if [[ -n "$src_other" ]]; then
-              # It's a copy to a new overlay. Find the same secret in the target
-              # by applying substitutions to the secret name (e.g. source-app →
-              # app-a) so we match the target's naming convention.
               tgt_name=$(echo "$src_name" | sed "$SED_SCRIPT")
               tgt_existing=$(find_sealed_secret_by_name "$tgt_name" "$TARGET_DIR" || true)
 
               if [[ -n "$tgt_existing" ]]; then
-                cp "$tgt_existing" "$TARGET_DIR/$new_file"
-                apply_subs "$TARGET_DIR/$new_file" "$SED_SCRIPT"
-                SEALED_NOTES+=("- \`[COPIED]\` \`$new_file\` — target's own sealed secret copied from \`${tgt_existing#"$TARGET_DIR/"}\` (encrypted values preserved)")
+                cp "$tgt_existing" "$TARGET_DIR/$tgt_new_file"
+                apply_subs "$TARGET_DIR/$tgt_new_file" "$SED_SCRIPT"
+                SEALED_NOTES+=("- \`[COPIED]\` \`$tgt_new_file\` — target's own sealed secret copied from \`${tgt_existing#"$TARGET_DIR/"}\` (encrypted values preserved)")
               else
-                copy_and_apply "$new_file" "$new_file" "$TARGET_DIR" "$SED_SCRIPT"
-                strip_encrypted_data "$TARGET_DIR/$new_file"
-                SEALED_NOTES+=("- \`[COPIED]\` \`$new_file\` — no matching secret found in target; encryptedData blanked, re-seal for this cluster")
+                copy_and_apply "$src_new_file" "$tgt_new_file" "$TARGET_DIR" "$SED_SCRIPT"
+                strip_encrypted_data "$TARGET_DIR/$tgt_new_file"
+                SEALED_NOTES+=("- \`[COPIED]\` \`$tgt_new_file\` — no matching secret found in target; encryptedData blanked, re-seal for this cluster")
               fi
             else
-              # Truly new secret — carry the structure, blank the encrypted values
-              copy_and_apply "$new_file" "$new_file" "$TARGET_DIR" "$SED_SCRIPT"
-              strip_encrypted_data "$TARGET_DIR/$new_file"
-              SEALED_NOTES+=("- \`[ADDED]\` \`$new_file\` — new secret; encryptedData blanked, re-seal for this cluster")
+              copy_and_apply "$src_new_file" "$tgt_new_file" "$TARGET_DIR" "$SED_SCRIPT"
+              strip_encrypted_data "$TARGET_DIR/$tgt_new_file"
+              SEALED_NOTES+=("- \`[ADDED]\` \`$tgt_new_file\` — new secret; encryptedData blanked, re-seal for this cluster")
             fi
 
-            git -C "$TARGET_DIR" add "$new_file"
+            git -C "$TARGET_DIR" add "$tgt_new_file"
             HAS_CHANGES=true
 
           else
-            if copy_and_apply "$new_file" "$new_file" "$TARGET_DIR" "$SED_SCRIPT"; then
-              if has_image_lines "$TARGET_DIR/$new_file"; then
-                IMAGE_NOTES+=("- \`[ADDED]\` \`$new_file\` — new file; image tags copied from source (update if needed)")
+            if copy_and_apply "$src_new_file" "$tgt_new_file" "$TARGET_DIR" "$SED_SCRIPT"; then
+              if has_image_lines "$TARGET_DIR/$tgt_new_file"; then
+                IMAGE_NOTES+=("- \`[ADDED]\` \`$tgt_new_file\` — new file; image tags copied from source (update if needed)")
               fi
-              git -C "$TARGET_DIR" add "$new_file"
+              git -C "$TARGET_DIR" add "$tgt_new_file"
               HAS_CHANGES=true
             fi
           fi
@@ -780,7 +783,7 @@ Image tags are environment-specific and were not copied from source."
 
 ### ⚡ Merge conflicts — resolve before merging
 
-$(printf '- `%s`\n' "${CONFLICT_FILES[@]}")
+$(printf -- '- `%s`\n' "${CONFLICT_FILES[@]}")
 
 These files contain \`<<<<<<<\` conflict markers. Edit them to resolve, then commit."
     fi
