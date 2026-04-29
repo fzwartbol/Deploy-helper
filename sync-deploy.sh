@@ -87,15 +87,187 @@ done
 
 # ── Validation ────────────────────────────────────────────────────────────────
 [[ -f "$CONFIG_FILE" ]] || { log_error "Config not found: $CONFIG_FILE"; exit 1; }
-for cmd in jq git curl awk; do
+for cmd in git curl awk; do
   command -v "$cmd" >/dev/null || { log_error "'$cmd' is required but not installed"; exit 1; }
 done
 
+# ── JSON query helper (jq when installed, Python 3 otherwise) ─────────────────
+# Supports the exact filter patterns used in this script.
+_JQ_READY=false
+_JQ_USE_JQ=false
+_JQ_PY=""
+_JSON_HELPER=""
+
+_jq() {
+  if ! $_JQ_READY; then
+    if command -v jq >/dev/null 2>&1; then
+      _JQ_USE_JQ=true
+    else
+      for _jq_cmd in python3 python py; do
+        if command -v "$_jq_cmd" >/dev/null 2>&1 \
+           && "$_jq_cmd" -c "import sys; assert sys.version_info.major>=3" 2>/dev/null; then
+          _JQ_PY="$_jq_cmd"; break
+        fi
+      done
+      if [[ -z "$_JQ_PY" ]]; then
+        log_error "Neither 'jq' nor Python 3 is installed."
+        log_error "  jq:     https://jqlang.github.io/jq/download/"
+        log_error "  Python: https://www.python.org/downloads/"
+        exit 1
+      fi
+      _JSON_HELPER=$(mktemp "${TMPDIR:-/tmp}/.sync_jq_XXXXXX.py")
+      # shellcheck disable=SC2064
+      trap "rm -f '$_JSON_HELPER'" EXIT
+      cat > "$_JSON_HELPER" << 'PYEOF'
+import json, sys, re
+
+def parse_args(argv):
+    opts = {'raw': False, 'compact': False, 'null_input': False,
+            'argjson': {}, 'argstr': {}}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '-r':        opts['raw'] = True
+        elif a == '-c':      opts['compact'] = True
+        elif a == '-n':      opts['null_input'] = True
+        elif a == '--argjson':
+            opts['argjson'][argv[i+1]] = json.loads(argv[i+2]); i += 2
+        elif a == '--arg':
+            opts['argstr'][argv[i+1]] = argv[i+2]; i += 2
+        elif not a.startswith('-'):
+            break
+        i += 1
+    filt   = argv[i]   if i   < len(argv) else '.'
+    infile = argv[i+1] if i+1 < len(argv) else None
+    return opts, filt, infile
+
+def jout(val, raw=False, compact=False):
+    if raw and isinstance(val, str): return val
+    if val is None:   return 'null'
+    if isinstance(val, bool): return 'true' if val else 'false'
+    if isinstance(val, int):  return str(val)
+    if isinstance(val, float): return str(int(val)) if val == int(val) else str(val)
+    sep = (',', ':') if compact else (', ', ': ')
+    return json.dumps(val, separators=sep, ensure_ascii=False)
+
+def path_get(obj, path):
+    parts = re.findall(r'\.([^.\[]+)|\[(\d+)\]', path)
+    cur = obj
+    for key, idx in parts:
+        if cur is None: return None
+        if key:
+            cur = cur.get(key) if isinstance(cur, dict) else None
+        else:
+            i2 = int(idx)
+            cur = cur[i2] if isinstance(cur, list) and i2 < len(cur) else None
+    return cur
+
+opts, filt, infile = parse_args(sys.argv[1:])
+env = {**opts['argjson'], **opts['argstr']}
+r, c = opts['raw'], opts['compact']
+
+if opts['null_input']:
+    data = None
+elif infile:
+    with open(infile) as f:
+        data = json.load(f)
+else:
+    data = json.load(sys.stdin)
+
+filt = filt.strip()
+
+# .field.subfield // "default"
+m = re.fullmatch(r'([\w.\[\]]+)\s*//\s*"([^"]*)"', filt)
+if m:
+    v = path_get(data, m.group(1))
+    print(jout(v if v not in (None, '') else m.group(2), r, c)); sys.exit()
+
+# .array | length
+m = re.fullmatch(r'([\w.\[\]]+)\s*\|\s*length', filt)
+if m:
+    v = path_get(data, m.group(1))
+    print(len(v) if isinstance(v, (list, dict)) else 0); sys.exit()
+
+# .array // [] | join("sep")
+m = re.fullmatch(r'([\w.\[\]]+)\s*//\s*\[\]\s*\|\s*join\("([^"]*)"\)', filt)
+if m:
+    v = path_get(data, m.group(1)) or []
+    print(m.group(2).join(v)); sys.exit()
+
+# .repos[N].field
+m = re.fullmatch(r'\.repos\[(\d+)\]\.(\w+)', filt)
+if m:
+    v = data['repos'][int(m.group(1))][m.group(2)]
+    print(jout(v, r, c)); sys.exit()
+
+# .repos[N] | "\(.name)  [\(.repo)]"  -- string interpolation
+m = re.fullmatch(r'\.repos\[(\d+)\]\s*\|\s*"(.*)"', filt, re.DOTALL)
+if m:
+    repo = data['repos'][int(m.group(1))]
+    result = re.sub(r'\\?\(\.([\w]+)\)', lambda x: str(repo.get(x.group(1), '')), m.group(2))
+    print(result); sys.exit()
+
+# .repos | map(.name) | index($var)
+m = re.fullmatch(r'\.repos\s*\|\s*map\(\.name\)\s*\|\s*index\(\$(\w+)\)', filt)
+if m:
+    name = env.get(m.group(1), '')
+    names = [repo['name'] for repo in data['repos']]
+    idx = names.index(name) if name in names else None
+    print('null' if idx is None else str(idx)); sys.exit()
+
+# [.repos[].name] | join("sep")
+m = re.fullmatch(r'\[\.repos\[\]\.name\]\s*\|\s*join\("([^"]*)"\)', filt)
+if m:
+    print(m.group(1).join(repo['name'] for repo in data['repos'])); sys.exit()
+
+# build_sed_script: sorted (source_value, target_value) pairs as TSV
+if '$s' in filt and '$t' in filt and 'to_entries' in filt:
+    s = env.get('s', {}); t = env.get('t', {})
+    pairs = [(v, t[k]) for k, v in s.items() if k in t and t[k] != v]
+    pairs.sort(key=lambda x: -len(x[0]))
+    for sv, tv in pairs:
+        sys.stdout.write(sv + '\t' + tv + '\n')
+    sys.exit()
+
+# PR payload {title:$title, description:$body, source:{...}, destination:{...}}
+if opts['null_input'] and filt.startswith('{') and 'source' in filt and 'destination' in filt:
+    a = env
+    print(json.dumps({
+        'title': a.get('title', ''),
+        'description': a.get('body', ''),
+        'source': {'branch': {'name': a.get('branch', '')}},
+        'destination': {'branch': {'name': a.get('base', '')}},
+        'close_source_branch': True
+    }, ensure_ascii=False)); sys.exit()
+
+# .links.html.href
+if filt == '.links.html.href':
+    print(jout(data.get('links', {}).get('html', {}).get('href', ''), r, c)); sys.exit()
+
+# .error.message // .
+if '.error.message' in filt:
+    v = data.get('error', {}).get('message') if isinstance(data, dict) else None
+    print(jout(v if v is not None else data, r, c)); sys.exit()
+
+# Simple path fallback
+v = path_get(data, filt)
+print(jout(v, r, c))
+PYEOF
+    fi
+    _JQ_READY=true
+  fi
+  if $_JQ_USE_JQ; then
+    jq "$@"
+  else
+    "$_JQ_PY" "$_JSON_HELPER" "$@"
+  fi
+}
+
 # ── Load config ───────────────────────────────────────────────────────────────
-BASE_BRANCH=$(jq -r '.pr.base_branch    // "main"'        "$CONFIG_FILE")
-PR_TITLE_PREFIX=$(jq -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
-REPO_COUNT=$(jq '.repos | length'                         "$CONFIG_FILE")
-PROTECTED_CM_KEYS=$(jq -r '.protected_configmap_keys // [] | join("|")' "$CONFIG_FILE")
+BASE_BRANCH=$(_jq -r '.pr.base_branch    // "main"'        "$CONFIG_FILE")
+PR_TITLE_PREFIX=$(_jq -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
+REPO_COUNT=$(_jq '.repos | length'                         "$CONFIG_FILE")
+PROTECTED_CM_KEYS=$(_jq -r '.protected_configmap_keys // [] | join("|")' "$CONFIG_FILE")
 # SOURCE_REPO / SOURCE_SUBS are resolved after source selection (see below)
 
 mkdir -p "$WORK_DIR"
@@ -172,7 +344,7 @@ build_sed_script() {
     src_esc=$(printf '%s' "$sv" | sed 's/[[\.*^$()+?{|/]/\\&/g')
     tgt_esc=$(printf '%s' "$tv" | sed 's/[&|\\]/\\&/g')
     sed_script+="s|${src_esc}|${tgt_esc}|g;"
-  done < <(jq -rn --argjson s "$src" --argjson t "$tgt" \
+  done < <(_jq -rn --argjson s "$src" --argjson t "$tgt" \
     '$s | to_entries
      | map(select($t[.key] != null and .value != $t[.key]))
      | sort_by(.value | length) | reverse
@@ -346,7 +518,7 @@ three_way_merge_file() {
 create_bitbucket_pr() {
   local repo="$1" branch="$2" title="$3" body="$4"
   local payload response http_code body_json
-  payload=$(jq -n \
+  payload=$(_jq -n \
     --arg title  "$title"       \
     --arg body   "$body"        \
     --arg branch "$branch"      \
@@ -380,11 +552,11 @@ create_bitbucket_pr() {
   body_json=$(head  -n-1 <<< "$response")
 
   if [[ "$http_code" == "201" ]]; then
-    jq -r '.links.html.href' <<< "$body_json"
+    _jq -r '.links.html.href' <<< "$body_json"
   elif grep -q "already exists" <<< "$body_json" 2>/dev/null; then
     log_warn "PR already open for branch $branch on $repo — skipping"
   else
-    log_error "Bitbucket API $http_code: $(jq -r '.error.message // .' <<< "$body_json")"
+    log_error "Bitbucket API $http_code: $(_jq -r '.error.message // .' <<< "$body_json")"
     return 1
   fi
 }
@@ -396,8 +568,8 @@ pick_source() {
   local -a names=() labels=()
   local i
   for ((i=0; i<REPO_COUNT; i++)); do
-    names+=( "$(jq -r ".repos[$i].name" "$CONFIG_FILE")" )
-    labels+=( "$(jq -r '.repos[$i] | "\(.name)  [\(.repo)]"' "$CONFIG_FILE")" )
+    names+=( "$(_jq -r ".repos[$i].name" "$CONFIG_FILE")" )
+    labels+=( "$(_jq -r ".repos[$i] | \"\(.name)  [\(.repo)]\"" "$CONFIG_FILE")" )
   done
 
   local n=${#names[@]}
@@ -476,8 +648,8 @@ pick_targets() {
   local i
   for ((i=0; i<REPO_COUNT; i++)); do
     local _n _r
-    _n=$(jq -r ".repos[$i].name" "$CONFIG_FILE")
-    _r=$(jq -r ".repos[$i].repo" "$CONFIG_FILE")
+    _n=$(_jq -r ".repos[$i].name" "$CONFIG_FILE")
+    _r=$(_jq -r ".repos[$i].repo" "$CONFIG_FILE")
     [[ "$_n" == "$exclude" ]] && continue
     names+=("$_n"); repos+=("$_r")
   done
@@ -659,8 +831,8 @@ if [[ -t 0 ]]; then
   # 3. Ref selection (skip whichever of --from / --to was given explicitly)
   if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
     # Resolve source repo URL so we can fetch its tags for the menu
-    _SRC_IDX=$(jq -r --arg n "$SOURCE_NAME" '.repos | map(.name) | index($n)' "$CONFIG_FILE")
-    _SRC_REPO=$(jq -r ".repos[$_SRC_IDX].repo" "$CONFIG_FILE")
+    _SRC_IDX=$(_jq -r --arg n "$SOURCE_NAME" '.repos | map(.name) | index($n)' "$CONFIG_FILE")
+    _SRC_REPO=$(_jq -r ".repos[$_SRC_IDX].repo" "$CONFIG_FILE")
     log_info "Fetching tags from $_SRC_REPO ..."
     mapfile -t _TAGS < <(fetch_source_tags "$_SRC_REPO")
     if ! $FROM_EXPLICIT; then
@@ -686,14 +858,14 @@ if [[ -z "$SOURCE_NAME" ]]; then
   log_error "--source <name> is required in non-interactive mode"
   exit 1
 fi
-_IDX=$(jq -r --arg n "$SOURCE_NAME" '.repos | map(.name) | index($n)' "$CONFIG_FILE")
+_IDX=$(_jq -r --arg n "$SOURCE_NAME" '.repos | map(.name) | index($n)' "$CONFIG_FILE")
 if [[ "$_IDX" == "null" ]]; then
   log_error "Source repo '$SOURCE_NAME' not found in $CONFIG_FILE"
-  log_error "Available: $(jq -r '[.repos[].name] | join(", ")' "$CONFIG_FILE")"
+  log_error "Available: $(_jq -r '[.repos[].name] | join(", ")' "$CONFIG_FILE")"
   exit 1
 fi
-SOURCE_REPO=$(jq -r ".repos[$_IDX].repo"          "$CONFIG_FILE")
-SOURCE_SUBS=$(jq -c ".repos[$_IDX].substitutions" "$CONFIG_FILE")
+SOURCE_REPO=$(_jq -r ".repos[$_IDX].repo"          "$CONFIG_FILE")
+SOURCE_SUBS=$(_jq -c ".repos[$_IDX].substitutions" "$CONFIG_FILE")
 unset _IDX
 
 # ── Clone / update source ─────────────────────────────────────────────────────
@@ -726,9 +898,9 @@ FAIL=()
 TARGET_COUNT=$(( REPO_COUNT - 1 ))   # for display purposes only
 _TARGET_NUM=0
 for i in $(seq 0 $((REPO_COUNT - 1))); do
-  TARGET_NAME=$(jq -r ".repos[$i].name"          "$CONFIG_FILE")
-  TARGET_REPO=$(jq -r ".repos[$i].repo"          "$CONFIG_FILE")
-  TARGET_SUBS=$(jq -c ".repos[$i].substitutions" "$CONFIG_FILE")
+  TARGET_NAME=$(_jq -r ".repos[$i].name"          "$CONFIG_FILE")
+  TARGET_REPO=$(_jq -r ".repos[$i].repo"          "$CONFIG_FILE")
+  TARGET_SUBS=$(_jq -c ".repos[$i].substitutions" "$CONFIG_FILE")
 
   is_target_included "$TARGET_NAME" || continue
   _TARGET_NUM=$(( _TARGET_NUM + 1 ))
