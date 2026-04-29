@@ -47,8 +47,12 @@ Options:
   -h, --help         Show this help
 
 Environment:
-  BITBUCKET_USER   Bitbucket username
-  BITBUCKET_TOKEN  Bitbucket app password with repo + PR write access
+  BITBUCKET_USER   Bitbucket username   (optional — falls back to git credential helper)
+  BITBUCKET_TOKEN  Bitbucket app password/token  (optional — same fallback)
+
+  If neither variable is set the script uses whatever credentials are stored
+  in your git credential helper (Windows Credential Manager, macOS Keychain,
+  ~/.netrc, etc.) — the same ones git itself uses for clone/push.
 
 Examples:
   sync-deploy.sh
@@ -83,8 +87,6 @@ done
 
 # ── Validation ────────────────────────────────────────────────────────────────
 [[ -f "$CONFIG_FILE" ]] || { log_error "Config not found: $CONFIG_FILE"; exit 1; }
-[[ -n "${BITBUCKET_USER:-}" ]]  || { log_error "BITBUCKET_USER is not set";  exit 1; }
-[[ -n "${BITBUCKET_TOKEN:-}" ]] || { log_error "BITBUCKET_TOKEN is not set"; exit 1; }
 for cmd in jq git curl awk; do
   command -v "$cmd" >/dev/null || { log_error "'$cmd' is required but not installed"; exit 1; }
 done
@@ -128,9 +130,21 @@ find_sealed_secret_by_name() {
   return 1
 }
 
+# Returns an authenticated Bitbucket HTTPS URL.
+# Embeds BITBUCKET_USER/TOKEN when set; otherwise uses a plain URL so that
+# git's own credential helper (Windows Credential Manager, macOS Keychain,
+# ~/.netrc, etc.) handles authentication transparently.
+_bb_url() {
+  if [[ -n "${BITBUCKET_USER:-}" && -n "${BITBUCKET_TOKEN:-}" ]]; then
+    echo "https://${BITBUCKET_USER}:${BITBUCKET_TOKEN}@bitbucket.org/${1}.git"
+  else
+    echo "https://bitbucket.org/${1}.git"
+  fi
+}
+
 clone_or_update() {
   local repo="$1" dir="$2"
-  local url="https://${BITBUCKET_USER}:${BITBUCKET_TOKEN}@bitbucket.org/${repo}.git"
+  local url; url=$(_bb_url "$repo")
   if [[ -d "$dir/.git" ]]; then
     log_info "Updating $repo"
     git -C "$dir" remote set-url origin "$url"
@@ -141,8 +155,11 @@ clone_or_update() {
     log_info "Cloning $repo"
     git clone "$url" "$dir"
   fi
-  git -C "$dir" config user.email "sync-deploy@automation"
-  git -C "$dir" config user.name  "Deploy Sync Bot"
+  # Use the local machine's git identity for commits in the cloned repo
+  git -C "$dir" config user.email \
+    "$(git config --global user.email 2>/dev/null || echo 'sync-deploy@automation')"
+  git -C "$dir" config user.name \
+    "$(git config --global user.name  2>/dev/null || echo 'Deploy Sync Bot')"
 }
 
 # Builds a sed substitution script sorted longest-source-value first to prevent
@@ -339,8 +356,22 @@ create_bitbucket_pr() {
       destination:{branch:{name:$base}},
       close_source_branch:true}')
 
+  # Resolve credentials: prefer explicit env vars, fall back to git credential helper
+  # (Windows Credential Manager, macOS Keychain, ~/.netrc, etc.)
+  local api_user="${BITBUCKET_USER:-}"
+  local api_token="${BITBUCKET_TOKEN:-}"
+  if [[ -z "$api_user" || -z "$api_token" ]]; then
+    local _cred_raw
+    _cred_raw=$(printf 'protocol=https\nhost=bitbucket.org\n' | git credential fill 2>/dev/null) || true
+    [[ -z "$api_user"  ]] && api_user=$(printf '%s'  "$_cred_raw" | awk -F= '/^username=/{print $2}')
+    [[ -z "$api_token" ]] && api_token=$(printf '%s' "$_cred_raw" | awk -F= '/^password=/{print $2}')
+  fi
+
+  local _curl_auth=()
+  [[ -n "$api_user" && -n "$api_token" ]] && _curl_auth=(-u "${api_user}:${api_token}")
+
   response=$(curl -s -w "\n%{http_code}" -X POST \
-    -u "${BITBUCKET_USER}:${BITBUCKET_TOKEN}" \
+    "${_curl_auth[@]+"${_curl_auth[@]}"}" \
     -H "Content-Type: application/json" \
     "https://api.bitbucket.org/2.0/repositories/${repo}/pullrequests" \
     -d "$payload")
@@ -530,7 +561,7 @@ pick_targets() {
 # Fetches tags from a repo via git ls-remote (no full clone needed).
 # Arg: repo path (workspace/slug). Outputs one tag per line, newest-first.
 fetch_source_tags() {
-  local url="https://${BITBUCKET_USER}:${BITBUCKET_TOKEN}@bitbucket.org/${1}.git"
+  local url; url=$(_bb_url "$1")
   git ls-remote --tags "$url" 2>/dev/null \
     | grep -v '\^{}' \
     | awk '{print $2}' \
