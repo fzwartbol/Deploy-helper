@@ -1,36 +1,57 @@
 {
   "source": {
-    "repo": "your-org/source-deploy-repo",
+    "repo": "your-workspace/source-deploy-repo",
     "substitutions": {
-      "app_name":       "source-app",
-      "namespace":      "source-namespace",
-      "service_account":"source-sa",
-      "image_name":     "source-image"
+      "service_name":    "source-service",
+      "app_name":        "source-app",
+      "paas_name":       "source-paas-project",
+      "namespace":       "source-namespace",
+      "environment":     "source-env",
+      "service_account": "source-sa",
+      "image_name":      "source-image",
+      "context_url":     "source-app.example.com",
+      "health_url":      "source-app.example.com/actuator/health"
     }
   },
   "pr": {
     "base_branch":  "main",
     "title_prefix": "chore(sync): "
   },
+  "protected_configmap_keys": [
+    "DATABASE_URL",
+    "REDIS_URL",
+    "CLUSTER_ENDPOINT",
+    "API_BASE_URL"
+  ],
   "targets": [
     {
       "name": "app-a",
-      "repo": "your-org/app-a-deploy",
+      "repo": "your-workspace/app-a-deploy",
       "substitutions": {
-        "app_name":       "app-a",
-        "namespace":      "ns-a",
-        "service_account":"sa-a",
-        "image_name":     "image-a"
+        "service_name":    "app-a-service",
+        "app_name":        "app-a",
+        "paas_name":       "app-a-paas-project",
+        "namespace":       "ns-a",
+        "environment":     "development",
+        "service_account": "sa-a",
+        "image_name":      "image-a",
+        "context_url":     "app-a.example.com",
+        "health_url":      "app-a.example.com/actuator/health"
       }
     },
     {
       "name": "app-b",
-      "repo": "your-org/app-b-deploy",
+      "repo": "your-workspace/app-b-deploy",
       "substitutions": {
-        "app_name":       "app-b",
-        "namespace":      "ns-b",
-        "service_account":"sa-b",
-        "image_name":     "image-b"
+        "service_name":    "app-b-service",
+        "app_name":        "app-b",
+        "paas_name":       "app-b-paas-project",
+        "namespace":       "ns-b",
+        "environment":     "production",
+        "service_account": "sa-b",
+        "image_name":      "image-b",
+        "context_url":     "app-b.example.com",
+        "health_url":      "app-b.example.com/actuator/health"
       }
     }
   ]
