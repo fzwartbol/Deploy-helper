@@ -498,26 +498,27 @@ with_work "app-b-deploy" "" app_b_initial
 # ─────────────────────────────────────────────────────────────────────────────
 cat > "$T/repos.test.json" <<'EOF'
 {
-  "source": {
-    "repo": "testspace/source-deploy-repo",
-    "substitutions": {
-      "service_name":    "source-service",
-      "app_name":        "source-app",
-      "paas_name":       "source-paas-project",
-      "namespace":       "source-namespace",
-      "environment":     "source-env",
-      "service_account": "source-sa",
-      "image_name":      "source-image",
-      "context_url":     "source-app.example.com",
-      "health_url":      "source-app.example.com/actuator/health"
-    }
-  },
   "pr": {
     "base_branch":  "main",
     "title_prefix": "chore(sync): "
   },
   "protected_configmap_keys": ["DATABASE_URL"],
-  "targets": [
+  "repos": [
+    {
+      "name": "source-deploy",
+      "repo": "testspace/source-deploy-repo",
+      "substitutions": {
+        "service_name":    "source-service",
+        "app_name":        "source-app",
+        "paas_name":       "source-paas-project",
+        "namespace":       "source-namespace",
+        "environment":     "source-env",
+        "service_account": "source-sa",
+        "image_name":      "source-image",
+        "context_url":     "source-app.example.com",
+        "health_url":      "source-app.example.com/actuator/health"
+      }
+    },
     {
       "name": "app-a",
       "repo": "testspace/app-a-deploy",
@@ -560,8 +561,9 @@ rm -rf "$WORK_DIR"
 
 bash "$SYNC_SCRIPT" \
   --config "$T/repos.test.json" \
-  --from v1.0.0 \
-  --to   v1.1.0
+  --source source-deploy \
+  --from   v1.0.0 \
+  --to     v1.1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Assertions

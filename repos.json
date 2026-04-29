@@ -1,18 +1,4 @@
 {
-  "source": {
-    "repo": "your-workspace/source-deploy-repo",
-    "substitutions": {
-      "service_name":    "source-service",
-      "app_name":        "source-app",
-      "paas_name":       "source-paas-project",
-      "namespace":       "source-namespace",
-      "environment":     "source-env",
-      "service_account": "source-sa",
-      "image_name":      "source-image",
-      "context_url":     "source-app.example.com",
-      "health_url":      "source-app.example.com/actuator/health"
-    }
-  },
   "pr": {
     "base_branch":  "main",
     "title_prefix": "chore(sync): "
@@ -23,7 +9,22 @@
     "CLUSTER_ENDPOINT",
     "API_BASE_URL"
   ],
-  "targets": [
+  "repos": [
+    {
+      "name": "source-deploy",
+      "repo": "your-workspace/source-deploy-repo",
+      "substitutions": {
+        "service_name":    "source-service",
+        "app_name":        "source-app",
+        "paas_name":       "source-paas-project",
+        "namespace":       "source-namespace",
+        "environment":     "source-env",
+        "service_account": "source-sa",
+        "image_name":      "source-image",
+        "context_url":     "source-app.example.com",
+        "health_url":      "source-app.example.com/actuator/health"
+      }
+    },
     {
       "name": "app-a",
       "repo": "your-workspace/app-a-deploy",
