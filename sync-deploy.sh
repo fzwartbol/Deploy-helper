@@ -33,13 +33,15 @@ log_section() { echo -e "\n${BLUE}==> $*${NC}"; }
 usage() { cat <<'EOF'
 Usage: sync-deploy.sh [OPTIONS]
 
-Syncs OpenShift deploy repo changes to all configured Bitbucket repos,
+Syncs OpenShift deploy repo changes to configured Bitbucket repos,
 substitutes app/service/namespace names, pushes a branch, and opens a PR.
+Any repo in the list can act as source; others become targets.
 
 Options:
+  --source <name>    Name of the source repo (from repos list)
   --from <ref>       Start ref in source repo  (default: HEAD~1)
   --to <ref>         End ref in source repo    (default: HEAD)
-  --targets <names>  Comma-separated names from repos.json, or "all" (default: all)
+  --targets <names>  Comma-separated target names, or "all" (default: all)
   --dry-run          Preview changes without cloning or pushing
   --config <file>    Path to config file       (default: ./repos.json)
   -h, --help         Show this help
@@ -50,10 +52,9 @@ Environment:
 
 Examples:
   sync-deploy.sh
-  sync-deploy.sh --from HEAD~3 --to HEAD
-  sync-deploy.sh --from v1.2.0 --to v1.3.0
-  sync-deploy.sh --targets app-a,app-b
-  sync-deploy.sh --dry-run
+  sync-deploy.sh --source source-deploy --from v1.2.0 --to v1.3.0
+  sync-deploy.sh --source app-a --targets app-b,app-c
+  sync-deploy.sh --source source-deploy --dry-run
 EOF
 }
 
@@ -64,11 +65,14 @@ FROM_EXPLICIT=false
 TO_EXPLICIT=false
 DRY_RUN=false
 FILTER_TARGETS="all"
+SOURCE_NAME=""
+SOURCE_EXPLICIT=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --from)    FROM_REF="$2"; FROM_EXPLICIT=true; shift 2 ;;
-    --to)      TO_REF="$2";   TO_EXPLICIT=true;   shift 2 ;;
+    --source)  SOURCE_NAME="$2"; SOURCE_EXPLICIT=true; shift 2 ;;
+    --from)    FROM_REF="$2";    FROM_EXPLICIT=true;   shift 2 ;;
+    --to)      TO_REF="$2";      TO_EXPLICIT=true;     shift 2 ;;
     --targets) FILTER_TARGETS="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true;        shift   ;;
     --config)  CONFIG_FILE="$2";    shift 2 ;;
@@ -86,18 +90,18 @@ for cmd in jq git curl awk; do
 done
 
 # ── Load config ───────────────────────────────────────────────────────────────
-SOURCE_REPO=$(jq -r '.source.repo'                        "$CONFIG_FILE")
-SOURCE_SUBS=$(jq -c '.source.substitutions'               "$CONFIG_FILE")
 BASE_BRANCH=$(jq -r '.pr.base_branch    // "main"'        "$CONFIG_FILE")
 PR_TITLE_PREFIX=$(jq -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
-TARGET_COUNT=$(jq '.targets | length'                     "$CONFIG_FILE")
+REPO_COUNT=$(jq '.repos | length'                         "$CONFIG_FILE")
 PROTECTED_CM_KEYS=$(jq -r '.protected_configmap_keys // [] | join("|")' "$CONFIG_FILE")
+# SOURCE_REPO / SOURCE_SUBS are resolved after source selection (see below)
 
 mkdir -p "$WORK_DIR"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 is_target_included() {
+  [[ "$1" == "$SOURCE_NAME" ]] && return 1   # source is never its own target
   [[ "$FILTER_TARGETS" == "all" ]] && return 0
   IFS=',' read -ra arr <<< "$FILTER_TARGETS"
   for t in "${arr[@]}"; do [[ "$t" == "$1" ]] && return 0; done
@@ -203,11 +207,13 @@ restore_image_lines() {
   ' "$original" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
 }
 
-# For existing ConfigMap files: overwrites protected key lines in 'theirs' with the
-# values from the actual target file so that git merge-file sees the same value on
-# both sides (base→theirs and base→ours both changed the key to the target value),
-# producing a clean merge that keeps the target's cluster-specific value intact.
-# Not called for first-time copies — source values are used as-is on initial sync.
+# Neutralises protected ConfigMap keys in 'theirs' before a three-way merge:
+#   - Key exists in target   → set theirs' value = target's value so both sides
+#     make the same change relative to base → clean merge keeps the target value.
+#   - Key is NEW (not yet in target) → tgt_val entry absent → key passes through
+#     unchanged so it is always copied from source on first occurrence.
+# Only keys listed in PROTECTED_CM_KEYS are affected; all others merge normally.
+# Not called for first-time file copies — source values are used as-is.
 neutralize_configmap_keys() {
   local theirs="$1" target="$2"
   [[ -z "${PROTECTED_CM_KEYS:-}" ]] && return 0
@@ -352,15 +358,97 @@ create_bitbucket_pr() {
   fi
 }
 
-# ── Interactive repo-selection menu ──────────────────────────────────────────
-# Shown when --targets is not supplied and stdin is a terminal.
-# Returns a comma-separated list of selected target names via stdout.
+# ── Interactive menus ─────────────────────────────────────────────────────────
+
+# Single-select source repo. Returns chosen repo name via stdout.
+pick_source() {
+  local -a names=() labels=()
+  local i
+  for ((i=0; i<REPO_COUNT; i++)); do
+    names+=( "$(jq -r ".repos[$i].name" "$CONFIG_FILE")" )
+    labels+=( "$(jq -r '.repos[$i] | "\(.name)  [\(.repo)]"' "$CONFIG_FILE")" )
+  done
+
+  local n=${#names[@]}
+  [[ $n -eq 0 ]] && { log_error "No repos configured in $CONFIG_FILE"; exit 1; }
+
+  local view=$(( n < 12 ? n : 12 ))
+  local total=$(( view + 5 ))
+  local cursor=0 scroll=0
+
+  _ps_render() {
+    printf '\033[%dA' "$total"
+    printf '\033[K\033[1m  Select SOURCE repo  (diff will be taken from this repo)\033[0m\n'
+    printf '\033[K  \033[2m↑/↓ navigate   ENTER confirm   Q quit\033[0m\n'
+    printf '\033[K\n'
+    if [[ $scroll -gt 0 ]]; then
+      printf '\033[K  \033[2m  ↑ %d more above\033[0m\n' "$scroll"
+    else
+      printf '\033[K\n'
+    fi
+    local printed=0
+    for ((i=scroll; i<scroll+view && i<n; i++)); do
+      if [[ $i -eq $cursor ]]; then
+        printf '\033[K  \033[1;36m▶ ◉  %s\033[0m\n' "${labels[$i]}"
+      else
+        printf '\033[K    ○  %s\n' "${labels[$i]}"
+      fi
+      printed=$(( printed + 1 ))
+    done
+    for ((i=printed; i<view; i++)); do printf '\033[K\n'; done
+    local below=$(( n - scroll - view ))
+    if [[ $below -gt 0 ]]; then
+      printf '\033[K  \033[2m  ↓ %d more below\033[0m\n' "$below"
+    else
+      printf '\033[K\n'
+    fi
+  }
+
+  printf '\n%.0s' $(seq 1 "$total")
+  tput civis 2>/dev/null || true
+  _ps_render
+
+  local key seq
+  while true; do
+    IFS= read -r -s -n1 key 2>/dev/null || key=""
+    if [[ "$key" == $'\x1b' ]]; then
+      IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
+      case "$seq" in
+        '[A')
+          [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 ))
+          [[ $cursor -lt $scroll ]] && scroll=$cursor
+          ;;
+        '[B')
+          [[ $cursor -lt $(( n-1 )) ]] && cursor=$(( cursor + 1 ))
+          [[ $cursor -ge $(( scroll + view )) ]] && scroll=$(( cursor - view + 1 ))
+          ;;
+      esac
+    else
+      case "$key" in
+        '') break ;;
+        'q'|'Q') tput cnorm 2>/dev/null || true; echo ""; log_warn "Aborted"; exit 0 ;;
+      esac
+    fi
+    _ps_render
+  done
+
+  tput cnorm 2>/dev/null || true
+  printf '\n  \033[1mSource:\033[0m %s\n\n' "${labels[$cursor]}"
+  echo "${names[$cursor]}"
+}
+
+# Multi-select target repos (source repo is excluded automatically).
+# Returns a comma-separated list of selected names via stdout.
 pick_targets() {
+  local exclude="${1:-}"
   local -a names=() repos=()
   local i
-  for ((i=0; i<TARGET_COUNT; i++)); do
-    names+=("$(jq -r ".targets[$i].name" "$CONFIG_FILE")")
-    repos+=("$(jq -r ".targets[$i].repo" "$CONFIG_FILE")")
+  for ((i=0; i<REPO_COUNT; i++)); do
+    local _n _r
+    _n=$(jq -r ".repos[$i].name" "$CONFIG_FILE")
+    _r=$(jq -r ".repos[$i].repo" "$CONFIG_FILE")
+    [[ "$_n" == "$exclude" ]] && continue
+    names+=("$_n"); repos+=("$_r")
   done
 
   local n=${#names[@]}
@@ -439,10 +527,10 @@ pick_targets() {
   echo "${result[*]}"
 }
 
-# Fetches tags from the source repo via git ls-remote (no full clone needed).
-# Outputs one tag per line, sorted newest-first by version order.
+# Fetches tags from a repo via git ls-remote (no full clone needed).
+# Arg: repo path (workspace/slug). Outputs one tag per line, newest-first.
 fetch_source_tags() {
-  local url="https://${BITBUCKET_USER}:${BITBUCKET_TOKEN}@bitbucket.org/${SOURCE_REPO}.git"
+  local url="https://${BITBUCKET_USER}:${BITBUCKET_TOKEN}@bitbucket.org/${1}.git"
   git ls-remote --tags "$url" 2>/dev/null \
     | grep -v '\^{}' \
     | awk '{print $2}' \
@@ -531,13 +619,19 @@ pick_ref() {
 
 # ── Interactive menus (only when stdin is a real terminal) ────────────────────
 if [[ -t 0 ]]; then
-  # 1. Repo selection (skip if --targets was given)
-  [[ "$FILTER_TARGETS" == "all" ]] && FILTER_TARGETS=$(pick_targets)
+  # 1. Source repo selection (skip if --source was given)
+  [[ -z "$SOURCE_NAME" ]] && SOURCE_NAME=$(pick_source)
 
-  # 2. Ref selection (skip whichever of --from / --to was given explicitly)
+  # 2. Target repo selection (skip if --targets was given; always excludes source)
+  [[ "$FILTER_TARGETS" == "all" ]] && FILTER_TARGETS=$(pick_targets "$SOURCE_NAME")
+
+  # 3. Ref selection (skip whichever of --from / --to was given explicitly)
   if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
-    log_info "Fetching tags from $SOURCE_REPO ..."
-    mapfile -t _TAGS < <(fetch_source_tags)
+    # Resolve source repo URL so we can fetch its tags for the menu
+    _SRC_IDX=$(jq -r --arg n "$SOURCE_NAME" '.repos | map(.name) | index($n)' "$CONFIG_FILE")
+    _SRC_REPO=$(jq -r ".repos[$_SRC_IDX].repo" "$CONFIG_FILE")
+    log_info "Fetching tags from $_SRC_REPO ..."
+    mapfile -t _TAGS < <(fetch_source_tags "$_SRC_REPO")
     if ! $FROM_EXPLICIT; then
       FROM_REF=$(pick_ref \
         "Select FROM ref  (start of diff)" \
@@ -552,12 +646,27 @@ if [[ -t 0 ]]; then
         "HEAD" \
         "${_TAGS[@]+"${_TAGS[@]}"}")
     fi
-    unset _TAGS
+    unset _TAGS _SRC_IDX _SRC_REPO
   fi
 fi
 
+# ── Resolve source repo from name ────────────────────────────────────────────
+if [[ -z "$SOURCE_NAME" ]]; then
+  log_error "--source <name> is required in non-interactive mode"
+  exit 1
+fi
+_IDX=$(jq -r --arg n "$SOURCE_NAME" '.repos | map(.name) | index($n)' "$CONFIG_FILE")
+if [[ "$_IDX" == "null" ]]; then
+  log_error "Source repo '$SOURCE_NAME' not found in $CONFIG_FILE"
+  log_error "Available: $(jq -r '[.repos[].name] | join(", ")' "$CONFIG_FILE")"
+  exit 1
+fi
+SOURCE_REPO=$(jq -r ".repos[$_IDX].repo"          "$CONFIG_FILE")
+SOURCE_SUBS=$(jq -c ".repos[$_IDX].substitutions" "$CONFIG_FILE")
+unset _IDX
+
 # ── Clone / update source ─────────────────────────────────────────────────────
-log_section "Source: $SOURCE_REPO  ($FROM_REF → $TO_REF)"
+log_section "Source: $SOURCE_NAME ($SOURCE_REPO)  ($FROM_REF → $TO_REF)"
 SOURCE_DIR="$WORK_DIR/source"
 
 if $DRY_RUN; then
@@ -583,14 +692,17 @@ done <<< "$CHANGED_FILES")
 PASS=()
 FAIL=()
 
-for i in $(seq 0 $((TARGET_COUNT - 1))); do
-  TARGET_NAME=$(jq -r ".targets[$i].name"          "$CONFIG_FILE")
-  TARGET_REPO=$(jq -r ".targets[$i].repo"          "$CONFIG_FILE")
-  TARGET_SUBS=$(jq -c ".targets[$i].substitutions" "$CONFIG_FILE")
+TARGET_COUNT=$(( REPO_COUNT - 1 ))   # for display purposes only
+_TARGET_NUM=0
+for i in $(seq 0 $((REPO_COUNT - 1))); do
+  TARGET_NAME=$(jq -r ".repos[$i].name"          "$CONFIG_FILE")
+  TARGET_REPO=$(jq -r ".repos[$i].repo"          "$CONFIG_FILE")
+  TARGET_SUBS=$(jq -c ".repos[$i].substitutions" "$CONFIG_FILE")
 
   is_target_included "$TARGET_NAME" || continue
+  _TARGET_NUM=$(( _TARGET_NUM + 1 ))
 
-  log_section "[$((i+1))/$TARGET_COUNT] $TARGET_NAME → $TARGET_REPO"
+  log_section "[$_TARGET_NUM/$TARGET_COUNT] $TARGET_NAME → $TARGET_REPO"
 
   if $DRY_RUN; then
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
