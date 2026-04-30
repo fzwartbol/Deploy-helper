@@ -92,8 +92,7 @@ for cmd in git curl awk; do
 done
 
 # ── Bundled jq (bin/jq-linux-amd64 / bin/jq-windows-amd64.exe shipped in repo)
-# The script uses pure-awk helpers and works without jq.  When the bundled or
-# system jq is present it is exposed as JQ_BIN for ad-hoc use.
+# jq IS required; the bundled binary is used automatically on Linux/Windows.
 JQ_BIN=""
 _os=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
 case "$_os" in
@@ -104,119 +103,13 @@ esac
 [[ -n "${_jq_bundle:-}" && -x "$_jq_bundle" ]] && JQ_BIN="$_jq_bundle"
 [[ -z "$JQ_BIN" ]] && command -v jq >/dev/null 2>&1 && JQ_BIN="jq"
 unset _os _jq_bundle
-
-# ── Config file helpers (pure awk — no jq or Python needed) ──────────────────
-
-# Get the first string value matching a key anywhere in the config file.
-_cf_str() {
-  awk -F'"' -v k="$1" '$2==k && NF>=4 { print $4; exit }' "$CONFIG_FILE"
-}
-
-# Count number of repos (by counting "name" keys at repo level).
-_cf_repo_count() {
-  awk -F'"' '$2=="name" && NF>=4 { c++ } END { print c+0 }' "$CONFIG_FILE"
-}
-
-# Get repos[N].name  (0-based index)
-_cf_repo_name() {
-  awk -F'"' -v idx="$1" '$2=="name" && NF>=4 { if (c++==idx) { print $4; exit } }' "$CONFIG_FILE"
-}
-
-# Get repos[N].repo  (0-based index)
-_cf_repo_path() {
-  awk -F'"' -v idx="$1" '$2=="repo" && NF>=4 { if (c++==idx) { print $4; exit } }' "$CONFIG_FILE"
-}
-
-# Get 0-based index of repo by name; prints "null" if not found.
-_cf_repo_index() {
-  awk -F'"' -v name="$1" '
-    $2=="name" && NF>=4 { if ($4==name) { print c+0; f=1; exit } c++ }
-    END { if (!f) print "null" }
-  ' "$CONFIG_FILE"
-}
-
-# Display label for repos[N]: "name  [repo/path]"
-_cf_repo_label() {
-  printf '%s  [%s]' "$(_cf_repo_name "$1")" "$(_cf_repo_path "$1")"
-}
-
-# All repo names as comma-separated string.
-_cf_repo_names_csv() {
-  awk -F'"' '$2=="name" && NF>=4 { printf "%s%s",(sep?", ":""),$4; sep=1 } END{print ""}' "$CONFIG_FILE"
-}
-
-# Substitutions for repos[N] as "key TAB value" lines.
-_cf_repo_subs() {
-  awk -F'"' -v idx="$1" '
-    $2=="name" && NF>=4          { nc++ }
-    nc==idx+1 && $2=="substitutions" { in_s=1; next }
-    in_s && /^[[:space:]]*\}/   { exit }
-    in_s && NF>=4 && $2!="" && $3~/^:/ { print $2 "\t" $4 }
-  ' "$CONFIG_FILE"
-}
-
-# Protected configmap keys joined with "|" (empty string if none configured).
-# Handles both compact  ["KEY1","KEY2"]  and multi-line array formats.
-_cf_protected_keys() {
-  awk '
-    /"protected_configmap_keys"/ {
-      in_a=1
-      rest=$0; sub(/^[^[]*\[/,"",rest)
-      while (1) {
-        idx=index(rest,"\""); if (!idx) break
-        rest=substr(rest,idx+1)
-        idx2=index(rest,"\""); if (!idx2) break
-        printf "%s%s",(sep?"|":""),substr(rest,1,idx2-1); sep=1
-        rest=substr(rest,idx2+1)
-      }
-      if (index($0,"]")) { in_a=0; printf "\n" }
-      next
-    }
-    in_a && /\]/ { printf "\n"; exit }
-    in_a && /"/ {
-      s=$0; gsub(/^[^"]*"/,"",s); gsub(/".*$/,"",s)
-      printf "%s%s",(sep?"|":""),s; sep=1
-    }
-    END { if (sep && in_a) printf "\n" }
-  ' "$CONFIG_FILE"
-}
-
-# ── JSON helpers for Bitbucket API (pure awk/grep/sed) ────────────────────────
-
-# Encode a string as a safe JSON value (escapes \, ", and newlines).
-_json_encode() {
-  printf '%s' "$1" | awk '{
-    gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\r/,"\\r"); gsub(/\t/,"\\t")
-    printf "%s%s",(NR>1?"\\n":""),$0
-  }'
-}
-
-# Build the Bitbucket PR JSON payload.
-_json_pr_payload() {
-  printf '{"title":"%s","description":"%s","source":{"branch":{"name":"%s"}},"destination":{"branch":{"name":"%s"}},"close_source_branch":true}' \
-    "$(_json_encode "$1")" "$(_json_encode "$2")" "$(_json_encode "$3")" "$(_json_encode "$4")"
-}
-
-# Extract PR URL (.links.html.href) from a Bitbucket API response.
-_json_pr_url() {
-  printf '%s' "$1" | tr -d '\n\r' \
-    | grep -o '"html":{"href":"[^"]*"' | head -1 \
-    | grep -o '"href":"[^"]*"' | cut -d'"' -f4
-}
-
-# Extract error message from a Bitbucket API response (fallback: raw body).
-_json_pr_error() {
-  local msg
-  msg=$(printf '%s' "$1" | tr -d '\n\r' \
-    | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
-  echo "${msg:-$1}"
-}
+[[ -n "$JQ_BIN" ]] || { log_error "jq not found — bundled binary missing from bin/"; exit 1; }
 
 # ── Load config ───────────────────────────────────────────────────────────────
-BASE_BRANCH=$(_cf_str base_branch);   BASE_BRANCH="${BASE_BRANCH:-main}"
-PR_TITLE_PREFIX=$(_cf_str title_prefix); PR_TITLE_PREFIX="${PR_TITLE_PREFIX:-chore(sync): }"
-REPO_COUNT=$(_cf_repo_count)
-PROTECTED_CM_KEYS=$(_cf_protected_keys)
+BASE_BRANCH=$("$JQ_BIN" -r '.pr.base_branch // "main"' "$CONFIG_FILE")
+PR_TITLE_PREFIX=$("$JQ_BIN" -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
+REPO_COUNT=$("$JQ_BIN" '.repos | length' "$CONFIG_FILE")
+PROTECTED_CM_KEYS=$("$JQ_BIN" -r '.protected_configmap_keys // [] | join("|")' "$CONFIG_FILE")
 # SOURCE_REPO / SOURCE_SUBS are resolved after source selection (see below)
 
 mkdir -p "$WORK_DIR"
@@ -285,36 +178,19 @@ clone_or_update() {
 
 # Builds a sed substitution script sorted longest-source-value first to prevent
 # partial-string matches (e.g. "app" clobbering part of "app-service").
+# Receives $src and $tgt as compact JSON objects (e.g. {"service_name":"source-service",...}).
 build_sed_script() {
   local src="$1" tgt="$2" sed_script="" sv tv src_esc tgt_esc
-  local src_f tgt_f
-  src_f=$(mktemp "${TMPDIR:-/tmp}/.subs_src_XXXXXX")
-  tgt_f=$(mktemp "${TMPDIR:-/tmp}/.subs_tgt_XXXXXX")
-  printf '%s\n' "$src" > "$src_f"
-  printf '%s\n' "$tgt" > "$tgt_f"
   while IFS=$'\t' read -r sv tv; do
     [[ -z "$sv" || -z "$tv" ]] && continue
     src_esc=$(printf '%s' "$sv" | sed 's/[[\.*^$()+?{|/]/\\&/g')
     tgt_esc=$(printf '%s' "$tv" | sed 's/[&|\\]/\\&/g')
     sed_script+="s|${src_esc}|${tgt_esc}|g;"
-  done < <(awk -F'\t' '
-    NR==FNR { if (NF==2) src[$1]=$2; next }
-    NF==2 && $1 in src && src[$1]!=$2 {
-      sv=src[$1]; tv=$2; l=length(sv)
-      svals[cnt]=sv; tvals[cnt]=tv; lens[cnt]=l; cnt++
-    }
-    END {
-      for (i=1;i<cnt;i++) {
-        sv2=svals[i]; tv2=tvals[i]; l2=lens[i]; j=i-1
-        while (j>=0 && lens[j]<l2) {
-          svals[j+1]=svals[j]; tvals[j+1]=tvals[j]; lens[j+1]=lens[j]; j--
-        }
-        svals[j+1]=sv2; tvals[j+1]=tv2; lens[j+1]=l2
-      }
-      for (i=0;i<cnt;i++) print svals[i] "\t" tvals[i]
-    }
-  ' "$src_f" "$tgt_f")
-  rm -f "$src_f" "$tgt_f"
+  done < <("$JQ_BIN" -rn --argjson s "$src" --argjson t "$tgt" \
+    '$s | to_entries
+     | map(select($t[.key] != null and .value != $t[.key]))
+     | sort_by(.value | length) | reverse
+     | .[] | [.value, $t[.key]] | @tsv')
   echo "$sed_script"
 }
 
@@ -484,7 +360,15 @@ three_way_merge_file() {
 create_bitbucket_pr() {
   local repo="$1" branch="$2" title="$3" body="$4"
   local payload response http_code body_json
-  payload=$(_json_pr_payload "$title" "$body" "$branch" "$BASE_BRANCH")
+  payload=$("$JQ_BIN" -n \
+    --arg title  "$title"       \
+    --arg body   "$body"        \
+    --arg branch "$branch"      \
+    --arg base   "$BASE_BRANCH" \
+    '{title:$title, description:$body,
+      source:{branch:{name:$branch}},
+      destination:{branch:{name:$base}},
+      close_source_branch:true}')
 
   # Resolve credentials: prefer explicit env vars, fall back to git credential helper
   # (Windows Credential Manager, macOS Keychain, ~/.netrc, etc.)
@@ -510,11 +394,11 @@ create_bitbucket_pr() {
   body_json=$(head  -n-1 <<< "$response")
 
   if [[ "$http_code" == "201" ]]; then
-    _json_pr_url "$body_json"
+    "$JQ_BIN" -r '.links.html.href' <<< "$body_json"
   elif grep -q "already exists" <<< "$body_json" 2>/dev/null; then
     log_warn "PR already open for branch $branch on $repo — skipping"
   else
-    log_error "Bitbucket API $http_code: $(_json_pr_error "$body_json")"
+    log_error "Bitbucket API $http_code: $("$JQ_BIN" -r '.error.message // .' <<< "$body_json")"
     return 1
   fi
 }
@@ -524,10 +408,12 @@ create_bitbucket_pr() {
 # Single-select source repo. Returns chosen repo name via stdout.
 pick_source() {
   local -a names=() labels=()
-  local i
+  local i n r
   for ((i=0; i<REPO_COUNT; i++)); do
-    names+=( "$(_cf_repo_name "$i")" )
-    labels+=( "$(_cf_repo_label "$i")" )
+    n=$("$JQ_BIN" -r ".repos[$i].name" "$CONFIG_FILE")
+    r=$("$JQ_BIN" -r ".repos[$i].repo" "$CONFIG_FILE")
+    names+=("$n")
+    labels+=("$n  [$r]")
   done
 
   local n=${#names[@]}
@@ -603,11 +489,10 @@ pick_source() {
 pick_targets() {
   local exclude="${1:-}"
   local -a names=() repos=()
-  local i
+  local i _n _r
   for ((i=0; i<REPO_COUNT; i++)); do
-    local _n _r
-    _n=$(_cf_repo_name "$i")
-    _r=$(_cf_repo_path "$i")
+    _n=$("$JQ_BIN" -r ".repos[$i].name" "$CONFIG_FILE")
+    _r=$("$JQ_BIN" -r ".repos[$i].repo" "$CONFIG_FILE")
     [[ "$_n" == "$exclude" ]] && continue
     names+=("$_n"); repos+=("$_r")
   done
@@ -789,8 +674,9 @@ if [[ -t 0 ]]; then
   # 3. Ref selection (skip whichever of --from / --to was given explicitly)
   if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
     # Resolve source repo URL so we can fetch its tags for the menu
-    _SRC_IDX=$(_cf_repo_index "$SOURCE_NAME")
-    _SRC_REPO=$(_cf_repo_path "$_SRC_IDX")
+    _SRC_IDX=$("$JQ_BIN" -r --arg n "$SOURCE_NAME" \
+      '.repos | to_entries[] | select(.value.name == $n) | .key' "$CONFIG_FILE")
+    _SRC_REPO=$("$JQ_BIN" -r ".repos[$_SRC_IDX].repo" "$CONFIG_FILE")
     log_info "Fetching tags from $_SRC_REPO ..."
     mapfile -t _TAGS < <(fetch_source_tags "$_SRC_REPO")
     if ! $FROM_EXPLICIT; then
@@ -816,14 +702,15 @@ if [[ -z "$SOURCE_NAME" ]]; then
   log_error "--source <name> is required in non-interactive mode"
   exit 1
 fi
-_IDX=$(_cf_repo_index "$SOURCE_NAME")
-if [[ "$_IDX" == "null" ]]; then
+_IDX=$("$JQ_BIN" -r --arg n "$SOURCE_NAME" \
+  '.repos | to_entries[] | select(.value.name == $n) | .key' "$CONFIG_FILE")
+if [[ -z "$_IDX" ]]; then
   log_error "Source repo '$SOURCE_NAME' not found in $CONFIG_FILE"
-  log_error "Available: $(_cf_repo_names_csv)"
+  log_error "Available: $("$JQ_BIN" -r '[.repos[].name] | join(", ")' "$CONFIG_FILE")"
   exit 1
 fi
-SOURCE_REPO=$(_cf_repo_path "$_IDX")
-SOURCE_SUBS=$(_cf_repo_subs "$_IDX")
+SOURCE_REPO=$("$JQ_BIN" -r ".repos[$_IDX].repo" "$CONFIG_FILE")
+SOURCE_SUBS=$("$JQ_BIN" -c ".repos[$_IDX].substitutions" "$CONFIG_FILE")
 unset _IDX
 
 # ── Clone / update source ─────────────────────────────────────────────────────
@@ -856,9 +743,9 @@ FAIL=()
 TARGET_COUNT=$(( REPO_COUNT - 1 ))   # for display purposes only
 _TARGET_NUM=0
 for i in $(seq 0 $((REPO_COUNT - 1))); do
-  TARGET_NAME=$(_cf_repo_name "$i")
-  TARGET_REPO=$(_cf_repo_path "$i")
-  TARGET_SUBS=$(_cf_repo_subs "$i")
+  TARGET_NAME=$("$JQ_BIN" -r ".repos[$i].name" "$CONFIG_FILE")
+  TARGET_REPO=$("$JQ_BIN" -r ".repos[$i].repo" "$CONFIG_FILE")
+  TARGET_SUBS=$("$JQ_BIN" -c ".repos[$i].substitutions" "$CONFIG_FILE")
 
   is_target_included "$TARGET_NAME" || continue
   _TARGET_NUM=$(( _TARGET_NUM + 1 ))
