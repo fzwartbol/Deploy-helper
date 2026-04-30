@@ -515,8 +515,7 @@ create_bitbucket_pr() {
 
 # ── Interactive menus ─────────────────────────────────────────────────────────
 
-# Single-select source repo. Returns chosen repo name via stdout.
-# Display goes to /dev/tty so it is visible even inside $() capture.
+# Single-select source repo. Sets _PICK_RESULT to the chosen repo name.
 pick_source() {
   local -a names=() labels=()
   local i
@@ -618,7 +617,7 @@ pick_source() {
 }
 
 # Multi-select target repos (source repo is excluded automatically).
-# Returns a comma-separated list of selected names via stdout.
+# Sets _PICK_RESULT to a comma-separated list of selected names.
 pick_targets() {
   local exclude="${1:-}"
   local -a names=() repos=()
@@ -746,9 +745,8 @@ fetch_source_tags() {
     | sort -Vr 2>/dev/null || sort -r
 }
 
-# Single-select scrollable ref picker.
+# Single-select scrollable ref picker. Sets _PICK_RESULT to chosen ref value.
 # Args: title  default_label  default_value  [tag …]
-# Prints the chosen ref value to stdout.
 pick_ref() {
   local title="$1" default_label="$2" default_value="$3"
   shift 3
