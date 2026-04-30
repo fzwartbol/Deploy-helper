@@ -104,20 +104,36 @@ esac
 [[ -z "$JQ_BIN" ]] && command -v jq >/dev/null 2>&1 && JQ_BIN="jq"
 unset _os _jq_bundle
 [[ -n "$JQ_BIN" ]] || { log_error "jq not found — bundled binary missing from bin/"; exit 1; }
+log_info "jq binary : $JQ_BIN"
+
+# Verify jq can actually execute (company AV/policy may block the bundled exe).
+log_info "Testing jq execution..."
+if ! "$JQ_BIN" --version >/dev/null 2>&1; then
+  log_error "jq failed to execute: $JQ_BIN"
+  log_error "If your company blocks unsigned executables, install jq via"
+  log_error "  choco install jq  or  winget install jqlang.jq"
+  log_error "and ensure it is on PATH."
+  exit 1
+fi
+log_info "jq OK: $("$JQ_BIN" --version 2>/dev/null)"
 
 # Detect whether the terminal supports ANSI cursor movement (cuu1).
 # Falls back to simple numbered menus when cursor-up is unavailable
 # (e.g. Git Bash on Windows, dumb terminals, CI environments).
+log_info "Detecting terminal capabilities..."
 _HAS_TUI=false
 if [[ -t 1 ]] && [[ "$(tput cuu1 2>/dev/null | wc -c)" -gt 0 ]]; then
   _HAS_TUI=true
 fi
+log_info "TUI capable : $_HAS_TUI"
 
 # ── Load config ───────────────────────────────────────────────────────────────
+log_info "Loading config: $CONFIG_FILE"
 BASE_BRANCH=$("$JQ_BIN" -r '.pr.base_branch // "main"' "$CONFIG_FILE")
 PR_TITLE_PREFIX=$("$JQ_BIN" -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
 REPO_COUNT=$("$JQ_BIN" '.repos | length' "$CONFIG_FILE")
 PROTECTED_CM_KEYS=$("$JQ_BIN" -r '.protected_configmap_keys // [] | join("|")' "$CONFIG_FILE")
+log_info "Config loaded — $REPO_COUNT repo(s), base branch: $BASE_BRANCH"
 # SOURCE_REPO / SOURCE_SUBS are resolved after source selection (see below)
 
 mkdir -p "$WORK_DIR"
