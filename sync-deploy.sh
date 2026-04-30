@@ -115,6 +115,7 @@ _HAS_TUI=false
 if [[ -z "${MSYSTEM:-}" && -z "${WINDIR:-}" && -t 1 ]]; then
   _HAS_TUI=true
 fi
+_PICK_RESULT=""   # set by pick_source / pick_targets / pick_ref
 
 # ── awk config helpers (no jq dependency at startup) ─────────────────────────
 _cf_str() { awk -F'"' -v k="$1" '$2==k && NF>=4 { print $4; exit }' "$CONFIG_FILE"; }
@@ -558,17 +559,17 @@ pick_source() {
       else
         printf '\033[K\n'
       fi
-    } >/dev/tty
+    }
 
-    printf '\n%.0s' $(seq 1 "$total") >/dev/tty
-    tput civis >/dev/tty 2>/dev/null || true
+    printf '\n%.0s' $(seq 1 "$total")
+    tput civis 2>/dev/null || true
     _ps_render
 
     local key seq
     while true; do
-      IFS= read -r -s -n1 key </dev/tty 2>/dev/null || key=""
+      IFS= read -r -s -n1 key 2>/dev/null || key=""
       if [[ "$key" == $'\x1b' ]]; then
-        IFS= read -r -s -n2 -t 0.1 seq </dev/tty 2>/dev/null || seq=""
+        IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
         case "$seq" in
           '[A')
             [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 ))
@@ -582,40 +583,38 @@ pick_source() {
       else
         case "$key" in
           '') break ;;
-          'q'|'Q') tput cnorm >/dev/tty 2>/dev/null || true; log_warn "Aborted"; exit 0 ;;
+          'q'|'Q') tput cnorm 2>/dev/null || true; log_warn "Aborted"; exit 0 ;;
         esac
       fi
       _ps_render
     done
 
-    tput cnorm >/dev/tty 2>/dev/null || true
-    printf '\n  Source: %s\n\n' "${labels[$cursor]}" >/dev/tty
-    echo "${names[$cursor]}"
+    tput cnorm 2>/dev/null || true
+    printf '\n  Source: %s\n\n' "${labels[$cursor]}"
+    _PICK_RESULT="${names[$cursor]}"
     return
   fi
 
-  # Simple text menu — all display to /dev/tty, only result to stdout
-  {
-    echo ""
-    echo "=== Select SOURCE repo ==="
-    for ((i=0; i<n; i++)); do echo "  $((i+1))) ${labels[$i]}"; done
-    echo ""
-  } >/dev/tty
+  # Simple text menu
+  echo ""
+  echo "=== Select SOURCE repo ==="
+  for ((i=0; i<n; i++)); do echo "  $((i+1))) ${labels[$i]}"; done
+  echo ""
 
   local choice
   if [[ $n -eq 1 ]]; then
-    echo "  (auto-selected: ${labels[0]})" >/dev/tty
+    echo "  (auto-selected: ${labels[0]})"
     choice=1
   else
     while true; do
-      printf 'Enter number [1-%d]: ' "$n" >/dev/tty
-      read -r choice </dev/tty
+      printf 'Enter number [1-%d]: ' "$n"
+      read -r choice
       [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )) && break
-      echo "  Invalid — enter a number between 1 and $n." >/dev/tty
+      echo "  Invalid — enter a number between 1 and $n."
     done
   fi
-  echo "  Selected: ${labels[$((choice-1))]}" >/dev/tty
-  echo "${names[$((choice-1))]}"
+  echo "  Selected: ${labels[$((choice-1))]}"
+  _PICK_RESULT="${names[$((choice-1))]}"
 }
 
 # Multi-select target repos (source repo is excluded automatically).
@@ -664,18 +663,16 @@ pick_targets() {
   }
 
   if ! $_HAS_TUI; then
-    {
-      echo ""
-      echo "=== Select TARGET repos to sync ==="
-      for ((i=0; i<n; i++)); do
-        printf '  %d) %-30s  [%s]\n' $((i+1)) "${names[$i]}" "${repos[$i]}"
-      done
-      echo ""
-      printf 'Numbers (space-separated), a=all, ENTER=all [default: all]: '
-    } >/dev/tty
+    echo ""
+    echo "=== Select TARGET repos to sync ==="
+    for ((i=0; i<n; i++)); do
+      printf '  %d) %-30s  [%s]\n' $((i+1)) "${names[$i]}" "${repos[$i]}"
+    done
+    echo ""
+    printf 'Numbers (space-separated), a=all, ENTER=all [default: all]: '
 
     local choices
-    read -r choices </dev/tty
+    read -r choices
 
     local -a result=()
     if [[ -z "$choices" || "$choices" == "a" || "$choices" == "A" || "$choices" == "all" ]]; then
@@ -687,23 +684,23 @@ pick_targets() {
       done
     fi
     if [[ ${#result[@]} -eq 0 ]]; then
-      echo "No repos selected — exiting" >/dev/tty; exit 0
+      echo "No repos selected — exiting"; exit 0
     fi
-    echo "  Syncing: $(IFS=', '; echo "${result[*]}")" >/dev/tty
+    echo "  Syncing: $(IFS=', '; echo "${result[*]}")"
     local IFS=','
-    echo "${result[*]}"
+    _PICK_RESULT="${result[*]}"
     return
   fi
 
-  printf '\n%.0s' $(seq 1 "$total") >/dev/tty
-  tput civis >/dev/tty 2>/dev/null || true
+  printf '\n%.0s' $(seq 1 "$total")
+  tput civis 2>/dev/null || true
   _pt_render
 
   local key seq
   while true; do
-    IFS= read -r -s -n1 key </dev/tty 2>/dev/null || key=""
+    IFS= read -r -s -n1 key 2>/dev/null || key=""
     if [[ "$key" == $'\x1b' ]]; then
-      IFS= read -r -s -n2 -t 0.1 seq </dev/tty 2>/dev/null || seq=""
+      IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
       case "$seq" in
         '[A') [[ $cursor -gt 0 ]]         && cursor=$(( cursor - 1 )) ;;
         '[B') [[ $cursor -lt $(( n-1 )) ]] && cursor=$(( cursor + 1 )) ;;
@@ -714,13 +711,13 @@ pick_targets() {
         'a'|'A') for ((i=0; i<n; i++)); do sel[$i]=1; done ;;
         'n'|'N') for ((i=0; i<n; i++)); do sel[$i]=0; done ;;
         '')      break ;;   # Enter
-        'q'|'Q') tput cnorm >/dev/tty 2>/dev/null || true; log_warn "Aborted"; exit 0 ;;
+        'q'|'Q') tput cnorm 2>/dev/null || true; log_warn "Aborted"; exit 0 ;;
       esac
     fi
     _pt_render
   done
 
-  tput cnorm >/dev/tty 2>/dev/null || true
+  tput cnorm 2>/dev/null || true
 
   local -a result=()
   for ((i=0; i<n; i++)); do
@@ -732,10 +729,10 @@ pick_targets() {
     exit 0
   fi
 
-  printf '  Syncing: %s\n' "$(IFS=', '; echo "${result[*]}")" >/dev/tty
+  printf '  Syncing: %s\n' "$(IFS=', '; echo "${result[*]}")"
 
   local IFS=','
-  echo "${result[*]}"
+  _PICK_RESULT="${result[*]}"
 }
 
 # Fetches tags from a repo via git ls-remote (no full clone needed).
@@ -793,37 +790,35 @@ pick_ref() {
     else
       printf '\033[K\n'
     fi
-  } >/dev/tty
+  }
 
   if ! $_HAS_TUI; then
     local show=$(( n < 16 ? n : 16 ))
-    {
-      echo ""
-      echo "=== $title ==="
-      # Show at most 15 entries (default + up to 14 tags) to keep output readable
-      for ((i=0; i<show; i++)); do printf '  %d) %s\n' $((i+1)) "${labels[$i]}"; done
-      [[ $n -gt $show ]] && echo "  ... ($((n-show)) more tags not shown)"
-      echo ""
-      printf 'Enter number [1-%d, ENTER=1 (%s)]: ' "$show" "${labels[0]}"
-    } >/dev/tty
+    echo ""
+    echo "=== $title ==="
+    # Show at most 15 entries (default + up to 14 tags) to keep output readable
+    for ((i=0; i<show; i++)); do printf '  %d) %s\n' $((i+1)) "${labels[$i]}"; done
+    [[ $n -gt $show ]] && echo "  ... ($((n-show)) more tags not shown)"
+    echo ""
+    printf 'Enter number [1-%d, ENTER=1 (%s)]: ' "$show" "${labels[0]}"
     local choice
-    read -r choice </dev/tty
+    read -r choice
     [[ -z "$choice" ]] && choice=1
     { [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= show )); } || choice=1
-    echo "  Selected: ${labels[$((choice-1))]}" >/dev/tty
-    echo "${values[$((choice-1))]}"
+    echo "  Selected: ${labels[$((choice-1))]}"
+    _PICK_RESULT="${values[$((choice-1))]}"
     return
   fi
 
-  printf '\n%.0s' $(seq 1 "$total") >/dev/tty
-  tput civis >/dev/tty 2>/dev/null || true
+  printf '\n%.0s' $(seq 1 "$total")
+  tput civis 2>/dev/null || true
   _pr_render
 
   local key seq
   while true; do
-    IFS= read -r -s -n1 key </dev/tty 2>/dev/null || key=""
+    IFS= read -r -s -n1 key 2>/dev/null || key=""
     if [[ "$key" == $'\x1b' ]]; then
-      IFS= read -r -s -n2 -t 0.1 seq </dev/tty 2>/dev/null || seq=""
+      IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
       case "$seq" in
         '[A')
           [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 ))
@@ -837,24 +832,28 @@ pick_ref() {
     else
       case "$key" in
         '') break ;;
-        'q'|'Q') tput cnorm >/dev/tty 2>/dev/null || true; log_warn "Aborted" >/dev/tty; exit 0 ;;
+        'q'|'Q') tput cnorm 2>/dev/null || true; log_warn "Aborted"; exit 0 ;;
       esac
     fi
     _pr_render
   done
 
-  tput cnorm >/dev/tty 2>/dev/null || true
-  printf '\n  \033[1mSelected:\033[0m %s\n\n' "${labels[$cursor]}" >/dev/tty
-  echo "${values[$cursor]}"
+  tput cnorm 2>/dev/null || true
+  printf '\n  \033[1mSelected:\033[0m %s\n\n' "${labels[$cursor]}"
+  _PICK_RESULT="${values[$cursor]}"
 }
 
 # ── Interactive menus (only when stdin is a real terminal) ────────────────────
 if [[ -t 0 ]]; then
   # 1. Source repo selection (skip if --source was given)
-  [[ -z "$SOURCE_NAME" ]] && SOURCE_NAME=$(pick_source)
+  if [[ -z "$SOURCE_NAME" ]]; then
+    pick_source; SOURCE_NAME="$_PICK_RESULT"
+  fi
 
   # 2. Target repo selection (skip if --targets was given; always excludes source)
-  [[ "$FILTER_TARGETS" == "all" ]] && FILTER_TARGETS=$(pick_targets "$SOURCE_NAME")
+  if [[ "$FILTER_TARGETS" == "all" ]]; then
+    pick_targets "$SOURCE_NAME"; FILTER_TARGETS="$_PICK_RESULT"
+  fi
 
   # 3. Ref selection (skip whichever of --from / --to was given explicitly)
   if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
@@ -864,18 +863,18 @@ if [[ -t 0 ]]; then
     log_info "Fetching tags from $_SRC_REPO ..."
     mapfile -t _TAGS < <(fetch_source_tags "$_SRC_REPO")
     if ! $FROM_EXPLICIT; then
-      FROM_REF=$(pick_ref \
+      pick_ref \
         "Select FROM ref  (start of diff)" \
         "HEAD~1  — previous commit (default)" \
         "HEAD~1" \
-        "${_TAGS[@]+"${_TAGS[@]}"}")
+        "${_TAGS[@]+"${_TAGS[@]}"}"; FROM_REF="$_PICK_RESULT"
     fi
     if ! $TO_EXPLICIT; then
-      TO_REF=$(pick_ref \
+      pick_ref \
         "Select TO ref  (end of diff)" \
         "HEAD  — latest commit (default)" \
         "HEAD" \
-        "${_TAGS[@]+"${_TAGS[@]}"}")
+        "${_TAGS[@]+"${_TAGS[@]}"}"; TO_REF="$_PICK_RESULT"
     fi
     unset _TAGS _SRC_IDX _SRC_REPO
   fi
