@@ -105,6 +105,14 @@ esac
 unset _os _jq_bundle
 [[ -n "$JQ_BIN" ]] || { log_error "jq not found — bundled binary missing from bin/"; exit 1; }
 
+# Detect whether the terminal supports ANSI cursor movement (cuu1).
+# Falls back to simple numbered menus when cursor-up is unavailable
+# (e.g. Git Bash on Windows, dumb terminals, CI environments).
+_HAS_TUI=false
+if [[ -t 1 ]] && [[ "$(tput cuu1 2>/dev/null | wc -c)" -gt 0 ]]; then
+  _HAS_TUI=true
+fi
+
 # ── Load config ───────────────────────────────────────────────────────────────
 BASE_BRANCH=$("$JQ_BIN" -r '.pr.base_branch // "main"' "$CONFIG_FILE")
 PR_TITLE_PREFIX=$("$JQ_BIN" -r '.pr.title_prefix // "chore(sync): "' "$CONFIG_FILE")
@@ -453,6 +461,20 @@ pick_source() {
     fi
   }
 
+  if ! $_HAS_TUI; then
+    echo "Select SOURCE repo  (diff will be taken from this repo):"
+    for ((i=0; i<n; i++)); do printf '  %d) %s\n' $((i+1)) "${labels[$i]}"; done
+    local choice
+    while true; do
+      read -rp "Enter number [1-$n]: " choice
+      [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )) && break
+      echo "  Invalid — enter a number between 1 and $n."
+    done
+    printf '\n  Source: %s\n\n' "${labels[$((choice-1))]}"
+    echo "${names[$((choice-1))]}"
+    return
+  fi
+
   printf '\n%.0s' $(seq 1 "$total")
   tput civis 2>/dev/null || true
   _ps_render
@@ -530,6 +552,31 @@ pick_targets() {
     printf '\033[K\n'
     printf '\033[K  \033[1m%d\033[0m of %d repo(s) selected\n' "$sel_count" "$n"
   }
+
+  if ! $_HAS_TUI; then
+    echo "Select TARGET repos to sync (space-separated numbers, or 'a' for all):"
+    for ((i=0; i<n; i++)); do
+      printf '  %d) %-30s  [%s]\n' $((i+1)) "${names[$i]}" "${repos[$i]}"
+    done
+    local choices
+    read -rp "Selection: " choices
+    local -a result=()
+    if [[ "$choices" == "a" || "$choices" == "A" || "$choices" == "all" ]]; then
+      result=("${names[@]}")
+    else
+      local c
+      for c in $choices; do
+        [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= n )) && result+=("${names[$((c-1))]}") || true
+      done
+    fi
+    if [[ ${#result[@]} -eq 0 ]]; then
+      log_warn "No repos selected — exiting"; exit 0
+    fi
+    printf '\n  Syncing: %s\n\n' "$(IFS=', '; echo "${result[*]}")"
+    local IFS=','
+    echo "${result[*]}"
+    return
+  fi
 
   printf '\n%.0s' $(seq 1 "$total")
   tput civis 2>/dev/null || true
@@ -631,6 +678,18 @@ pick_ref() {
       printf '\033[K\n'
     fi
   }
+
+  if ! $_HAS_TUI; then
+    echo "$title"
+    for ((i=0; i<n; i++)); do printf '  %d) %s\n' $((i+1)) "${labels[$i]}"; done
+    local choice
+    read -rp "Enter number [1-$n, default=1]: " choice
+    [[ -z "$choice" ]] && choice=1
+    { [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )); } || choice=1
+    printf '\n  Selected: %s\n\n' "${labels[$((choice-1))]}"
+    echo "${values[$((choice-1))]}"
+    return
+  fi
 
   printf '\n%.0s' $(seq 1 "$total")
   tput civis 2>/dev/null || true
