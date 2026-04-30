@@ -117,15 +117,15 @@ if ! "$JQ_BIN" --version >/dev/null 2>&1; then
 fi
 log_info "jq OK: $("$JQ_BIN" --version 2>/dev/null)"
 
-# Detect whether the terminal supports ANSI cursor movement (cuu1).
-# Falls back to simple numbered menus when cursor-up is unavailable
-# (e.g. Git Bash on Windows, dumb terminals, CI environments).
-log_info "Detecting terminal capabilities..."
+# On Windows/Git Bash (MSYSTEM is always set: MINGW64, MINGW32, MSYS) the ANSI
+# cursor-movement TUI renders blank even though tput reports sequences.
+# Force simple numbered prompts on Windows; use TUI only on Linux/macOS.
 _HAS_TUI=false
-if [[ -t 1 ]] && [[ "$(tput cuu1 2>/dev/null | wc -c)" -gt 0 ]]; then
+if [[ -z "${MSYSTEM:-}" && -z "${WINDIR:-}" && -t 1 ]] \
+   && [[ "$(tput cuu1 2>/dev/null | wc -c)" -gt 0 ]]; then
   _HAS_TUI=true
 fi
-log_info "TUI capable : $_HAS_TUI"
+log_info "Interactive mode: $(${_HAS_TUI} && echo "ANSI TUI" || echo "simple prompts")"
 
 # ── Load config ───────────────────────────────────────────────────────────────
 log_info "Loading config: $CONFIG_FILE"
@@ -478,15 +478,23 @@ pick_source() {
   }
 
   if ! $_HAS_TUI; then
-    echo "Select SOURCE repo  (diff will be taken from this repo):"
+    echo ""
+    echo "=== Select SOURCE repo (diff will be taken from this repo) ==="
     for ((i=0; i<n; i++)); do printf '  %d) %s\n' $((i+1)) "${labels[$i]}"; done
     local choice
-    while true; do
-      read -rp "Enter number [1-$n]: " choice
-      [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )) && break
-      echo "  Invalid — enter a number between 1 and $n."
-    done
-    printf '\n  Source: %s\n\n' "${labels[$((choice-1))]}"
+    if [[ $n -eq 1 ]]; then
+      echo "  (only one repo — auto-selected: ${labels[0]})"
+      choice=1
+    else
+      while true; do
+        read -rp "Enter number [1-$n]: " choice
+        [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )) && break
+        echo "  Invalid — enter a number between 1 and $n."
+      done
+    fi
+    echo ""
+    echo "  Source: ${labels[$((choice-1))]}"
+    echo ""
     echo "${names[$((choice-1))]}"
     return
   fi
@@ -570,14 +578,16 @@ pick_targets() {
   }
 
   if ! $_HAS_TUI; then
-    echo "Select TARGET repos to sync (space-separated numbers, or 'a' for all):"
+    echo ""
+    echo "=== Select TARGET repos to sync ==="
     for ((i=0; i<n; i++)); do
       printf '  %d) %-30s  [%s]\n' $((i+1)) "${names[$i]}" "${repos[$i]}"
     done
+    echo ""
     local choices
-    read -rp "Selection: " choices
+    read -rp "Numbers (space-separated), 'a'=all, or ENTER for all [default: all]: " choices
     local -a result=()
-    if [[ "$choices" == "a" || "$choices" == "A" || "$choices" == "all" ]]; then
+    if [[ -z "$choices" || "$choices" == "a" || "$choices" == "A" || "$choices" == "all" ]]; then
       result=("${names[@]}")
     else
       local c
@@ -588,7 +598,9 @@ pick_targets() {
     if [[ ${#result[@]} -eq 0 ]]; then
       log_warn "No repos selected — exiting"; exit 0
     fi
-    printf '\n  Syncing: %s\n\n' "$(IFS=', '; echo "${result[*]}")"
+    echo ""
+    echo "  Syncing: $(IFS=', '; echo "${result[*]}")"
+    echo ""
     local IFS=','
     echo "${result[*]}"
     return
@@ -696,13 +708,20 @@ pick_ref() {
   }
 
   if ! $_HAS_TUI; then
-    echo "$title"
-    for ((i=0; i<n; i++)); do printf '  %d) %s\n' $((i+1)) "${labels[$i]}"; done
+    echo ""
+    echo "=== $title ==="
+    # Show at most 15 entries (default + up to 14 tags) to keep output readable
+    local show=$(( n < 16 ? n : 16 ))
+    for ((i=0; i<show; i++)); do printf '  %d) %s\n' $((i+1)) "${labels[$i]}"; done
+    [[ $n -gt $show ]] && echo "  ... ($((n-show)) more tags not shown)"
+    echo ""
     local choice
-    read -rp "Enter number [1-$n, default=1]: " choice
+    read -rp "Enter number [1-$show, default=1 (${labels[0]})]: " choice
     [[ -z "$choice" ]] && choice=1
-    { [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )); } || choice=1
-    printf '\n  Selected: %s\n\n' "${labels[$((choice-1))]}"
+    { [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= show )); } || choice=1
+    echo ""
+    echo "  Selected: ${labels[$((choice-1))]}"
+    echo ""
     echo "${values[$((choice-1))]}"
     return
   fi
