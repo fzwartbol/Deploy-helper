@@ -214,8 +214,10 @@ strip_encrypted_data() {
   ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-# After copying a file from source, restores image/imageTag/tag lines from the
+# After copying a file from source, restores image-related lines from the
 # original target file so environment-specific image tags are never overwritten.
+# Covers Deployment-style keys (image, imageTag, tag) and kustomization images
+# block keys (newTag, newName, digest).
 # Matches by YAML key + indentation level to handle multi-container pods correctly.
 restore_image_lines() {
   local file="$1" original="$2"
@@ -223,13 +225,13 @@ restore_image_lines() {
   is_text_file "$file" || return 0
   awk '
     NR == FNR {
-      if (/^[[:space:]]*(image|imageTag|tag):[[:space:]]/) {
+      if (/^[[:space:]]*(image|imageTag|tag|newTag|newName|digest):[[:space:]]/) {
         key = $0; sub(/:[[:space:]].*$/, "", key)
         kc[key]++; kl[key, kc[key]] = $0
       }
       next
     }
-    /^[[:space:]]*(image|imageTag|tag):[[:space:]]/ {
+    /^[[:space:]]*(image|imageTag|tag|newTag|newName|digest):[[:space:]]/ {
       key = $0; sub(/:[[:space:]].*$/, "", key)
       ku[key]++
       if (ku[key] <= kc[key]) { print kl[key, ku[key]]; next }
@@ -268,9 +270,9 @@ neutralize_configmap_keys() {
   ' "$target" "$theirs" > "$theirs.tmp" && mv "$theirs.tmp" "$theirs"
 }
 
-# Checks whether a file contains any image/imageTag/tag YAML keys.
+# Checks whether a file contains any image-related YAML keys (Deployment or kustomization style).
 has_image_lines() {
-  grep -qE '^[[:space:]]*(image|imageTag|tag):[[:space:]]' "$1" 2>/dev/null
+  grep -qE '^[[:space:]]*(image|imageTag|tag|newTag|newName|digest):[[:space:]]' "$1" 2>/dev/null
 }
 
 # Copies a file from the source repo to the target dir and applies substitutions.
