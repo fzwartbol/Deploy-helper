@@ -17,6 +17,8 @@
 #   For new files no original exists, so source values are kept as-is
 #   and the PR body notes which files contain image references.
 set -euo pipefail
+# Show which line caused an unexpected abort (helps diagnose silent failures).
+trap 'printf "[FATAL] Script aborted at line %d\n" "$LINENO" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/repos.json"
@@ -108,14 +110,14 @@ esac
 unset _os _jq_bundle
 true  # jq optional — awk helpers used as primary config parser
 
-# On Windows/Git Bash (MSYSTEM is always set: MINGW64, MINGW32, MSYS) the ANSI
-# cursor-movement TUI renders blank even though tput reports sequences.
-# Force simple numbered prompts on Windows; use TUI only on Linux/macOS.
-_HAS_TUI=false
-if [[ -z "${MSYSTEM:-}" && -z "${WINDIR:-}" && -t 1 ]]; then
-  _HAS_TUI=true
+# _INTERACTIVE: true when there is a real user at the keyboard.
+# Git Bash always sets MSYSTEM (MINGW64/MINGW32/MSYS); use it as a reliable
+# Windows-interactive signal because isatty() can mis-report in some Git Bash
+# terminal configurations.
+_INTERACTIVE=false
+if [[ -t 0 || -n "${MSYSTEM:-}" ]]; then
+  _INTERACTIVE=true
 fi
-_PICK_RESULT=""   # set by pick_source / pick_targets / pick_ref
 
 # ── awk config helpers (no jq dependency at startup) ─────────────────────────
 _cf_str() { awk -F'"' -v k="$1" '$2==k && NF>=4 { print $4; exit }' "$CONFIG_FILE"; }
@@ -513,370 +515,181 @@ create_bitbucket_pr() {
   fi
 }
 
-# ── Interactive menus ─────────────────────────────────────────────────────────
+# ── Interactive selection ─────────────────────────────────────────────────────
 
-# Single-select source repo. Sets _PICK_RESULT to the chosen repo name.
-pick_source() {
-  local -a names=() labels=()
-  local i
-  for ((i=0; i<REPO_COUNT; i++)); do
-    names+=( "$(_cf_repo_name "$i")" )
-    labels+=( "$(_cf_repo_label "$i")" )
-  done
-
-  local n=${#names[@]}
-  [[ $n -eq 0 ]] && { log_error "No repos configured in $CONFIG_FILE"; exit 1; }
-
-  if $_HAS_TUI; then
-    local view=$(( n < 12 ? n : 12 ))
-    local total=$(( view + 5 ))
-    local cursor=0 scroll=0
-
-    _ps_render() {
-      printf '\033[%dA' "$total"
-      printf '\033[K\033[1m  Select SOURCE repo  (diff will be taken from this repo)\033[0m\n'
-      printf '\033[K  \033[2m↑/↓ navigate   ENTER confirm   Q quit\033[0m\n'
-      printf '\033[K\n'
-      if [[ $scroll -gt 0 ]]; then
-        printf '\033[K  \033[2m  ↑ %d more above\033[0m\n' "$scroll"
-      else
-        printf '\033[K\n'
-      fi
-      local printed=0
-      for ((i=scroll; i<scroll+view && i<n; i++)); do
-        if [[ $i -eq $cursor ]]; then
-          printf '\033[K  \033[1;36m▶ ◉  %s\033[0m\n' "${labels[$i]}"
-        else
-          printf '\033[K    ○  %s\n' "${labels[$i]}"
-        fi
-        printed=$(( printed + 1 ))
-      done
-      for ((i=printed; i<view; i++)); do printf '\033[K\n'; done
-      local below=$(( n - scroll - view ))
-      if [[ $below -gt 0 ]]; then
-        printf '\033[K  \033[2m  ↓ %d more below\033[0m\n' "$below"
-      else
-        printf '\033[K\n'
-      fi
-    }
-
-    printf '\n%.0s' $(seq 1 "$total")
-    tput civis 2>/dev/null || true
-    _ps_render
-
-    local key seq
-    while true; do
-      IFS= read -r -s -n1 key 2>/dev/null || key=""
-      if [[ "$key" == $'\x1b' ]]; then
-        IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
-        case "$seq" in
-          '[A')
-            [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 ))
-            [[ $cursor -lt $scroll ]] && scroll=$cursor
-            ;;
-          '[B')
-            [[ $cursor -lt $(( n-1 )) ]] && cursor=$(( cursor + 1 ))
-            [[ $cursor -ge $(( scroll + view )) ]] && scroll=$(( cursor - view + 1 ))
-            ;;
-        esac
-      else
-        case "$key" in
-          '') break ;;
-          'q'|'Q') tput cnorm 2>/dev/null || true; log_warn "Aborted"; exit 0 ;;
-        esac
-      fi
-      _ps_render
-    done
-
-    tput cnorm 2>/dev/null || true
-    printf '\n  Source: %s\n\n' "${labels[$cursor]}"
-    _PICK_RESULT="${names[$cursor]}"
-    return
-  fi
-
-  # Simple text menu
-  echo ""
-  echo "=== Select SOURCE repo ==="
-  for ((i=0; i<n; i++)); do echo "  $((i+1))) ${labels[$i]}"; done
-  echo ""
-
-  local choice
-  if [[ $n -eq 1 ]]; then
-    echo "  (auto-selected: ${labels[0]})"
-    choice=1
-  else
-    while true; do
-      printf 'Enter number [1-%d]: ' "$n"
-      read -r choice
-      [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )) && break
-      echo "  Invalid — enter a number between 1 and $n."
-    done
-  fi
-  echo "  Selected: ${labels[$((choice-1))]}"
-  _PICK_RESULT="${names[$((choice-1))]}"
-}
-
-# Multi-select target repos (source repo is excluded automatically).
-# Sets _PICK_RESULT to a comma-separated list of selected names.
-pick_targets() {
-  local exclude="${1:-}"
-  local -a names=() repos=()
-  local i _n _r
-  for ((i=0; i<REPO_COUNT; i++)); do
-    _n=$(_cf_repo_name "$i")
-    _r=$(_cf_repo_path "$i")
-    [[ "$_n" == "$exclude" ]] && continue
-    names+=("$_n"); repos+=("$_r")
-  done
-
-  local n=${#names[@]}
-  if [[ $n -eq 0 ]]; then
-    log_error "No targets configured in $CONFIG_FILE"
-    exit 1
-  fi
-
-  local -a sel=()
-  for ((i=0; i<n; i++)); do sel[$i]=0; done
-  local cursor=0
-  # 3 header lines + n repo lines + 2 footer lines
-  local total=$(( n + 5 ))
-
-  # Redraws the menu in-place using ANSI cursor-up + erase-line sequences.
-  _pt_render() {
-    printf '\033[%dA' "$total"
-    printf '\033[K\033[1m  Repos to sync\033[0m\n'
-    printf '\033[K  \033[2m↑/↓ navigate   SPACE toggle   A all   N none   ENTER confirm   Q quit\033[0m\n'
-    printf '\033[K\n'
-    for ((i=0; i<n; i++)); do
-      local mark="[ ]"; [[ ${sel[$i]} -eq 1 ]] && mark="[\033[32m✓\033[0m]"
-      if [[ $i -eq $cursor ]]; then
-        printf '\033[K  \033[1;36m▶ %b  %-30s  \033[2m%s\033[0m\n' "$mark" "${names[$i]}" "${repos[$i]}"
-      else
-        printf '\033[K    %b  %-30s  \033[2m%s\033[0m\n' "$mark" "${names[$i]}" "${repos[$i]}"
-      fi
-    done
-    local sel_count=0
-    for ((i=0; i<n; i++)); do [[ ${sel[$i]} -eq 1 ]] && sel_count=$(( sel_count + 1 )) || true; done
-    printf '\033[K\n'
-    printf '\033[K  \033[1m%d\033[0m of %d repo(s) selected\n' "$sel_count" "$n"
-  }
-
-  if ! $_HAS_TUI; then
-    echo ""
-    echo "=== Select TARGET repos to sync ==="
-    for ((i=0; i<n; i++)); do
-      printf '  %d) %-30s  [%s]\n' $((i+1)) "${names[$i]}" "${repos[$i]}"
-    done
-    echo ""
-    printf 'Numbers (space-separated), a=all, ENTER=all [default: all]: '
-
-    local choices
-    read -r choices
-
-    local -a result=()
-    if [[ -z "$choices" || "$choices" == "a" || "$choices" == "A" || "$choices" == "all" ]]; then
-      result=("${names[@]}")
-    else
-      local c
-      for c in $choices; do
-        [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= n )) && result+=("${names[$((c-1))]}") || true
-      done
-    fi
-    if [[ ${#result[@]} -eq 0 ]]; then
-      echo "No repos selected — exiting"; exit 0
-    fi
-    echo "  Syncing: $(IFS=', '; echo "${result[*]}")"
-    local IFS=','
-    _PICK_RESULT="${result[*]}"
-    return
-  fi
-
-  printf '\n%.0s' $(seq 1 "$total")
-  tput civis 2>/dev/null || true
-  _pt_render
-
-  local key seq
-  while true; do
-    IFS= read -r -s -n1 key 2>/dev/null || key=""
-    if [[ "$key" == $'\x1b' ]]; then
-      IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
-      case "$seq" in
-        '[A') [[ $cursor -gt 0 ]]         && cursor=$(( cursor - 1 )) ;;
-        '[B') [[ $cursor -lt $(( n-1 )) ]] && cursor=$(( cursor + 1 )) ;;
-      esac
-    else
-      case "$key" in
-        ' ') sel[$cursor]=$(( 1 - sel[$cursor] )) ;;
-        'a'|'A') for ((i=0; i<n; i++)); do sel[$i]=1; done ;;
-        'n'|'N') for ((i=0; i<n; i++)); do sel[$i]=0; done ;;
-        '')      break ;;   # Enter
-        'q'|'Q') tput cnorm 2>/dev/null || true; log_warn "Aborted"; exit 0 ;;
-      esac
-    fi
-    _pt_render
-  done
-
-  tput cnorm 2>/dev/null || true
-
-  local -a result=()
-  for ((i=0; i<n; i++)); do
-    [[ ${sel[$i]} -eq 1 ]] && result+=("${names[$i]}") || true
-  done
-
-  if [[ ${#result[@]} -eq 0 ]]; then
-    log_warn "No repos selected — exiting"
-    exit 0
-  fi
-
-  printf '  Syncing: %s\n' "$(IFS=', '; echo "${result[*]}")"
-
-  local IFS=','
-  _PICK_RESULT="${result[*]}"
-}
-
-# Fetches tags from a repo via git ls-remote (no full clone needed).
-# Arg: repo path (workspace/slug). Outputs one tag per line, newest-first.
+# Fetches tags from a Bitbucket repo via git ls-remote (no clone needed).
 fetch_source_tags() {
   local url; url=$(_bb_url "$1")
   git ls-remote --tags "$url" 2>/dev/null \
     | grep -v '\^{}' \
     | awk '{print $2}' \
     | sed 's|refs/tags/||' \
-    | sort -Vr 2>/dev/null || sort -r
+    | { sort -Vr 2>/dev/null || sort -r; }
 }
 
-# Single-select scrollable ref picker. Sets _PICK_RESULT to chosen ref value.
-# Args: title  default_label  default_value  [tag …]
-pick_ref() {
-  local title="$1" default_label="$2" default_value="$3"
-  shift 3
-  local -a labels=("$default_label") values=("$default_value")
-  for t in "$@"; do labels+=("$t"); values+=("$t"); done
+# Pre-load repo list into arrays (avoids repeated awk calls in menus).
+_RNAMES=(); _RPATHS=()
+for ((_i=0; _i<REPO_COUNT; _i++)); do
+  _RNAMES+=("$(_cf_repo_name "$_i")")
+  _RPATHS+=("$(_cf_repo_path "$_i")")
+done
+if [[ "${#_RNAMES[@]}" -eq 0 ]]; then
+  log_error "No repos found in $CONFIG_FILE"
+  exit 1
+fi
 
-  local n=${#labels[@]}
-  local view=$(( n < 12 ? n : 12 ))
-  # title + hint + blank + top-indicator + VIEW rows + bottom-indicator = VIEW+5
-  local total=$(( view + 5 ))
-  local cursor=0 scroll=0 i
-
-  _pr_render() {
-    printf '\033[%dA' "$total"
-    printf '\033[K\033[1m  %s\033[0m\n' "$title"
-    printf '\033[K  \033[2m↑/↓ navigate   ENTER confirm   Q quit\033[0m\n'
-    printf '\033[K\n'
-    # top scroll indicator (always 1 line)
-    if [[ $scroll -gt 0 ]]; then
-      printf '\033[K  \033[2m  ↑ %d more above\033[0m\n' "$scroll"
-    else
-      printf '\033[K\n'
-    fi
-    # item rows — always exactly $view lines (pad with blanks at end)
-    local printed=0
-    for ((i=scroll; i<scroll+view && i<n; i++)); do
-      if [[ $i -eq $cursor ]]; then
-        printf '\033[K  \033[1;36m▶ ◉  %s\033[0m\n' "${labels[$i]}"
-      else
-        printf '\033[K    ○  %s\n' "${labels[$i]}"
-      fi
-      printed=$(( printed + 1 ))
-    done
-    for ((i=printed; i<view; i++)); do printf '\033[K\n'; done
-    # bottom scroll indicator (always 1 line)
-    local below=$(( n - scroll - view ))
-    if [[ $below -gt 0 ]]; then
-      printf '\033[K  \033[2m  ↓ %d more below\033[0m\n' "$below"
-    else
-      printf '\033[K\n'
-    fi
-  }
-
-  if ! $_HAS_TUI; then
-    local show=$(( n < 16 ? n : 16 ))
-    echo ""
-    echo "=== $title ==="
-    # Show at most 15 entries (default + up to 14 tags) to keep output readable
-    for ((i=0; i<show; i++)); do printf '  %d) %s\n' $((i+1)) "${labels[$i]}"; done
-    [[ $n -gt $show ]] && echo "  ... ($((n-show)) more tags not shown)"
-    echo ""
-    printf 'Enter number [1-%d, ENTER=1 (%s)]: ' "$show" "${labels[0]}"
-    local choice
-    read -r choice
-    [[ -z "$choice" ]] && choice=1
-    { [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= show )); } || choice=1
-    echo "  Selected: ${labels[$((choice-1))]}"
-    _PICK_RESULT="${values[$((choice-1))]}"
-    return
+# ── 1. Source repo ────────────────────────────────────────────────────────────
+if [[ -z "$SOURCE_NAME" ]]; then
+  if ! $_INTERACTIVE; then
+    log_error "--source <name> is required (not running interactively)"
+    log_error "Available: $(_cf_repo_names_csv)"
+    usage; exit 1
   fi
 
-  printf '\n%.0s' $(seq 1 "$total")
-  tput civis 2>/dev/null || true
-  _pr_render
-
-  local key seq
-  while true; do
-    IFS= read -r -s -n1 key 2>/dev/null || key=""
-    if [[ "$key" == $'\x1b' ]]; then
-      IFS= read -r -s -n2 -t 0.1 seq 2>/dev/null || seq=""
-      case "$seq" in
-        '[A')
-          [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 ))
-          [[ $cursor -lt $scroll ]] && scroll=$cursor
-          ;;
-        '[B')
-          [[ $cursor -lt $(( n-1 )) ]] && cursor=$(( cursor + 1 ))
-          [[ $cursor -ge $(( scroll + view )) ]] && scroll=$(( cursor - view + 1 ))
-          ;;
-      esac
-    else
-      case "$key" in
-        '') break ;;
-        'q'|'Q') tput cnorm 2>/dev/null || true; log_warn "Aborted"; exit 0 ;;
-      esac
-    fi
-    _pr_render
+  printf '\n### sync-deploy.sh ###\n'
+  printf 'Config: %s\n\n' "$CONFIG_FILE"
+  printf '--- Select SOURCE repo ---\n'
+  printf 'Diff will be taken from this repo.\n\n'
+  for ((_i=0; _i<REPO_COUNT; _i++)); do
+    printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_RNAMES[$_i]}" "${_RPATHS[$_i]}"
   done
+  printf '\n'
 
-  tput cnorm 2>/dev/null || true
-  printf '\n  \033[1mSelected:\033[0m %s\n\n' "${labels[$cursor]}"
-  _PICK_RESULT="${values[$cursor]}"
-}
-
-# ── Interactive menus (only when stdin is a real terminal) ────────────────────
-if [[ -t 0 ]]; then
-  # 1. Source repo selection (skip if --source was given)
-  if [[ -z "$SOURCE_NAME" ]]; then
-    pick_source; SOURCE_NAME="$_PICK_RESULT"
-  fi
-
-  # 2. Target repo selection (skip if --targets was given; always excludes source)
-  if [[ "$FILTER_TARGETS" == "all" ]]; then
-    pick_targets "$SOURCE_NAME"; FILTER_TARGETS="$_PICK_RESULT"
-  fi
-
-  # 3. Ref selection (skip whichever of --from / --to was given explicitly)
-  if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
-    # Resolve source repo URL so we can fetch its tags for the menu
-    _SRC_IDX=$(_cf_repo_index "$SOURCE_NAME")
-    _SRC_REPO=$(_cf_repo_path "$_SRC_IDX")
-    log_info "Fetching tags from $_SRC_REPO ..."
-    mapfile -t _TAGS < <(fetch_source_tags "$_SRC_REPO")
-    if ! $FROM_EXPLICIT; then
-      pick_ref \
-        "Select FROM ref  (start of diff)" \
-        "HEAD~1  — previous commit (default)" \
-        "HEAD~1" \
-        "${_TAGS[@]+"${_TAGS[@]}"}"; FROM_REF="$_PICK_RESULT"
-    fi
-    if ! $TO_EXPLICIT; then
-      pick_ref \
-        "Select TO ref  (end of diff)" \
-        "HEAD  — latest commit (default)" \
-        "HEAD" \
-        "${_TAGS[@]+"${_TAGS[@]}"}"; TO_REF="$_PICK_RESULT"
-    fi
-    unset _TAGS _SRC_IDX _SRC_REPO
+  if [[ "$REPO_COUNT" -eq 1 ]]; then
+    SOURCE_NAME="${_RNAMES[0]}"
+    printf 'Auto-selected: %s\n\n' "$SOURCE_NAME"
+  else
+    _pick=""
+    while true; do
+      printf 'Enter number [1-%d]: ' "$REPO_COUNT"
+      read -r _pick 2>/dev/null || _pick=""
+      if [[ -z "$_pick" ]]; then
+        SOURCE_NAME="${_RNAMES[0]}"
+        printf '-> %s (default)\n\n' "$SOURCE_NAME"
+        break
+      fi
+      if [[ "$_pick" =~ ^[0-9]+$ ]] && ((_pick >= 1 && _pick <= REPO_COUNT)); then
+        SOURCE_NAME="${_RNAMES[$((_pick-1))]}"
+        printf '-> %s\n\n' "$SOURCE_NAME"
+        break
+      fi
+      printf 'Invalid — enter a number between 1 and %d.\n' "$REPO_COUNT"
+    done
+    unset _pick
   fi
 fi
+
+# ── 2. Target repos ───────────────────────────────────────────────────────────
+if [[ "$FILTER_TARGETS" == "all" ]]; then
+  _tgt_names=(); _tgt_paths=()
+  for ((_i=0; _i<REPO_COUNT; _i++)); do
+    [[ "${_RNAMES[$_i]}" == "$SOURCE_NAME" ]] && continue
+    _tgt_names+=("${_RNAMES[$_i]}"); _tgt_paths+=("${_RPATHS[$_i]}")
+  done
+  _nt=${#_tgt_names[@]}
+
+  if [[ $_nt -eq 0 ]]; then
+    log_error "No target repos left after excluding source '$SOURCE_NAME'"
+    exit 1
+  elif [[ $_nt -eq 1 ]]; then
+    FILTER_TARGETS="${_tgt_names[0]}"
+    printf 'Only one target — auto-selected: %s\n\n' "${_tgt_names[0]}"
+  elif $_INTERACTIVE; then
+    printf '--- Select TARGET repos ---\n'
+    printf 'These repos will receive the synced changes.\n\n'
+    for ((_i=0; _i<_nt; _i++)); do
+      printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_paths[$_i]}"
+    done
+    printf '\nEnter numbers (space-separated), or ENTER for all: '
+    read -r _picks 2>/dev/null || _picks=""
+
+    if [[ -z "$_picks" ]]; then
+      _sel=("${_tgt_names[@]}")
+    else
+      _sel=()
+      for _p in $_picks; do
+        [[ "$_p" =~ ^[0-9]+$ ]] && ((_p >= 1 && _p <= _nt)) \
+          && _sel+=("${_tgt_names[$((_p-1))]}")
+      done
+      if [[ ${#_sel[@]} -eq 0 ]]; then
+        printf 'No valid selection — using all.\n'
+        _sel=("${_tgt_names[@]}")
+      fi
+    fi
+
+    _oifs="$IFS"; IFS=','
+    FILTER_TARGETS="${_sel[*]}"
+    IFS="$_oifs"
+    printf '-> %s\n\n' "$FILTER_TARGETS"
+    unset _picks _p _sel _oifs
+  fi
+  unset _tgt_names _tgt_paths _nt
+fi
+
+# ── 3. Ref range ──────────────────────────────────────────────────────────────
+if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
+  _src_path=""
+  for ((_i=0; _i<REPO_COUNT; _i++)); do
+    if [[ "${_RNAMES[$_i]}" == "$SOURCE_NAME" ]]; then
+      _src_path="${_RPATHS[$_i]}"; break
+    fi
+  done
+
+  if $_INTERACTIVE; then
+    log_info "Fetching tags from ${_src_path} ..."
+    _tags=()
+    while IFS= read -r _t; do
+      [[ -n "$_t" ]] && _tags+=("$_t")
+    done < <(fetch_source_tags "$_src_path" 2>/dev/null || true)
+
+    # _menu_ref <result_var> <title> <default_label> <default_value> [tags...]
+    # Uses printf -v to assign the chosen value to the named variable.
+    _menu_ref() {
+      local _rv="$1" _ti="$2" _dl="$3" _dv="$4"; shift 4
+      local -a _lb=("$_dl") _vl=("$_dv")
+      local _x; for _x in "$@"; do _lb+=("$_x"); _vl+=("$_x"); done
+      local _cnt=${#_lb[@]}
+      local _show=$(( _cnt < 16 ? _cnt : 16 ))
+
+      printf '--- %s ---\n\n' "$_ti"
+      local _j
+      for ((_j=0; _j<_show; _j++)); do
+        printf '  %d) %s\n' "$((_j+1))" "${_lb[$_j]}"
+      done
+      [[ $_cnt -gt $_show ]] && printf '  ... (%d more tags not shown)\n' "$((_cnt-_show))"
+      printf '\nEnter number [1-%d, ENTER=1]: ' "$_show"
+
+      local _r
+      read -r _r 2>/dev/null || _r=""
+      [[ -z "$_r" ]] && _r=1
+      { [[ "$_r" =~ ^[0-9]+$ ]] && ((_r >= 1 && _r <= _show)); } || _r=1
+      printf -v "$_rv" '%s' "${_vl[$((_r-1))]}"
+      printf '-> %s\n\n' "${_lb[$((_r-1))]}"
+    }
+
+    printf '\n'
+    if ! $FROM_EXPLICIT; then
+      _menu_ref FROM_REF \
+        "Select FROM ref (start of diff)" \
+        "HEAD~1 — previous commit (default)" "HEAD~1" \
+        "${_tags[@]+"${_tags[@]}"}"
+    fi
+    if ! $TO_EXPLICIT; then
+      _menu_ref TO_REF \
+        "Select TO ref (end of diff)" \
+        "HEAD — latest commit (default)" "HEAD" \
+        "${_tags[@]+"${_tags[@]}"}"
+    fi
+    unset _t _tags
+  fi
+  unset _src_path
+fi
+unset _RNAMES _RPATHS _i
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Everything below this line is the sync engine — no interactive code.
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 # ── Resolve source repo from name ────────────────────────────────────────────
 if [[ -z "$SOURCE_NAME" ]]; then
