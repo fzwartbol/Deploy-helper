@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/repos.json"
 WORK_DIR="$SCRIPT_DIR/.work"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-SYNC_BRANCH="sync/deploy-$TIMESTAMP"
+# SYNC_BRANCH is computed after FROM_REF/TO_REF are resolved (see below)
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 if [[ -n "${MSYSTEM:-}" || -n "${WINDIR:-}" ]]; then
@@ -183,6 +183,13 @@ _json_pr_error() {
   msg=$(printf '%s' "$1" | tr -d '\n\r' \
     | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
   echo "${msg:-$1}"
+}
+
+# Sanitizes a git ref so it can be used as a component of a branch name.
+# Replaces chars illegal in branch names with '-', collapses runs of '-'.
+_sanitize_ref_for_branch() {
+  printf '%s' "$1" \
+    | sed 's/[[:space:]~^:?*\[\\]/-/g; s/\.\./-/g; s/-\{2,\}/-/g; s/^-//; s/-$//'
 }
 
 # ── Load config ───────────────────────────────────────────────────────────────
@@ -686,6 +693,9 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
   unset _tgt_names _tgt_paths _nt
 fi
 unset _RNAMES _RPATHS _i
+
+# ── Branch name: sync/deploy-from-<from>-to-<to> ─────────────────────────────
+SYNC_BRANCH="sync/deploy-from-$(_sanitize_ref_for_branch "$FROM_REF")-to-$(_sanitize_ref_for_branch "$TO_REF")"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Everything below this line is the sync engine — no interactive code.
