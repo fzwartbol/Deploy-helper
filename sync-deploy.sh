@@ -548,8 +548,9 @@ if [[ -z "$SOURCE_NAME" ]]; then
 
   printf '\n### sync-deploy.sh ###\n'
   printf 'Config: %s\n\n' "$CONFIG_FILE"
-  printf '--- Select SOURCE repo ---\n'
-  printf 'Diff will be taken from this repo.\n\n'
+  printf 'You will be asked: (1) source repo  (2) FROM tag/commit  (3) TO tag/commit  (4) target repo(s)\n\n'
+  printf '--- Step 1: Select SOURCE repo ---\n'
+  printf 'The diff will be computed on this repo.\n\n'
   for ((_i=0; _i<REPO_COUNT; _i++)); do
     printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_RNAMES[$_i]}" "${_RPATHS[$_i]}"
   done
@@ -579,54 +580,7 @@ if [[ -z "$SOURCE_NAME" ]]; then
   fi
 fi
 
-# ── 2. Target repos ───────────────────────────────────────────────────────────
-if [[ "$FILTER_TARGETS" == "all" ]]; then
-  _tgt_names=(); _tgt_paths=()
-  for ((_i=0; _i<REPO_COUNT; _i++)); do
-    [[ "${_RNAMES[$_i]}" == "$SOURCE_NAME" ]] && continue
-    _tgt_names+=("${_RNAMES[$_i]}"); _tgt_paths+=("${_RPATHS[$_i]}")
-  done
-  _nt=${#_tgt_names[@]}
-
-  if [[ $_nt -eq 0 ]]; then
-    log_error "No target repos left after excluding source '$SOURCE_NAME'"
-    exit 1
-  elif [[ $_nt -eq 1 ]]; then
-    FILTER_TARGETS="${_tgt_names[0]}"
-    printf 'Only one target — auto-selected: %s\n\n' "${_tgt_names[0]}"
-  elif $_INTERACTIVE; then
-    printf '--- Select TARGET repos ---\n'
-    printf 'These repos will receive the synced changes.\n\n'
-    for ((_i=0; _i<_nt; _i++)); do
-      printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_paths[$_i]}"
-    done
-    printf '\nEnter numbers (space-separated), or ENTER for all: '
-    read -r _picks 2>/dev/null || _picks=""
-
-    if [[ -z "$_picks" ]]; then
-      _sel=("${_tgt_names[@]}")
-    else
-      _sel=()
-      for _p in $_picks; do
-        [[ "$_p" =~ ^[0-9]+$ ]] && ((_p >= 1 && _p <= _nt)) \
-          && _sel+=("${_tgt_names[$((_p-1))]}")
-      done
-      if [[ ${#_sel[@]} -eq 0 ]]; then
-        printf 'No valid selection — using all.\n'
-        _sel=("${_tgt_names[@]}")
-      fi
-    fi
-
-    _oifs="$IFS"; IFS=','
-    FILTER_TARGETS="${_sel[*]}"
-    IFS="$_oifs"
-    printf '-> %s\n\n' "$FILTER_TARGETS"
-    unset _picks _p _sel _oifs
-  fi
-  unset _tgt_names _tgt_paths _nt
-fi
-
-# ── 3. Ref range ──────────────────────────────────────────────────────────────
+# ── 2. Ref range (FROM → TO commit/tag on the source repo) ───────────────────
 if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
   _src_path=""
   for ((_i=0; _i<REPO_COUNT; _i++)); do
@@ -670,19 +624,66 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
     printf '\n'
     if ! $FROM_EXPLICIT; then
       _menu_ref FROM_REF \
-        "Select FROM ref (start of diff)" \
+        "Select FROM ref (start of diff — older commit/tag)" \
         "HEAD~1 — previous commit (default)" "HEAD~1" \
         "${_tags[@]+"${_tags[@]}"}"
     fi
     if ! $TO_EXPLICIT; then
       _menu_ref TO_REF \
-        "Select TO ref (end of diff)" \
+        "Select TO ref (end of diff — newer commit/tag)" \
         "HEAD — latest commit (default)" "HEAD" \
         "${_tags[@]+"${_tags[@]}"}"
     fi
     unset _t _tags
   fi
   unset _src_path
+fi
+
+# ── 3. Target repos (which repos receive the diff) ────────────────────────────
+if [[ "$FILTER_TARGETS" == "all" ]]; then
+  _tgt_names=(); _tgt_paths=()
+  for ((_i=0; _i<REPO_COUNT; _i++)); do
+    [[ "${_RNAMES[$_i]}" == "$SOURCE_NAME" ]] && continue
+    _tgt_names+=("${_RNAMES[$_i]}"); _tgt_paths+=("${_RPATHS[$_i]}")
+  done
+  _nt=${#_tgt_names[@]}
+
+  if [[ $_nt -eq 0 ]]; then
+    log_error "No target repos left after excluding source '$SOURCE_NAME'"
+    exit 1
+  elif [[ $_nt -eq 1 ]]; then
+    FILTER_TARGETS="${_tgt_names[0]}"
+    printf 'Only one target — auto-selected: %s\n\n' "${_tgt_names[0]}"
+  elif $_INTERACTIVE; then
+    printf '--- Select TARGET repo(s) ---\n'
+    printf 'The diff (%s -> %s) will be applied to these repos.\n\n' "$FROM_REF" "$TO_REF"
+    for ((_i=0; _i<_nt; _i++)); do
+      printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_paths[$_i]}"
+    done
+    printf '\nEnter numbers (space-separated), or ENTER for all: '
+    read -r _picks 2>/dev/null || _picks=""
+
+    if [[ -z "$_picks" ]]; then
+      _sel=("${_tgt_names[@]}")
+    else
+      _sel=()
+      for _p in $_picks; do
+        [[ "$_p" =~ ^[0-9]+$ ]] && ((_p >= 1 && _p <= _nt)) \
+          && _sel+=("${_tgt_names[$((_p-1))]}")
+      done
+      if [[ ${#_sel[@]} -eq 0 ]]; then
+        printf 'No valid selection — using all.\n'
+        _sel=("${_tgt_names[@]}")
+      fi
+    fi
+
+    _oifs="$IFS"; IFS=','
+    FILTER_TARGETS="${_sel[*]}"
+    IFS="$_oifs"
+    printf '-> %s\n\n' "$FILTER_TARGETS"
+    unset _picks _p _sel _oifs
+  fi
+  unset _tgt_names _tgt_paths _nt
 fi
 unset _RNAMES _RPATHS _i
 
