@@ -1,0 +1,13 @@
+{
+  "app":"checkout-service",
+  "environment":"dev",
+  "branch":"release/1.2",
+  "pipelineId":"run-mock-1",
+  "timestamp":"2026-05-01T10:00:00Z",
+  "total":80,
+  "passed":75,
+  "failed":5,
+  "status":"YELLOW",
+  "pipelineUrl":"https://pipeline.example/run-mock-1",
+  "allureUrl":"https://allure.example/checkout/dev"
+}
