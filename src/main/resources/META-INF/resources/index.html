@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Test Dashboard</title>
+  <style>
+    body { margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#f8fafc; color:#0f172a; }
+    .container { max-width:1200px; margin:0 auto; padding:24px; }
+    .controls { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:20px; }
+    input, select { padding:10px 12px; border:1px solid #e2e8f0; border-radius:10px; min-width:200px; }
+    button { border:1px solid #cbd5e1; background:#fff; border-radius:999px; padding:8px 14px; cursor:pointer; }
+    button.active { background:#0f172a; color:#fff; border-color:#0f172a; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }
+    .card { background:#fff; border:1px solid #e2e8f0; border-radius:12px; box-shadow:0 1px 3px rgba(15,23,42,0.08); padding:16px; }
+    .unknown-card { background:#f1f5f9; }
+    .title { display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:8px; }
+    .dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px; }
+    .GREEN{ background:#22c55e;} .YELLOW{ background:#eab308;} .RED{ background:#ef4444;} .UNKNOWN{ background:#94a3b8;}
+    .meta { color:#475569; font-size:14px; margin-bottom:8px; }
+    a { color:#2563eb; text-decoration:none; display:block; font-size:14px; margin-top:6px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>Test Dashboard</h1>
+  <div class="controls">
+    <input id="appFilter" placeholder="Filter by app name" />
+    <button class="active" data-status="GREEN">Success</button><button class="active" data-status="YELLOW">Warning</button><button class="active" data-status="RED">Fail</button><button class="active" data-status="UNKNOWN">Unknown</button>
+  </div>
+  <div id="cards" class="grid"></div>
+</div>
+<script>
+const state = { search:'', statuses:new Set(['GREEN','YELLOW','RED','UNKNOWN']), rows:[], branchSelection:{} };
+const cards = document.getElementById('cards');
+document.getElementById('appFilter').addEventListener('input', (e) => { state.search=e.target.value.toLowerCase(); render(); });
+document.querySelectorAll('button[data-status]').forEach(btn => btn.addEventListener('click',()=>{const s=btn.dataset.status; if(state.statuses.has(s)){state.statuses.delete(s);btn.classList.remove('active')} else {state.statuses.add(s);btn.classList.add('active')} render();}));
+
+function groupedRows(){
+  const groups = {};
+  state.rows.forEach(r => { const k=`${r.app}::${r.environment}`; groups[k] ??= {app:r.app, environment:r.environment, branches:[]}; groups[k].branches.push(r); });
+  return Object.values(groups);
+}
+
+function render(){
+  const groups = groupedRows().filter(g=>g.app.toLowerCase().includes(state.search));
+  cards.innerHTML = groups.map(g => {
+    const options = g.branches.map(r=>r.branch || 'main');
+    const selected = state.branchSelection[`${g.app}::${g.environment}`] || options[0];
+    state.branchSelection[`${g.app}::${g.environment}`] = selected;
+    const row = g.branches.find(r => (r.branch||'main') === selected) || g.branches[0];
+    if(!state.statuses.has(row.status)) return '';
+    return `<article class="card ${row.status==='UNKNOWN'?'unknown-card':''}"><div class="title"><strong>${g.app}</strong><span><i class="dot ${row.status}"></i>${row.status}</span></div><div class="meta">Environment: ${g.environment || 'n/a'}</div><label class="meta">Branch: <select data-key="${g.app}::${g.environment}">${options.map(b=>`<option ${b===selected?'selected':''}>${b}</option>`).join('')}</select></label><div class="meta">Failed: ${row.failed ?? 0} / ${row.total ?? 0}</div>${row.pipelineUrl ? `<a href="${row.pipelineUrl}" target="_blank" rel="noopener">Pipeline run</a>` : `<span class="meta">Pipeline run: n/a</span>`}${row.allureUrl ? `<a href="${row.allureUrl}" target="_blank" rel="noopener">Allure report</a>` : `<span class="meta">Allure report: n/a</span>`}</article>`;
+  }).join('');
+  document.querySelectorAll('select[data-key]').forEach(s=>s.addEventListener('change',(e)=>{state.branchSelection[e.target.dataset.key]=e.target.value; render();}));
+}
+fetch('/api/test-status/latest').then(r=>r.json()).then(data=>{state.rows=data; render();});
+</script>
+</body>
+</html>
