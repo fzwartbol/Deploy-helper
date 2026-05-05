@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # sync-deploy.sh — sync OpenShift deploy-repo diffs across Bitbucket repos
 #
+# IMPORTANT: must be run with bash, not sh.
+#   Correct:   bash sync-deploy.sh
+#   Wrong:     sh sync-deploy.sh
+
+# Guard: abort immediately if running under sh/dash instead of bash.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "ERROR: this script requires bash. Run it as:" >&2
+  echo "  bash $0 $*" >&2
+  exit 1
+fi
+#
 # Per-file rules
 #   D  deleted   → delete from target
 #   M  modified  → three-way merge
