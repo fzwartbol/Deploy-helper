@@ -226,17 +226,23 @@ _sanitize_ref() {
 
 # ── git helpers ───────────────────────────────────────────────────────────────
 
-# Build a Bitbucket clone URL.
-# Uses SSH by default (git@bitbucket.org:workspace/repo.git) so that the
-# existing SSH key in the git credential store is used automatically.
-# Falls back to HTTPS only when BITBUCKET_USER and BITBUCKET_TOKEN are both set.
+# Build a clone URL from a repo value.
+# If the value is already a full URL (git@..., https://, ssh://) it is used
+# as-is.  Otherwise it is treated as a bare "workspace/repo" path: SSH is used
+# by default; HTTPS only when both BITBUCKET_USER and BITBUCKET_TOKEN are set.
 _bb_url() {
-  if [[ -n "${BITBUCKET_USER:-}" && -n "${BITBUCKET_TOKEN:-}" ]]; then
-    printf 'https://%s:%s@bitbucket.org/%s.git' \
-      "$BITBUCKET_USER" "$BITBUCKET_TOKEN" "$1"
-  else
-    printf 'git@bitbucket.org:%s.git' "$1"
-  fi
+  local repo="$1"
+  case "$repo" in
+    git@*|https://*|ssh://*|http://*)
+      printf '%s' "$repo" ;;
+    *)
+      if [[ -n "${BITBUCKET_USER:-}" && -n "${BITBUCKET_TOKEN:-}" ]]; then
+        printf 'https://%s:%s@bitbucket.org/%s.git' \
+          "$BITBUCKET_USER" "$BITBUCKET_TOKEN" "$repo"
+      else
+        printf 'git@bitbucket.org:%s.git' "$repo"
+      fi ;;
+  esac
 }
 
 # Clone repo or reset an existing clone to origin/<BASE_BRANCH>
