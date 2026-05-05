@@ -715,7 +715,7 @@ done <<< "$CHANGED_FILES"
 
 CHANGED_FILES_MD=$(
   while IFS=$'\t' read -r s f1 f2; do
-    printf -- '- `[%s]` `%s`\n' "$s" "${f2:-$f1}"
+    printf '%s\n' "- \`[$s]\` \`${f2:-$f1}\`"
   done <<< "$CHANGED_FILES"
 )
 
@@ -906,7 +906,7 @@ Image tags are environment-specific and were not copied from source."
 
 ### Merge conflicts — resolve before merging
 
-$(printf -- '- \`%s\`\n' "${CONFLICT_FILES[@]}")
+$(for _cf in "${CONFLICT_FILES[@]}"; do printf '%s\n' "- \`$_cf\`"; done)
 
 These files contain \`<<<<<<<\` conflict markers. Edit them to resolve, then commit."
 
