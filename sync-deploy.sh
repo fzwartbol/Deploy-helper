@@ -553,19 +553,24 @@ if [[ -z "$SOURCE_NAME" ]]; then
     usage; exit 1
   fi
 
-  printf '\n### sync-deploy.sh ###\n'
-  printf 'Config: %s\n\n' "$CONFIG_FILE"
-  printf 'Steps: (1) source repo  (2) FROM ref  (3) TO ref  (4) target(s)\n\n'
-  printf '%s\n' '--- Step 1: Select SOURCE repo ---'
-  printf 'The diff will be computed on this repo.\n\n'
+  echo ""
+  echo "### sync-deploy.sh ###"
+  echo "Config: $CONFIG_FILE"
+  echo ""
+  echo "Steps: (1) source repo  (2) FROM ref  (3) TO ref  (4) target(s)"
+  echo ""
+  echo "--- Step 1: Select SOURCE repo ---"
+  echo "The diff will be computed on this repo."
+  echo ""
   for ((_i=0; _i<REPO_COUNT; _i++)); do
     printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_RNAMES[$_i]}" "${_RPATHS[$_i]}"
   done
-  printf '\n'
+  echo ""
 
   if [[ "$REPO_COUNT" -eq 1 ]]; then
     SOURCE_NAME="${_RNAMES[0]}"
-    printf 'Only one repo — auto-selected: %s\n\n' "$SOURCE_NAME"
+    echo "Only one repo — auto-selected: $SOURCE_NAME"
+    echo ""
   else
     while true; do
       printf 'Enter number [1-%d, ENTER=1]: ' "$REPO_COUNT"
@@ -573,7 +578,8 @@ if [[ -z "$SOURCE_NAME" ]]; then
       [[ -z "$_pick" ]] && _pick=1
       if [[ "$_pick" =~ ^[0-9]+$ ]] && ((_pick >= 1 && _pick <= REPO_COUNT)); then
         SOURCE_NAME="${_RNAMES[$((_pick-1))]}"
-        printf '%s\n\n' "-> $SOURCE_NAME"
+        echo "-> $SOURCE_NAME"
+        echo ""
         break
       fi
       printf 'Enter a number between 1 and %d.\n' "$REPO_COUNT"
@@ -603,7 +609,8 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
       local _n=${#_labels[@]}
       local _show=$(( _n < 16 ? _n : 16 ))
 
-      printf '%s\n\n' "--- $_title ---"
+      echo "--- $_title ---"
+      echo ""
       local _j
       for ((_j=0; _j<_show; _j++)); do
         printf '  %d) %s\n' "$((_j+1))" "${_labels[$_j]}"
@@ -615,7 +622,8 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
       [[ -z "$_r" ]] && _r=1
       { [[ "$_r" =~ ^[0-9]+$ ]] && ((_r>=1 && _r<=_show)); } || _r=1
       printf -v "$_rv" '%s' "${_values[$((_r-1))]}"
-      printf '%s\n\n' "-> ${_labels[$((_r-1))]}"
+      echo "-> ${_labels[$((_r-1))]}"
+      echo ""
     }
 
     printf '\n'
@@ -646,10 +654,12 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
     exit 1
   elif [[ $_nt -eq 1 ]]; then
     FILTER_TARGETS="${_tgt_names[0]}"
-    printf 'Only one target — auto-selected: %s\n\n' "${_tgt_names[0]}"
+    echo "Only one target — auto-selected: ${_tgt_names[0]}"
+    echo ""
   elif $_INTERACTIVE; then
-    printf '%s\n' '--- Step 3: Select TARGET repo(s) ---'
-    printf 'The diff (%s → %s) will be applied to these repos.\n\n' "$FROM_REF" "$TO_REF"
+    echo "--- Step 3: Select TARGET repo(s) ---"
+    echo "The diff ($FROM_REF -> $TO_REF) will be applied to these repos."
+    echo ""
     for ((_i=0; _i<_nt; _i++)); do
       printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_paths[$_i]}"
     done
@@ -663,13 +673,14 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
       for _p in $_picks; do
         [[ "$_p" =~ ^[0-9]+$ ]] && ((_p>=1 && _p<=_nt)) && _sel+=("${_tgt_names[$((_p-1))]}")
       done
-      [[ ${#_sel[@]} -eq 0 ]] && { printf 'Invalid — using all.\n'; _sel=("${_tgt_names[@]}"); }
+      [[ ${#_sel[@]} -eq 0 ]] && { echo "Invalid — using all."; _sel=("${_tgt_names[@]}"); }
     fi
 
     _oifs="$IFS"; IFS=','
     FILTER_TARGETS="${_sel[*]}"
     IFS="$_oifs"
-    printf '%s\n\n' "-> $FILTER_TARGETS"
+    echo "-> $FILTER_TARGETS"
+    echo ""
     unset _picks _p _sel _oifs
   fi
   unset _tgt_names _tgt_paths _nt
