@@ -195,6 +195,9 @@ resources:
   - ../../base
   - sealed-secret.yaml
   - source-app-configmap-v1.yaml
+images:
+  - name: source-image
+    newTag: v1.0.0
 EOF
 
   # Sealed secret — will be "copied" to staging overlay in v2
@@ -301,6 +304,32 @@ data:
   FEATURE_FLAG: new-flag
 EOF
 
+  # M: kustomization.yaml — update resources reference v1→v2, bump image tag
+  cat > overlays/dev/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - sealed-secret.yaml
+  - source-app-configmap-v2.yaml
+images:
+  - name: source-image
+    newTag: v2.0.0
+EOF
+
+  # M: dev sealed-secret — modified in source (must NOT be synced to target)
+  cat > overlays/dev/sealed-secret.yaml <<'EOF'
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: source-app-db-credentials
+  namespace: source-namespace
+spec:
+  encryptedData:
+    password: ModifiedSourceEncryptedPassword==
+    username: ModifiedSourceEncryptedUsername==
+EOF
+
   # A: staging overlay sealed-secret — same metadata.name as dev one (= a copy)
   mkdir -p overlays/staging
   cat > overlays/staging/sealed-secret.yaml <<'EOF'
@@ -313,6 +342,18 @@ spec:
   encryptedData:
     password: SourceStagingEncryptedPassword==
     username: SourceStagingEncryptedUsername==
+EOF
+
+  # A: staging overlay — truly new sealed secret (unique metadata.name, no copy)
+  cat > overlays/staging/source-app-unique-secret.yaml <<'EOF'
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: source-app-unique-secret
+  namespace: source-namespace
+spec:
+  encryptedData:
+    api_key: SourceUniqueEncryptedValue==
 EOF
 }
 with_work "source-deploy-repo" "v1.1.0" source_v2
@@ -405,6 +446,9 @@ resources:
   - ../../base
   - sealed-secret.yaml
   - app-a-configmap-v1.yaml
+images:
+  - name: image-a
+    newTag: app-a-custom-v1.5.0
 EOF
 
   # App-a's own sealed secret — cluster-specific encrypted values
@@ -651,6 +695,66 @@ absent  "$B/overlays/dev/source-app-internal-svc.yaml"  "source filename not in 
 exists  "$B/overlays/dev/app-b-internal-svc.yaml"       "filename with app-b substitution"
 has     "$B/overlays/dev/app-b-internal-svc.yaml"  "name: app-b-internal"  "content substituted in app-b"
 has     "$B/overlays/dev/app-b-internal-svc.yaml"  "namespace: ns-b"       "namespace correct in app-b"
+
+# ── Branch name contains FROM/TO refs ────────────────────────────────────────
+section "Branch name contains FROM and TO refs"
+_branch=$(git -C "$WORK_DIR/app-a" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+if [[ "$_branch" == "sync/deploy-from-v1.0.0-to-v1.1.0" ]]; then
+  ok "branch is sync/deploy-from-v1.0.0-to-v1.1.0"
+else
+  fail "expected sync/deploy-from-v1.0.0-to-v1.1.0, got $_branch"
+fi
+unset _branch
+
+# ── app-a: kustomization.yaml images block — newTag preserved ────────────────
+section "app-a  kustomization.yaml — images newTag preserved from target"
+has     "$A/overlays/dev/kustomization.yaml"  "newTag: app-a-custom-v1.5.0"  "target newTag preserved"
+has_not "$A/overlays/dev/kustomization.yaml"  "newTag: v2.0.0"               "source newTag not copied"
+has_not "$A/overlays/dev/kustomization.yaml"  "newTag: v1.0.0"               "base newTag not copied either"
+has     "$A/overlays/dev/kustomization.yaml"  "name: image-a"                "image name substituted"
+has     "$A/overlays/dev/kustomization.yaml"  "app-a-configmap-v2.yaml"      "resources reference updated to v2"
+has_not "$A/overlays/dev/kustomization.yaml"  "app-a-configmap-v1.yaml"      "old v1 reference removed"
+has_not "$A/overlays/dev/kustomization.yaml"  "source-image"                 "no source-image in kustomization"
+
+# ── app-b: kustomization.yaml — first-time copy, source values used ──────────
+section "app-b  kustomization.yaml — first-time copy, source values used"
+exists  "$B/overlays/dev/kustomization.yaml"                                  "kustomization.yaml created for app-b"
+has     "$B/overlays/dev/kustomization.yaml"  "name: image-b"                "image name substituted in app-b"
+has     "$B/overlays/dev/kustomization.yaml"  "newTag: v2.0.0"               "source newTag used for first-time copy"
+has     "$B/overlays/dev/kustomization.yaml"  "app-b-configmap-v2.yaml"      "resources reference has app-b naming"
+has_not "$B/overlays/dev/kustomization.yaml"  "source-image"                 "no source-image in app-b kustomization"
+
+# ── app-a: SealedSecret M (modified) — not synced ────────────────────────────
+section "app-a  SealedSecret M (modified) — not synced to target"
+has     "$A/overlays/dev/sealed-secret.yaml"  "AppAClusterEncryptedPassword=="     "target sealed secret values unchanged"
+has_not "$A/overlays/dev/sealed-secret.yaml"  "ModifiedSourceEncryptedPassword=="  "modified source values not copied"
+
+# ── app-b: SealedSecret M (modified) — no target file created ────────────────
+section "app-b  SealedSecret M (modified) — no target file created"
+absent  "$B/overlays/dev/sealed-secret.yaml"  "sealed secret M does not create missing target file"
+
+# ── app-b: SealedSecret copy — no matching secret found, encryptedData blanked
+section "app-b  SealedSecret copy — no match, encryptedData blanked"
+exists  "$B/overlays/staging/sealed-secret.yaml"                                  "staging sealed secret created for app-b"
+has     "$B/overlays/staging/sealed-secret.yaml"  "name: app-b-db-credentials"    "secret name substituted"
+has     "$B/overlays/staging/sealed-secret.yaml"  "namespace: ns-b"               "namespace substituted"
+has_not "$B/overlays/staging/sealed-secret.yaml"  "SourceStagingEncryptedPassword=="  "source values not used"
+has     "$B/overlays/staging/sealed-secret.yaml"  "TODO: kubeseal"                "encryptedData blanked with TODO marker"
+
+# ── app-a: SealedSecret new (truly new, not a copy) — encryptedData blanked ──
+section "app-a  SealedSecret new (not a copy) — encryptedData blanked"
+exists  "$A/overlays/staging/app-a-unique-secret.yaml"                             "truly new sealed secret created"
+has     "$A/overlays/staging/app-a-unique-secret.yaml"  "name: app-a-unique-secret"  "unique secret name substituted"
+has     "$A/overlays/staging/app-a-unique-secret.yaml"  "namespace: ns-a"            "namespace substituted"
+has_not "$A/overlays/staging/app-a-unique-secret.yaml"  "SourceUniqueEncryptedValue=="  "source values not used"
+has     "$A/overlays/staging/app-a-unique-secret.yaml"  "TODO: kubeseal"             "encryptedData blanked"
+
+# ── app-b: SealedSecret new (truly new, not a copy) — encryptedData blanked ──
+section "app-b  SealedSecret new (not a copy) — encryptedData blanked"
+exists  "$B/overlays/staging/app-b-unique-secret.yaml"                             "truly new sealed secret created for app-b"
+has     "$B/overlays/staging/app-b-unique-secret.yaml"  "name: app-b-unique-secret"  "unique secret name substituted in app-b"
+has_not "$B/overlays/staging/app-b-unique-secret.yaml"  "SourceUniqueEncryptedValue=="  "source values not used in app-b"
+has     "$B/overlays/staging/app-b-unique-secret.yaml"  "TODO: kubeseal"             "encryptedData blanked in app-b"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
