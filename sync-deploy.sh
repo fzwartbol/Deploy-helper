@@ -556,7 +556,7 @@ if [[ -z "$SOURCE_NAME" ]]; then
   printf '\n### sync-deploy.sh ###\n'
   printf 'Config: %s\n\n' "$CONFIG_FILE"
   printf 'Steps: (1) source repo  (2) FROM ref  (3) TO ref  (4) target(s)\n\n'
-  printf '--- Step 1: Select SOURCE repo ---\n'
+  printf '%s\n' '--- Step 1: Select SOURCE repo ---'
   printf 'The diff will be computed on this repo.\n\n'
   for ((_i=0; _i<REPO_COUNT; _i++)); do
     printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_RNAMES[$_i]}" "${_RPATHS[$_i]}"
@@ -573,7 +573,7 @@ if [[ -z "$SOURCE_NAME" ]]; then
       [[ -z "$_pick" ]] && _pick=1
       if [[ "$_pick" =~ ^[0-9]+$ ]] && ((_pick >= 1 && _pick <= REPO_COUNT)); then
         SOURCE_NAME="${_RNAMES[$((_pick-1))]}"
-        printf '-> %s\n\n' "$SOURCE_NAME"
+        printf '%s\n\n' "-> $SOURCE_NAME"
         break
       fi
       printf 'Enter a number between 1 and %d.\n' "$REPO_COUNT"
@@ -603,7 +603,7 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
       local _n=${#_labels[@]}
       local _show=$(( _n < 16 ? _n : 16 ))
 
-      printf '--- %s ---\n\n' "$_title"
+      printf '%s\n\n' "--- $_title ---"
       local _j
       for ((_j=0; _j<_show; _j++)); do
         printf '  %d) %s\n' "$((_j+1))" "${_labels[$_j]}"
@@ -615,7 +615,7 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
       [[ -z "$_r" ]] && _r=1
       { [[ "$_r" =~ ^[0-9]+$ ]] && ((_r>=1 && _r<=_show)); } || _r=1
       printf -v "$_rv" '%s' "${_values[$((_r-1))]}"
-      printf '-> %s\n\n' "${_labels[$((_r-1))]}"
+      printf '%s\n\n' "-> ${_labels[$((_r-1))]}"
     }
 
     printf '\n'
@@ -648,7 +648,7 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
     FILTER_TARGETS="${_tgt_names[0]}"
     printf 'Only one target — auto-selected: %s\n\n' "${_tgt_names[0]}"
   elif $_INTERACTIVE; then
-    printf '--- Step 3: Select TARGET repo(s) ---\n'
+    printf '%s\n' '--- Step 3: Select TARGET repo(s) ---'
     printf 'The diff (%s → %s) will be applied to these repos.\n\n' "$FROM_REF" "$TO_REF"
     for ((_i=0; _i<_nt; _i++)); do
       printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_paths[$_i]}"
@@ -669,7 +669,7 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
     _oifs="$IFS"; IFS=','
     FILTER_TARGETS="${_sel[*]}"
     IFS="$_oifs"
-    printf '-> %s\n\n' "$FILTER_TARGETS"
+    printf '%s\n\n' "-> $FILTER_TARGETS"
     unset _picks _p _sel _oifs
   fi
   unset _tgt_names _tgt_paths _nt
