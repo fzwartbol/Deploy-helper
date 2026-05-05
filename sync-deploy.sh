@@ -502,26 +502,25 @@ three_way_merge_file() {
 create_bitbucket_pr() {
   local repo="$1" branch="$2" title="$3" body="$4"
 
+  # Credentials must be supplied explicitly — we do NOT call git credential fill
+  # because that triggers browser/keychain auth which requires interactive input.
+  # Set BITBUCKET_USER and BITBUCKET_TOKEN (an app password, not your login
+  # password) to enable automatic PR creation.
+  local api_user="${BITBUCKET_USER:-}"
+  local api_token="${BITBUCKET_TOKEN:-}"
+
+  if [[ -z "$api_user" || -z "$api_token" ]]; then
+    log_warn "BITBUCKET_USER / BITBUCKET_TOKEN not set — skipping PR creation"
+    log_warn "Create the PR manually at: https://bitbucket.org/${repo}/pull-requests/new?source=${branch}"
+    return 0
+  fi
+
   local payload
   payload=$(_pr_payload "$title" "$body" "$branch" "$BASE_BRANCH")
 
-  # Credentials: prefer env vars, fall back to git credential helper
-  local api_user="${BITBUCKET_USER:-}"
-  local api_token="${BITBUCKET_TOKEN:-}"
-  if [[ -z "$api_user" || -z "$api_token" ]]; then
-    local _cred
-    _cred=$(printf 'protocol=https\nhost=bitbucket.org\n' \
-              | git credential fill 2>/dev/null) || true
-    [[ -z "$api_user"  ]] && api_user=$(printf  '%s' "$_cred" | awk -F= '/^username=/{print $2}')
-    [[ -z "$api_token" ]] && api_token=$(printf '%s' "$_cred" | awk -F= '/^password=/{print $2}')
-  fi
-
-  local curl_auth=()
-  [[ -n "$api_user" && -n "$api_token" ]] && curl_auth=(-u "${api_user}:${api_token}")
-
   local response http_code body_json
   response=$(curl -s -w "\n%{http_code}" -X POST \
-    "${curl_auth[@]+"${curl_auth[@]}"}" \
+    -u "${api_user}:${api_token}" \
     -H "Content-Type: application/json" \
     "https://api.bitbucket.org/2.0/repositories/${repo}/pullrequests" \
     -d "$payload")
