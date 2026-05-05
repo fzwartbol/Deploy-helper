@@ -69,8 +69,8 @@ Options:
   -h, --help         Show this help
 
 Environment:
-  BITBUCKET_USER   Bitbucket username       (falls back to git credential helper)
-  BITBUCKET_TOKEN  Bitbucket app password   (falls back to git credential helper)
+  BITBUCKET_USER   Bitbucket username       (optional — if set together with TOKEN,
+  BITBUCKET_TOKEN  Bitbucket app password    uses HTTPS; otherwise uses SSH)
 
 Examples:
   sync-deploy.sh
@@ -226,13 +226,16 @@ _sanitize_ref() {
 
 # ── git helpers ───────────────────────────────────────────────────────────────
 
-# Build an authenticated Bitbucket clone URL
+# Build a Bitbucket clone URL.
+# Uses SSH by default (git@bitbucket.org:workspace/repo.git) so that the
+# existing SSH key in the git credential store is used automatically.
+# Falls back to HTTPS only when BITBUCKET_USER and BITBUCKET_TOKEN are both set.
 _bb_url() {
   if [[ -n "${BITBUCKET_USER:-}" && -n "${BITBUCKET_TOKEN:-}" ]]; then
     printf 'https://%s:%s@bitbucket.org/%s.git' \
       "$BITBUCKET_USER" "$BITBUCKET_TOKEN" "$1"
   else
-    printf 'https://bitbucket.org/%s.git' "$1"
+    printf 'git@bitbucket.org:%s.git' "$1"
   fi
 }
 
