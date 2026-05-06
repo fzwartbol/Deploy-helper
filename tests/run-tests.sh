@@ -114,7 +114,7 @@ with_work() {
 make_bare "source-deploy-repo"
 
 source_v1() {
-  mkdir -p base overlays/dev
+  mkdir -p base overlays/dev services/environment/teamscope services/environment/enva services/environment/envb
 
   cat > base/deployment.yaml <<'EOF'
 apiVersion: apps/v1
@@ -198,6 +198,39 @@ resources:
 images:
   - name: source-image
     newTag: v1.0.0
+EOF
+
+  cat > services/environment/teamscope/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - teamscope-only.yaml
+configMapGenerator:
+  - name: source-app-teamscope
+    literals:
+      - MARKER=teamscope-v1
+EOF
+
+  cat > services/environment/enva/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - enva-only.yaml
+configMapGenerator:
+  - name: source-app-enva
+    literals:
+      - MARKER=enva-source
+EOF
+
+  cat > services/environment/envb/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - envb-only.yaml
+configMapGenerator:
+  - name: source-app-envb
+    literals:
+      - MARKER=envb-source
 EOF
 
   # Sealed secret — will be "copied" to staging overlay in v2
@@ -317,6 +350,20 @@ images:
     newTag: v2.0.0
 EOF
 
+  # M: teamscope env kustomization — path_substitution maps this to enva/envb.
+  # Targets must use their matching source env file, not this teamscope file.
+  cat > services/environment/teamscope/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - teamscope-only.yaml
+  - teamscope-new.yaml
+configMapGenerator:
+  - name: source-app-teamscope
+    literals:
+      - MARKER=teamscope-v2
+EOF
+
   # M: dev sealed-secret — modified in source (must NOT be synced to target)
   cat > overlays/dev/sealed-secret.yaml <<'EOF'
 apiVersion: bitnami.com/v1alpha1
@@ -366,7 +413,7 @@ with_work "source-deploy-repo" "v1.1.0" source_v2
 make_bare "app-a-deploy"
 
 app_a_initial() {
-  mkdir -p base overlays/dev
+  mkdir -p base overlays/dev services/environment/enva
 
   cat > base/deployment.yaml <<'EOF'
 apiVersion: apps/v1
@@ -449,6 +496,17 @@ resources:
 images:
   - name: image-a
     newTag: app-a-custom-v1.5.0
+EOF
+
+  cat > services/environment/enva/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - enva-target.yaml
+configMapGenerator:
+  - name: app-a-enva
+    literals:
+      - MARKER=app-a-enva-target
 EOF
 
   # App-a's own sealed secret — cluster-specific encrypted values
@@ -563,7 +621,8 @@ cat > "$T/repos.test.json" <<'EOF'
         "health_url":      "source-app.example.com/actuator/health"
       },
       "path_substitutions": {
-        "app_name": "source-app"
+        "app_name": "source-app",
+        "environment": "teamscope"
       }
     },
     {
@@ -581,7 +640,8 @@ cat > "$T/repos.test.json" <<'EOF'
         "health_url":      "app-a.example.com/actuator/health"
       },
       "path_substitutions": {
-        "app_name": "app-a"
+        "app_name": "app-a",
+        "environment": "enva"
       }
     },
     {
@@ -599,7 +659,8 @@ cat > "$T/repos.test.json" <<'EOF'
         "health_url":      "app-b.example.com/actuator/health"
       },
       "path_substitutions": {
-        "app_name": "app-b"
+        "app_name": "app-b",
+        "environment": "envb"
       }
     }
   ]
@@ -732,6 +793,16 @@ has     "$B/overlays/dev/kustomization.yaml"  "name: image-b"                "im
 has     "$B/overlays/dev/kustomization.yaml"  "newTag: v2.0.0"               "source newTag used for first-time copy"
 has     "$B/overlays/dev/kustomization.yaml"  "app-b-configmap-v2.yaml"      "resources reference has app-b naming"
 has_not "$B/overlays/dev/kustomization.yaml"  "source-image"                 "no source-image in app-b kustomization"
+
+# ── env kustomization path substitutions use matching source env folder ──────
+section "environment kustomization.yaml — source counterpart selected"
+exists  "$A/services/environment/enva/kustomization.yaml"                      "app-a enva kustomization exists"
+has     "$A/services/environment/enva/kustomization.yaml"  "MARKER=app-a-enva-target"  "existing app-a env file preserved"
+has_not "$A/services/environment/enva/kustomization.yaml"  "teamscope-v2"      "teamscope kustomization not copied to enva"
+exists  "$B/services/environment/envb/kustomization.yaml"                      "app-b envb kustomization created"
+has     "$B/services/environment/envb/kustomization.yaml"  "MARKER=envb-source"  "envb copied from source envb folder"
+has_not "$B/services/environment/envb/kustomization.yaml"  "teamscope-v2"      "teamscope kustomization not copied to envb"
+has_not "$B/services/environment/envb/kustomization.yaml"  "source-app"        "app-b substitutions applied to envb file"
 
 # ── app-a: SealedSecret M (modified) — not synced ────────────────────────────
 section "app-a  SealedSecret M (modified) — not synced to target"
