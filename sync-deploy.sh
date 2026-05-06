@@ -258,6 +258,21 @@ _bb_url() {
   esac
 }
 
+# Convert configured repo values, including SSH clone URLs, to workspace/repo.
+_bb_repo_slug() {
+  local repo="$1"
+  case "$repo" in
+    git@bitbucket.org:*)
+      repo="${repo#git@bitbucket.org:}" ;;
+    ssh://git@bitbucket.org/*)
+      repo="${repo#ssh://git@bitbucket.org/}" ;;
+    https://bitbucket.org/*|http://bitbucket.org/*)
+      repo="${repo#*://bitbucket.org/}" ;;
+  esac
+  repo="${repo%.git}"
+  printf '%s' "$repo"
+}
+
 # Clone repo or reset an existing clone to origin/<BASE_BRANCH>
 clone_or_update() {
   local repo="$1" dir="$2"
@@ -377,7 +392,7 @@ apply_subs() {
   local file="$1" sed_script="$2"
   [[ -z "$sed_script" ]] && return 0
   is_text_file "$file" || { log_warn "Binary file skipped: $(basename "$file")"; return 0; }
-  sed -i "$sed_script" "$file"
+  sed -i.bak "$sed_script" "$file" && rm -f "$file.bak"
 }
 
 # Apply path substitution script to a path string.
@@ -391,10 +406,23 @@ _sub_path() {
   fi
 }
 
+# Resolve the source file to read for a mapped target path.
+# If the target path also exists in the source repo, prefer that counterpart
+# instead of copying the file from the original changed path into every target.
+_source_path_for_target() {
+  local src_rel="$1" tgt_rel="$2"
+  if [[ "$src_rel" != "$tgt_rel" && -f "$SOURCE_DIR/$tgt_rel" ]]; then
+    printf '%s' "$tgt_rel"
+  else
+    printf '%s' "$src_rel"
+  fi
+}
+
 # Copy src_rel from SOURCE_DIR to tgt_dir/tgt_rel, then apply name subs.
 # Returns 1 (non-fatal) when the source file is absent.
 copy_and_apply() {
   local src_rel="$1" tgt_rel="$2" tgt_dir="$3" sed_script="$4"
+  src_rel=$(_source_path_for_target "$src_rel" "$tgt_rel")
   local src_abs="$SOURCE_DIR/$src_rel"
   if [[ ! -f "$src_abs" ]]; then
     log_warn "Source file missing: $src_rel — skipping"
@@ -470,6 +498,7 @@ neutralize_configmap_keys() {
 # Returns: 0=clean merge, 1=conflict markers written, 2+=hard error
 three_way_merge_file() {
   local src_path="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
+  src_path=$(_source_path_for_target "$src_path" "$tgt_path")
   local src_abs="$SOURCE_DIR/$src_path"
   local tgt_abs="$tgt_dir/$tgt_path"
 
@@ -517,6 +546,7 @@ three_way_merge_file() {
 # ── Bitbucket PR creation ─────────────────────────────────────────────────────
 create_bitbucket_pr() {
   local repo="$1" branch="$2" title="$3" body="$4"
+  local repo_slug; repo_slug=$(_bb_repo_slug "$repo")
 
   # Credentials must be supplied explicitly — we do NOT call git credential fill
   # because that triggers browser/keychain auth which requires interactive input.
@@ -527,7 +557,7 @@ create_bitbucket_pr() {
 
   if [[ -z "$api_user" || -z "$api_token" ]]; then
     log_warn "BITBUCKET_USER / BITBUCKET_TOKEN not set — skipping PR creation"
-    log_warn "Create the PR manually at: https://bitbucket.org/${repo}/pull-requests/new?source=${branch}"
+    log_warn "Create the PR manually at: https://bitbucket.org/${repo_slug}/pull-requests/new?source=${branch}"
     return 0
   fi
 
@@ -538,11 +568,11 @@ create_bitbucket_pr() {
   response=$(curl -s -w "\n%{http_code}" -X POST \
     -u "${api_user}:${api_token}" \
     -H "Content-Type: application/json" \
-    "https://api.bitbucket.org/2.0/repositories/${repo}/pullrequests" \
+    "https://api.bitbucket.org/2.0/repositories/${repo_slug}/pullrequests" \
     -d "$payload")
 
   http_code=$(tail  -n1  <<< "$response")
-  body_json=$(head  -n-1 <<< "$response")
+  body_json=$(sed '$d' <<< "$response")
 
   if [[ "$http_code" == "201" ]]; then
     _pr_html_url "$body_json"
