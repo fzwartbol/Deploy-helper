@@ -803,6 +803,12 @@ exists  "$B/services/environment/envb/kustomization.yaml"                      "
 has     "$B/services/environment/envb/kustomization.yaml"  "MARKER=envb-source"  "envb copied from source envb folder"
 has_not "$B/services/environment/envb/kustomization.yaml"  "teamscope-v2"      "teamscope kustomization not copied to envb"
 has_not "$B/services/environment/envb/kustomization.yaml"  "source-app"        "app-b substitutions applied to envb file"
+# M files that exist in source but NOT in target must not be created (no path
+# remap): other-env overlay dirs must not bleed across repos.
+absent  "$A/services/environment/teamscope/kustomization.yaml"  "teamscope dir not created in app-a (no path remap)"
+absent  "$A/services/environment/envb/kustomization.yaml"       "envb dir not created in app-a (no path remap)"
+absent  "$B/services/environment/teamscope/kustomization.yaml"  "teamscope dir not created in app-b (no path remap)"
+absent  "$B/services/environment/enva/kustomization.yaml"       "enva dir not created in app-b (no path remap)"
 
 # ── app-a: SealedSecret M (modified) — not synced ────────────────────────────
 section "app-a  SealedSecret M (modified) — not synced to target"
