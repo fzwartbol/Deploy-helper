@@ -912,6 +912,18 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
       "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")"
     git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH"
 
+    # Print conflict resolution hint pointing at the local working tree
+    if [[ ${#CONFLICT_FILES[@]} -gt 0 ]]; then
+      log_warn "Conflicts in $TARGET_NAME — resolve in IntelliJ then push:"
+      log_warn "  Open folder : $TARGET_DIR"
+      log_warn "  Branch      : $SYNC_BRANCH"
+      log_warn "  Files       :"
+      for _cf in "${CONFLICT_FILES[@]}"; do
+        log_warn "    $TARGET_DIR/$_cf"
+      done
+      log_warn "  After resolving: commit + push from IntelliJ (VCS > Git > Push)"
+    fi
+
     # ── Build PR body ─────────────────────────────────────────────────────────
     SEALED_SECTION=""
     [[ ${#SEALED_NOTES[@]} -gt 0 ]] && SEALED_SECTION="
