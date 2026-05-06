@@ -485,38 +485,17 @@ three_way_merge_file() {
   restore_image_lines       "$theirs" "$base"
   neutralize_configmap_keys "$theirs" "$tgt_abs"
 
-  # Save ours before git merge-file modifies tgt_abs in place
-  local ours
-  ours=$(mktemp "$WORK_DIR/.3wm_ours_XXXXXX")
-  cp "$tgt_abs" "$ours"
-
   local rc=0
   git merge-file \
     -L "target (ours)" \
     -L "base (${FROM_REF})" \
     -L "source (${TO_REF})" \
     "$tgt_abs" "$base" "$theirs" || rc=$?
+  rm -f "$base" "$theirs"
 
-  if [[ $rc -eq 1 ]]; then
-    # Register the conflict in git's index at stages 1/2/3 so IntelliJ's
-    # "Resolve Conflicts" dialog works (it needs index-level conflict entries,
-    # not just conflict markers in the working tree).
-    local base_sha ours_sha theirs_sha
-    base_sha=$(git   -C "$tgt_dir" hash-object -w "$base")
-    ours_sha=$(git   -C "$tgt_dir" hash-object -w "$ours")
-    theirs_sha=$(git -C "$tgt_dir" hash-object -w "$theirs")
-    git -C "$tgt_dir" update-index --force-remove -- "$tgt_path" 2>/dev/null || true
-    printf '100644 %s 1\t%s\n100644 %s 2\t%s\n100644 %s 3\t%s\n' \
-      "$base_sha"   "$tgt_path" \
-      "$ours_sha"   "$tgt_path" \
-      "$theirs_sha" "$tgt_path" \
-      | git -C "$tgt_dir" update-index --index-info
-    rm -f "$base" "$theirs" "$ours"
-    return 1
+  if   [[ $rc -eq 1 ]]; then return 1
+  elif [[ $rc -gt 1 ]]; then log_error "git merge-file error ($rc): $tgt_path"; return 2
   fi
-
-  rm -f "$base" "$theirs" "$ours"
-  if [[ $rc -gt 1 ]]; then log_error "git merge-file error ($rc): $tgt_path"; return 2; fi
 }
 
 # ── Bitbucket PR creation ─────────────────────────────────────────────────────
@@ -862,18 +841,12 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
           else
             merge_rc=0
             three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
-            if [[ $merge_rc -eq 1 ]]; then
-              CONFLICT_FILES+=("$tgt_file")
-              # Conflict markers written to working tree; stages 1/2/3 registered in
-              # the index by three_way_merge_file. Do NOT git-add — IntelliJ's
-              # "Resolve Conflicts" needs the unresolved index entries to show the dialog.
-            else
-              if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
-                IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
-              fi
-              git -C "$TARGET_DIR" add "$tgt_file"
-              HAS_CHANGES=true
+            [[ $merge_rc -eq 1 ]] && CONFLICT_FILES+=("$tgt_file")
+            if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
+              IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
             fi
+            git -C "$TARGET_DIR" add "$tgt_file"
+            HAS_CHANGES=true
           fi
           ;;
 
