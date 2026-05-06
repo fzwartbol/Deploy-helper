@@ -561,6 +561,9 @@ cat > "$T/repos.test.json" <<'EOF'
         "image_name":      "source-image",
         "context_url":     "source-app.example.com",
         "health_url":      "source-app.example.com/actuator/health"
+      },
+      "path_substitutions": {
+        "app_name": "source-app"
       }
     },
     {
@@ -576,6 +579,9 @@ cat > "$T/repos.test.json" <<'EOF'
         "image_name":      "image-a",
         "context_url":     "app-a.example.com",
         "health_url":      "app-a.example.com/actuator/health"
+      },
+      "path_substitutions": {
+        "app_name": "app-a"
       }
     },
     {
@@ -591,6 +597,9 @@ cat > "$T/repos.test.json" <<'EOF'
         "image_name":      "image-b",
         "context_url":     "app-b.example.com",
         "health_url":      "app-b.example.com/actuator/health"
+      },
+      "path_substitutions": {
+        "app_name": "app-b"
       }
     }
   ]

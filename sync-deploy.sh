@@ -161,6 +161,19 @@ _cf_repo_subs() {
   ' "$CONFIG_FILE"
 }
 
+# Returns KEY<TAB>VALUE lines for the optional path_substitutions block.
+# When absent, prints nothing → PATH_SED_SCRIPT stays empty → paths are
+# copied verbatim from source to target (correct when all repos share the
+# same directory structure).
+_cf_repo_path_subs() {
+  awk -F'"' -v idx="$1" '
+    $2=="name" && NF>=4                   { nc++ }
+    nc==idx+1 && $2=="path_substitutions" { in_s=1; next }
+    in_s && /^[[:space:]]*\}/             { exit }
+    in_s && NF>=4 && $2!="" && $3~/^:/    { print $2 "\t" $4 }
+  ' "$CONFIG_FILE"
+}
+
 # Returns pipe-delimited alternation of protected ConfigMap key names
 # (handles both single-line and multi-line JSON arrays)
 _cf_protected_keys() {
@@ -337,6 +350,7 @@ build_sed_script() {
     tgt_esc=$(printf '%s' "$tv" | sed 's/[&|\\]/\\&/g')
     sed_script+="s|${src_esc}|${tgt_esc}|g;"
   done < <(awk -F'\t' '
+    BEGIN { cnt=0 }
     NR==FNR { if (NF==2) src[$1]=$2; next }
     NF==2 && $1 in src && src[$1]!=$2 {
       sv=src[$1]; tv=$2; l=length(sv)
@@ -366,12 +380,14 @@ apply_subs() {
   sed -i "$sed_script" "$file"
 }
 
-# Apply substitution script to a path string (handles empty script safely)
+# Apply path substitution script to a path string.
+# Uses PATH_SED_SCRIPT (built from path_substitutions), NOT the content
+# SED_SCRIPT — so content substitutions never accidentally rename directories.
 _sub_path() {
-  if [[ -z "$SED_SCRIPT" ]]; then
+  if [[ -z "${PATH_SED_SCRIPT:-}" ]]; then
     printf '%s' "$1"
   else
-    printf '%s' "$1" | sed "$SED_SCRIPT"
+    printf '%s' "$1" | sed "$PATH_SED_SCRIPT"
   fi
 }
 
@@ -723,6 +739,7 @@ if [[ "$_src_idx" == "null" ]]; then
 fi
 SOURCE_REPO=$(_cf_repo_path "$_src_idx")
 SOURCE_SUBS=$(_cf_repo_subs "$_src_idx")
+SOURCE_PATH_SUBS=$(_cf_repo_path_subs "$_src_idx")
 unset _src_idx
 
 log_section "Source: $SOURCE_NAME  ($SOURCE_REPO)  [$FROM_REF → $TO_REF]"
@@ -756,7 +773,8 @@ _tgt_num=0
 for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
   TARGET_NAME=$(_cf_repo_name "$_ti")
   TARGET_REPO=$(_cf_repo_path "$_ti")
-  TARGET_SUBS=$(_cf_repo_subs  "$_ti")
+  TARGET_SUBS=$(_cf_repo_subs      "$_ti")
+  TARGET_PATH_SUBS=$(_cf_repo_path_subs "$_ti")
 
   is_target_included "$TARGET_NAME" || continue
   _tgt_num=$(( _tgt_num + 1 ))
@@ -765,8 +783,10 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
 
   if $DRY_RUN; then
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
-    log_info "[DRY RUN] Branch        : $SYNC_BRANCH"
-    log_info "[DRY RUN] Substitutions : ${SED_SCRIPT:-(none)}"
+    PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
+    log_info "[DRY RUN] Branch             : $SYNC_BRANCH"
+    log_info "[DRY RUN] Content subs       : ${SED_SCRIPT:-(none)}"
+    log_info "[DRY RUN] Path subs          : ${PATH_SED_SCRIPT:-(none)}"
     PASS+=("$TARGET_NAME (dry-run)")
     continue
   fi
@@ -778,6 +798,7 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
     git -C "$TARGET_DIR" checkout -B "$SYNC_BRANCH"
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
+    PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
     HAS_CHANGES=false
     SEALED_NOTES=()
     IMAGE_NOTES=()
