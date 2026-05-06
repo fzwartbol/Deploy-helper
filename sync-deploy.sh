@@ -161,6 +161,19 @@ _cf_repo_subs() {
   ' "$CONFIG_FILE"
 }
 
+# Returns KEY<TAB>VALUE lines for the optional path_substitutions block.
+# When absent, prints nothing → PATH_SED_SCRIPT stays empty → paths are
+# copied verbatim from source to target (correct when all repos share the
+# same directory structure).
+_cf_repo_path_subs() {
+  awk -F'"' -v idx="$1" '
+    $2=="name" && NF>=4                   { nc++ }
+    nc==idx+1 && $2=="path_substitutions" { in_s=1; next }
+    in_s && /^[[:space:]]*\}/             { exit }
+    in_s && NF>=4 && $2!="" && $3~/^:/    { print $2 "\t" $4 }
+  ' "$CONFIG_FILE"
+}
+
 # Returns pipe-delimited alternation of protected ConfigMap key names
 # (handles both single-line and multi-line JSON arrays)
 _cf_protected_keys() {
@@ -243,6 +256,21 @@ _bb_url() {
         printf 'git@bitbucket.org:%s.git' "$repo"
       fi ;;
   esac
+}
+
+# Convert configured repo values, including SSH clone URLs, to workspace/repo.
+_bb_repo_slug() {
+  local repo="$1"
+  case "$repo" in
+    git@bitbucket.org:*)
+      repo="${repo#git@bitbucket.org:}" ;;
+    ssh://git@bitbucket.org/*)
+      repo="${repo#ssh://git@bitbucket.org/}" ;;
+    https://bitbucket.org/*|http://bitbucket.org/*)
+      repo="${repo#*://bitbucket.org/}" ;;
+  esac
+  repo="${repo%.git}"
+  printf '%s' "$repo"
 }
 
 # Clone repo or reset an existing clone to origin/<BASE_BRANCH>
@@ -337,6 +365,7 @@ build_sed_script() {
     tgt_esc=$(printf '%s' "$tv" | sed 's/[&|\\]/\\&/g')
     sed_script+="s|${src_esc}|${tgt_esc}|g;"
   done < <(awk -F'\t' '
+    BEGIN { cnt=0 }
     NR==FNR { if (NF==2) src[$1]=$2; next }
     NF==2 && $1 in src && src[$1]!=$2 {
       sv=src[$1]; tv=$2; l=length(sv)
@@ -363,15 +392,29 @@ apply_subs() {
   local file="$1" sed_script="$2"
   [[ -z "$sed_script" ]] && return 0
   is_text_file "$file" || { log_warn "Binary file skipped: $(basename "$file")"; return 0; }
-  sed -i "$sed_script" "$file"
+  sed -i.bak "$sed_script" "$file" && rm -f "$file.bak"
 }
 
-# Apply substitution script to a path string (handles empty script safely)
+# Apply path substitution script to a path string.
+# Uses PATH_SED_SCRIPT (built from path_substitutions), NOT the content
+# SED_SCRIPT — so content substitutions never accidentally rename directories.
 _sub_path() {
-  if [[ -z "$SED_SCRIPT" ]]; then
+  if [[ -z "${PATH_SED_SCRIPT:-}" ]]; then
     printf '%s' "$1"
   else
-    printf '%s' "$1" | sed "$SED_SCRIPT"
+    printf '%s' "$1" | sed "$PATH_SED_SCRIPT"
+  fi
+}
+
+# Resolve the source file to read for a mapped target path.
+# If the target path also exists in the source repo, prefer that counterpart
+# instead of copying the file from the original changed path into every target.
+_source_path_for_target() {
+  local src_rel="$1" tgt_rel="$2"
+  if [[ "$src_rel" != "$tgt_rel" && -f "$SOURCE_DIR/$tgt_rel" ]]; then
+    printf '%s' "$tgt_rel"
+  else
+    printf '%s' "$src_rel"
   fi
 }
 
@@ -379,6 +422,7 @@ _sub_path() {
 # Returns 1 (non-fatal) when the source file is absent.
 copy_and_apply() {
   local src_rel="$1" tgt_rel="$2" tgt_dir="$3" sed_script="$4"
+  src_rel=$(_source_path_for_target "$src_rel" "$tgt_rel")
   local src_abs="$SOURCE_DIR/$src_rel"
   if [[ ! -f "$src_abs" ]]; then
     log_warn "Source file missing: $src_rel — skipping"
@@ -454,6 +498,7 @@ neutralize_configmap_keys() {
 # Returns: 0=clean merge, 1=conflict markers written, 2+=hard error
 three_way_merge_file() {
   local src_path="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
+  src_path=$(_source_path_for_target "$src_path" "$tgt_path")
   local src_abs="$SOURCE_DIR/$src_path"
   local tgt_abs="$tgt_dir/$tgt_path"
 
@@ -501,6 +546,7 @@ three_way_merge_file() {
 # ── Bitbucket PR creation ─────────────────────────────────────────────────────
 create_bitbucket_pr() {
   local repo="$1" branch="$2" title="$3" body="$4"
+  local repo_slug; repo_slug=$(_bb_repo_slug "$repo")
 
   # Credentials must be supplied explicitly — we do NOT call git credential fill
   # because that triggers browser/keychain auth which requires interactive input.
@@ -511,7 +557,7 @@ create_bitbucket_pr() {
 
   if [[ -z "$api_user" || -z "$api_token" ]]; then
     log_warn "BITBUCKET_USER / BITBUCKET_TOKEN not set — skipping PR creation"
-    log_warn "Create the PR manually at: https://bitbucket.org/${repo}/pull-requests/new?source=${branch}"
+    log_warn "Create the PR manually at: https://bitbucket.org/${repo_slug}/pull-requests/new?source=${branch}"
     return 0
   fi
 
@@ -522,11 +568,11 @@ create_bitbucket_pr() {
   response=$(curl -s -w "\n%{http_code}" -X POST \
     -u "${api_user}:${api_token}" \
     -H "Content-Type: application/json" \
-    "https://api.bitbucket.org/2.0/repositories/${repo}/pullrequests" \
+    "https://api.bitbucket.org/2.0/repositories/${repo_slug}/pullrequests" \
     -d "$payload")
 
   http_code=$(tail  -n1  <<< "$response")
-  body_json=$(head  -n-1 <<< "$response")
+  body_json=$(sed '$d' <<< "$response")
 
   if [[ "$http_code" == "201" ]]; then
     _pr_html_url "$body_json"
@@ -723,6 +769,7 @@ if [[ "$_src_idx" == "null" ]]; then
 fi
 SOURCE_REPO=$(_cf_repo_path "$_src_idx")
 SOURCE_SUBS=$(_cf_repo_subs "$_src_idx")
+SOURCE_PATH_SUBS=$(_cf_repo_path_subs "$_src_idx")
 unset _src_idx
 
 log_section "Source: $SOURCE_NAME  ($SOURCE_REPO)  [$FROM_REF → $TO_REF]"
@@ -756,7 +803,8 @@ _tgt_num=0
 for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
   TARGET_NAME=$(_cf_repo_name "$_ti")
   TARGET_REPO=$(_cf_repo_path "$_ti")
-  TARGET_SUBS=$(_cf_repo_subs  "$_ti")
+  TARGET_SUBS=$(_cf_repo_subs      "$_ti")
+  TARGET_PATH_SUBS=$(_cf_repo_path_subs "$_ti")
 
   is_target_included "$TARGET_NAME" || continue
   _tgt_num=$(( _tgt_num + 1 ))
@@ -765,8 +813,10 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
 
   if $DRY_RUN; then
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
-    log_info "[DRY RUN] Branch        : $SYNC_BRANCH"
-    log_info "[DRY RUN] Substitutions : ${SED_SCRIPT:-(none)}"
+    PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
+    log_info "[DRY RUN] Branch             : $SYNC_BRANCH"
+    log_info "[DRY RUN] Content subs       : ${SED_SCRIPT:-(none)}"
+    log_info "[DRY RUN] Path subs          : ${PATH_SED_SCRIPT:-(none)}"
     PASS+=("$TARGET_NAME (dry-run)")
     continue
   fi
@@ -778,6 +828,7 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
     git -C "$TARGET_DIR" checkout -B "$SYNC_BRANCH"
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
+    PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
     HAS_CHANGES=false
     SEALED_NOTES=()
     IMAGE_NOTES=()
