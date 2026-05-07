@@ -939,9 +939,13 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
           if is_sealed_secret "$SOURCE_DIR/$file1"; then
             SEALED_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — **skipped** (cluster-specific encryption; re-seal manually if value changed)")
           else
-            merge_rc=0
-            three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
-            [[ $merge_rc -eq 1 ]] && CONFLICT_FILES+=("$tgt_file")
+            if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
+              merge_rc=0
+              three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
+              [[ $merge_rc -eq 1 ]] && CONFLICT_FILES+=("$tgt_file")
+            else
+              copy_and_apply "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || true
+            fi
             if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
               IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
             fi
@@ -988,9 +992,7 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
             HAS_CHANGES=true
 
           else
-            if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
-              log_info "A $tgt_file — already in target, skipping"
-            elif copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"; then
+            if copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"; then
               if has_image_lines "$TARGET_DIR/$tgt_file"; then
                 IMAGE_NOTES+=("- \`[ADDED]\` \`$tgt_file\` — new file; image tags copied from source (review if needed)")
               fi
