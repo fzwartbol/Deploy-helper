@@ -61,6 +61,7 @@ name substitutions, preserving image tags, and handling Sealed Secrets.
 
 Options:
   --source <name>    Source repo name (from repos list)
+  --branch <name>    Source branch to check out  (default: base_branch from config)
   --from <ref>       Start ref — tag or commit  (default: HEAD~1)
   --to <ref>         End ref   — tag or commit  (default: HEAD)
   --targets <names>  Comma-separated target names, or "all" (default: all)
@@ -81,6 +82,7 @@ EOF
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 SOURCE_NAME=""
+SOURCE_BRANCH=""
 FROM_REF="HEAD~1"
 TO_REF="HEAD"
 FROM_EXPLICIT=false
@@ -91,6 +93,7 @@ DRY_RUN=false
 while [[ $# -gt 0 ]]; do
   case $1 in
     --source)  SOURCE_NAME="$2"; shift 2 ;;
+    --branch)  SOURCE_BRANCH="$2"; shift 2 ;;
     --from)    FROM_REF="$2"; FROM_EXPLICIT=true; shift 2 ;;
     --to)      TO_REF="$2";   TO_EXPLICIT=true;   shift 2 ;;
     --targets) FILTER_TARGETS="$2"; shift 2 ;;
@@ -275,17 +278,17 @@ _bb_repo_slug() {
 
 # Clone repo or reset an existing clone to origin/<BASE_BRANCH>
 clone_or_update() {
-  local repo="$1" dir="$2"
+  local repo="$1" dir="$2" branch="${3:-$BASE_BRANCH}"
   local url; url=$(_bb_url "$repo")
   if [[ -d "$dir/.git" ]]; then
     log_info "Fetching $repo"
     git -C "$dir" remote set-url origin "$url"
     git -C "$dir" fetch origin
-    git -C "$dir" checkout "$BASE_BRANCH"
-    git -C "$dir" reset --hard "origin/$BASE_BRANCH"
+    git -C "$dir" checkout "$branch"
+    git -C "$dir" reset --hard "origin/$branch"
   else
     log_info "Cloning $repo"
-    git clone "$url" "$dir"
+    git clone --branch "$branch" "$url" "$dir"
   fi
   git -C "$dir" config user.email \
     "$(git config --global user.email 2>/dev/null || printf 'sync-deploy@automation')"
@@ -300,6 +303,13 @@ _fetch_tags() {
     | awk '{print $2}' \
     | sed 's|refs/tags/||' \
     | { sort -Vr 2>/dev/null || sort -r; }
+}
+
+_fetch_branches() {
+  git ls-remote --heads "$(_bb_url "$1")" 2>/dev/null \
+    | awk '{print $2}' \
+    | sed 's|refs/heads/||' \
+    | sort
 }
 
 # ── file-processing helpers ───────────────────────────────────────────────────
@@ -624,7 +634,7 @@ if [[ -z "$SOURCE_NAME" ]]; then
   echo "### sync-deploy.sh ###"
   echo "Config: $CONFIG_FILE"
   echo ""
-  echo "Steps: (1) source repo  (2) FROM ref  (3) TO ref  (4) target(s)"
+  echo "Steps: (1) source repo  (2) branch  (3) FROM ref  (4) TO ref  (5) target(s)"
   echo ""
   echo "--- Step 1: Select SOURCE repo ---"
   echo "The diff will be computed on this repo."
@@ -655,7 +665,44 @@ if [[ -z "$SOURCE_NAME" ]]; then
   fi
 fi
 
-# ── Interactive step 2: FROM and TO refs ─────────────────────────────────────
+# ── Interactive step 2: source branch ────────────────────────────────────────
+if [[ -z "$SOURCE_BRANCH" ]] && $_INTERACTIVE; then
+  _src_path_for_br=""
+  for ((_i=0; _i<REPO_COUNT; _i++)); do
+    [[ "${_RNAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_path_for_br="${_RPATHS[$_i]}"; break; }
+  done
+
+  echo "--- Step 2: Select source BRANCH ---"
+  log_info "Fetching branches from ${_src_path_for_br} ..."
+  _branches=()
+  while IFS= read -r _b; do [[ -n "$_b" ]] && _branches+=("$_b"); done \
+    < <(_fetch_branches "$_src_path_for_br" 2>/dev/null || true)
+
+  if [[ ${#_branches[@]} -eq 0 ]]; then
+    SOURCE_BRANCH="$BASE_BRANCH"
+    echo "No branches found — using default: $SOURCE_BRANCH"
+    echo ""
+  else
+    _nb=${#_branches[@]}
+    _show_br=$(( _nb < 16 ? _nb : 16 ))
+    echo ""
+    for ((_j=0; _j<_show_br; _j++)); do
+      printf '  %d) %s\n' "$((_j+1))" "${_branches[$_j]}"
+    done
+    [[ $_nb -gt $_show_br ]] && printf '  ... (%d more)\n' "$((_nb-_show_br))"
+    printf '\nEnter number [1-%d, ENTER=1]: ' "$_show_br"
+    read -r _pick 2>/dev/null || _pick=""
+    [[ -z "$_pick" ]] && _pick=1
+    { [[ "$_pick" =~ ^[0-9]+$ ]] && ((_pick >= 1 && _pick <= _show_br)); } || _pick=1
+    SOURCE_BRANCH="${_branches[$((_pick-1))]}"
+    echo "-> $SOURCE_BRANCH"
+    echo ""
+  fi
+  unset _src_path_for_br _branches _nb _show_br _b _pick _j
+fi
+[[ -z "$SOURCE_BRANCH" ]] && SOURCE_BRANCH="$BASE_BRANCH"
+
+# ── Interactive step 3: FROM and TO refs ─────────────────────────────────────
 if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
   if $_INTERACTIVE; then
     _src_path=""
@@ -695,11 +742,11 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
 
     printf '\n'
     $FROM_EXPLICIT || _pick_ref FROM_REF \
-      "Step 2a: FROM ref (start of diff — older tag/commit)" \
+      "Step 3a: FROM ref (start of diff — older tag/commit)" \
       "HEAD~1 — previous commit (default)" "HEAD~1" \
       "${_tags[@]+"${_tags[@]}"}"
     $TO_EXPLICIT   || _pick_ref TO_REF \
-      "Step 2b: TO ref (end of diff — newer tag/commit)" \
+      "Step 3b: TO ref (end of diff — newer tag/commit)" \
       "HEAD — latest commit (default)" "HEAD" \
       "${_tags[@]+"${_tags[@]}"}"
     unset _t _tags _src_path
@@ -724,7 +771,7 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
     echo "Only one target — auto-selected: ${_tgt_names[0]}"
     echo ""
   elif $_INTERACTIVE; then
-    echo "--- Step 3: Select TARGET repo(s) ---"
+    echo "--- Step 4: Select TARGET repo(s) ---"
     echo "The diff ($FROM_REF -> $TO_REF) will be applied to these repos."
     echo ""
     for ((_i=0; _i<_nt; _i++)); do
@@ -781,7 +828,7 @@ if $DRY_RUN; then
   log_info "[DRY RUN] Would clone $SOURCE_REPO and diff $FROM_REF..$TO_REF"
   CHANGED_FILES=$'M\texample/deployment.yaml\nA\tsecrets/new-secret.yaml\nD\texample/old.yaml'
 else
-  clone_or_update "$SOURCE_REPO" "$SOURCE_DIR"
+  clone_or_update "$SOURCE_REPO" "$SOURCE_DIR" "$SOURCE_BRANCH"
   CHANGED_FILES=$(git -C "$SOURCE_DIR" diff --find-renames --name-status "$FROM_REF" "$TO_REF" || true)
 fi
 
@@ -916,7 +963,11 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
 
             if [[ -n "$src_other" ]]; then
               # It's a copy of an existing sealed secret — find matching in target
-              tgt_name=$(_sub_path "$src_name")
+              if [[ -n "$SED_SCRIPT" ]]; then
+                tgt_name=$(printf '%s' "$src_name" | sed "$SED_SCRIPT")
+              else
+                tgt_name="$src_name"
+              fi
               tgt_existing=$(find_sealed_secret_by_name "$tgt_name" "$TARGET_DIR" || true)
               if [[ -n "$tgt_existing" ]]; then
                 cp "$tgt_existing" "$TARGET_DIR/$tgt_file"
@@ -937,7 +988,9 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
             HAS_CHANGES=true
 
           else
-            if copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"; then
+            if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
+              log_info "A $tgt_file — already in target, skipping"
+            elif copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"; then
               if has_image_lines "$TARGET_DIR/$tgt_file"; then
                 IMAGE_NOTES+=("- \`[ADDED]\` \`$tgt_file\` — new file; image tags copied from source (review if needed)")
               fi
