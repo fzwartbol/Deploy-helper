@@ -497,8 +497,10 @@ neutralize_configmap_keys() {
 #
 # Returns: 0=clean merge, 1=conflict markers written, 2+=hard error
 three_way_merge_file() {
-  local src_path="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
-  src_path=$(_source_path_for_target "$src_path" "$tgt_path")
+  local orig_src="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
+
+  local src_path
+  src_path=$(_source_path_for_target "$orig_src" "$tgt_path")
   local src_abs="$SOURCE_DIR/$src_path"
   local tgt_abs="$tgt_dir/$tgt_path"
 
@@ -518,8 +520,8 @@ three_way_merge_file() {
   cp "$src_abs" "$theirs"
   apply_subs "$theirs" "$sed_script"
 
-  # First-time copy: no target exists yet — write theirs directly
   if [[ ! -f "$tgt_abs" ]]; then
+    # Target doesn't have this file yet — first-time copy.
     mkdir -p "$(dirname "$tgt_abs")"
     cp "$theirs" "$tgt_abs"
     rm -f "$base" "$theirs"
