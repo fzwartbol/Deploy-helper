@@ -837,14 +837,19 @@ if $DRY_RUN; then
   CHANGED_FILES=$'M\texample/deployment.yaml\nA\tsecrets/new-secret.yaml\nD\texample/old.yaml'
 else
   clone_or_update "$SOURCE_REPO" "$SOURCE_DIR" "$SOURCE_BRANCH"
-  CHANGED_FILES=$(git -C "$SOURCE_DIR" diff --find-renames --name-status "$FROM_REF" "$TO_REF" || true)
+  CHANGED_FILES=$(git -C "$SOURCE_DIR" diff --find-renames=80% --name-status "$FROM_REF" "$TO_REF" || true)
 fi
 
 [[ -n "$CHANGED_FILES" ]] || { log_warn "No changes between $FROM_REF and $TO_REF"; exit 0; }
 
 log_info "Changed files:"
 while IFS=$'\t' read -r status f1 f2; do
-  printf '  [%s] %s\n' "$status" "${f2:-$f1}"
+  op="${status:0:1}"
+  if [[ "$op" == "R" || "$op" == "C" ]] && [[ -n "$f2" ]]; then
+    printf '  [%s] %s  →  %s\n' "$status" "$f1" "$f2"
+  else
+    printf '  [%s] %s\n' "$status" "$f1"
+  fi
 done <<< "$CHANGED_FILES"
 
 CHANGED_FILES_MD=$(
@@ -905,6 +910,8 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
             log_info "D $tgt_file"
             git -C "$TARGET_DIR" rm -f "$tgt_file"
             HAS_CHANGES=true
+          else
+            log_warn "D $tgt_file — not found in target (already absent, or path mismatch)"
           fi
           ;;
 
@@ -922,6 +929,8 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
             if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
               git -C "$TARGET_DIR" rm -f "$tgt_file1"
               HAS_CHANGES=true
+            else
+              log_warn "R(D) $tgt_file1 — not found in target (already absent, or path mismatch)"
             fi
             if copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"; then
               git -C "$TARGET_DIR" add "$tgt_file2"
