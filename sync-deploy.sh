@@ -316,7 +316,7 @@ _fetch_branches() {
 
 is_text_file()     { grep -qI '' "$1" 2>/dev/null; }
 is_sealed_secret() {
-  is_text_file "$1" && grep -q 'kind:[[:space:]]*SealedSecret' "$1" 2>/dev/null
+  is_text_file "$1" && grep -q '^kind:[[:space:]]*SealedSecret' "$1" 2>/dev/null
 }
 
 # Extract the metadata.name value from a SealedSecret YAML file
@@ -985,6 +985,7 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
           tgt_file=$(_sub_path "$src_file")
           log_info "A  src=$src_file  →  tgt=$tgt_file"
 
+          log_info "A  is_sealed_secret($src_file) → $(is_sealed_secret "$SOURCE_DIR/$src_file" && echo YES || echo no)"
           if is_sealed_secret "$SOURCE_DIR/$src_file"; then
             src_name=$(get_sealed_secret_name "$SOURCE_DIR/$src_file")
             src_other=$(find_sealed_secret_by_name \
