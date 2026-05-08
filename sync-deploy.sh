@@ -443,7 +443,8 @@ copy_and_apply() {
   fi
   mkdir -p "$(dirname "$tgt_dir/$tgt_rel")"
   cp "$src_abs" "$tgt_dir/$tgt_rel"
-  log_info "copy_and_apply: src=$src_rel  sed=[${sed_script:0:80}]"
+  log_info "copy_and_apply: src=$src_rel"
+  log_info "copy_and_apply: sed=[$sed_script]"
   apply_subs "$tgt_dir/$tgt_rel" "$sed_script"
   log_info "copy_and_apply result (first 3 lines): $(head -3 "$tgt_dir/$tgt_rel" | tr '\n' '|')"
 }
@@ -538,6 +539,8 @@ three_way_merge_file() {
   if [[ ! -f "$tgt_abs" ]]; then
     # Target doesn't have this file yet — first-time copy.
     mkdir -p "$(dirname "$tgt_abs")"
+    log_info "3wm first-time copy: src=$src_path → tgt=$tgt_path"
+    log_info "3wm first-time copy content: $(head -6 "$theirs" | tr '\n' '|')"
     cp "$theirs" "$tgt_abs"
     rm -f "$base" "$theirs"
     return 0
@@ -883,7 +886,8 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
     PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
-    log_info "SED_SCRIPT for $TARGET_NAME: [${SED_SCRIPT:-(empty)}]"
+    log_info "SED_SCRIPT for $TARGET_NAME:"
+    log_info "  $SED_SCRIPT"
     HAS_CHANGES=false
     SEALED_NOTES=()
     IMAGE_NOTES=()
