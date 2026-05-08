@@ -784,6 +784,109 @@ EOF
 with_work "app-b-deploy" "" app_b_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-c  (testspace/app-c-deploy)
+# Starts with ONLY teamscope/default — vs-ont/default and vs-tst/default are
+# absent.  After sync these must be created from scratch with substitutions
+# applied (source-app → app-c).  This is the real-world "brand new target
+# directory" scenario the user described.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-c-deploy"
+
+app_c_initial() {
+  mkdir -p base services/environment/teamscope services/environment/enva \
+           services/environment/envb services/environment/teamscope/default
+
+  cat > base/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-c
+  namespace: ns-c
+spec:
+  selector:
+    matchLabels:
+      app: app-c
+  template:
+    metadata:
+      labels:
+        app: app-c
+    spec:
+      serviceAccountName: sa-c
+      containers:
+        - name: app-c
+          image: image-c:app-c-v1.0.0
+          env:
+            - name: APP_NAME
+              value: app-c
+            - name: PAAS_PROJECT
+              value: app-c-paas-project
+EOF
+
+  cat > base/configmap.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-c-config
+  namespace: ns-c
+data:
+  DATABASE_URL: app-c-postgres.ns-c.svc.cluster.local
+  APP_SETTING: original-value
+  SERVICE_NAME: app-c-service
+EOF
+
+  cat > base/old-feature.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-c-old-config
+  namespace: ns-c
+data:
+  LEGACY_SETTING: old-value
+EOF
+
+  cat > services/environment/teamscope/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - teamscope-only.yaml
+configMapGenerator:
+  - name: app-c-teamscope
+    literals:
+      - MARKER=teamscope-v1
+EOF
+
+  cat > services/environment/enva/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-c-enva
+    literals:
+      - MARKER=enva-v1-app-c
+EOF
+
+  cat > services/environment/envb/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-c-envb
+    literals:
+      - MARKER=envb-v1-app-c
+EOF
+
+  # teamscope/default exists, vs-ont/default and vs-tst/default do NOT
+  cat > services/environment/teamscope/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-c-teamscope-default
+    literals:
+      - MARKER=teamscope-default-v1
+      - ENV=teamscope
+EOF
+}
+with_work "app-c-deploy" "" app_c_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generate test repos.json pointing to our local testspace/ repos
 # ─────────────────────────────────────────────────────────────────────────────
 cat > "$T/repos.test.json" <<'EOF'
@@ -847,6 +950,24 @@ cat > "$T/repos.test.json" <<'EOF'
       "path_substitutions": {
         "app_name": "app-b"
       }
+    },
+    {
+      "name": "app-c",
+      "repo": "testspace/app-c-deploy",
+      "substitutions": {
+        "service_name":    "app-c-service",
+        "app_name":        "app-c",
+        "paas_name":       "app-c-paas-project",
+        "namespace":       "ns-c",
+        "environment":     "staging",
+        "service_account": "sa-c",
+        "image_name":      "image-c",
+        "context_url":     "app-c.example.com",
+        "health_url":      "app-c.example.com/actuator/health"
+      },
+      "path_substitutions": {
+        "app_name": "app-c"
+      }
     }
   ]
 }
@@ -869,6 +990,7 @@ bash "$SYNC_SCRIPT" \
 # ─────────────────────────────────────────────────────────────────────────────
 A="$WORK_DIR/app-a"
 B="$WORK_DIR/app-b"
+C="$WORK_DIR/app-c"
 
 # ── app-a: ConfigMap (M) ──────────────────────────────────────────────────────
 section "app-a  ConfigMap — three-way merge"
@@ -1058,6 +1180,33 @@ has     "$B/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=
 has_not "$B/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-b: vs-ont/default has no teamscope content"
 has     "$B/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-tst-default-v2"     "app-b: vs-tst/default updated to v2"
 has_not "$B/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-b: vs-tst/default has no teamscope content"
+
+# ── app-c: brand-new target dirs — substitutions applied on first copy ────────
+# app-c starts with ONLY teamscope/default.  vs-ont/default and vs-tst/default
+# are absent from the target.  After sync they must be created with:
+#   a) correct env-specific content (not teamscope content)
+#   b) substitutions applied (source-app → app-c)
+section "app-c  new target dirs — content correct and substitutions applied"
+exists  "$C/services/environment/teamscope/default/kustomization.yaml"  "app-c: teamscope/default exists"
+has     "$C/services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"      "app-c: teamscope/default updated to v2"
+has     "$C/services/environment/teamscope/default/kustomization.yaml"  "app-c-teamscope-default"          "app-c: teamscope/default substitution applied"
+has_not "$C/services/environment/teamscope/default/kustomization.yaml"  "source-app"                       "app-c: no source-app in teamscope/default"
+# vs-ont/default: brand new — created from source, substitution applied
+exists  "$C/services/environment/vs-ont/default/kustomization.yaml"     "app-c: vs-ont/default created"
+has     "$C/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-ont-default-v2"         "app-c: vs-ont/default has correct v2 content"
+has     "$C/services/environment/vs-ont/default/kustomization.yaml"     "ENV=vs-ont"                       "app-c: vs-ont/default has vs-ont ENV"
+has     "$C/services/environment/vs-ont/default/kustomization.yaml"     "app-c-vs-ont-default"             "app-c: vs-ont/default substitution applied"
+has_not "$C/services/environment/vs-ont/default/kustomization.yaml"     "source-app"                       "app-c: no source-app in vs-ont/default"
+has_not "$C/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=teamscope-default"         "app-c: vs-ont/default has no teamscope content"
+has_not "$C/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-tst-default"            "app-c: vs-ont/default has no vs-tst content"
+# vs-tst/default: brand new — same checks
+exists  "$C/services/environment/vs-tst/default/kustomization.yaml"     "app-c: vs-tst/default created"
+has     "$C/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-tst-default-v2"         "app-c: vs-tst/default has correct v2 content"
+has     "$C/services/environment/vs-tst/default/kustomization.yaml"     "ENV=vs-tst"                       "app-c: vs-tst/default has vs-tst ENV"
+has     "$C/services/environment/vs-tst/default/kustomization.yaml"     "app-c-vs-tst-default"             "app-c: vs-tst/default substitution applied"
+has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "source-app"                       "app-c: no source-app in vs-tst/default"
+has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"         "app-c: vs-tst/default has no teamscope content"
+has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-ont-default"            "app-c: vs-tst/default has no vs-ont content"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
