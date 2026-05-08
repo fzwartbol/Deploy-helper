@@ -1047,16 +1047,16 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
       "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")"
     git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH"
 
-    # Print conflict resolution hint pointing at the local working tree
+    # Print conflict resolution hint — branch is already pushed; user resolves in their own clone
     if [[ ${#CONFLICT_FILES[@]} -gt 0 ]]; then
-      log_warn "Conflicts in $TARGET_NAME — resolve in IntelliJ then push:"
-      log_warn "  Open folder : $TARGET_DIR"
-      log_warn "  Branch      : $SYNC_BRANCH"
-      log_warn "  Files       :"
+      log_warn "Conflicts in $TARGET_NAME — resolve in your local clone of $TARGET_REPO:"
+      log_warn "  1. cd <your local clone>"
+      log_warn "  2. git fetch origin && git checkout $SYNC_BRANCH"
+      log_warn "  3. Resolve conflict markers in:"
       for _cf in "${CONFLICT_FILES[@]}"; do
-        log_warn "    $TARGET_DIR/$_cf"
+        log_warn "       $_cf"
       done
-      log_warn "  After resolving: commit + push from IntelliJ (VCS > Git > Push)"
+      log_warn "  4. git add <files> && git commit && git push"
     fi
 
     # ── Build PR body ─────────────────────────────────────────────────────────
