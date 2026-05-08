@@ -412,7 +412,10 @@ _sub_path() {
   if [[ -z "${PATH_SED_SCRIPT:-}" ]]; then
     printf '%s' "$1"
   else
-    printf '%s' "$1" | sed "$PATH_SED_SCRIPT"
+    local _dir _base
+    _dir=$(dirname "$1")
+    _base=$(printf '%s' "$(basename "$1")" | sed "$PATH_SED_SCRIPT")
+    [[ "$_dir" == "." ]] && printf '%s' "$_base" || printf '%s/%s' "$_dir" "$_base"
   fi
 }
 
