@@ -233,6 +233,40 @@ configMapGenerator:
       - MARKER=envb-source
 EOF
 
+  mkdir -p services/environment/teamscope/default \
+           services/environment/vs-ont/default \
+           services/environment/vs-tst/default
+
+  cat > services/environment/teamscope/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: source-app-teamscope-default
+    literals:
+      - MARKER=teamscope-default-v1
+      - ENV=teamscope
+EOF
+
+  cat > services/environment/vs-ont/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: source-app-vs-ont-default
+    literals:
+      - MARKER=vs-ont-default-v1
+      - ENV=vs-ont
+EOF
+
+  cat > services/environment/vs-tst/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: source-app-vs-tst-default
+    literals:
+      - MARKER=vs-tst-default-v1
+      - ENV=vs-tst
+EOF
+
   # Sealed secret — will be "copied" to staging overlay in v2
   cat > overlays/dev/sealed-secret.yaml <<'EOF'
 apiVersion: bitnami.com/v1alpha1
@@ -362,6 +396,37 @@ configMapGenerator:
   - name: source-app-teamscope
     literals:
       - MARKER=teamscope-v2
+EOF
+
+  # M: env/*/default/kustomization.yaml — each updated with a distinct v2 marker
+  cat > services/environment/teamscope/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: source-app-teamscope-default
+    literals:
+      - MARKER=teamscope-default-v2
+      - ENV=teamscope
+EOF
+
+  cat > services/environment/vs-ont/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: source-app-vs-ont-default
+    literals:
+      - MARKER=vs-ont-default-v2
+      - ENV=vs-ont
+EOF
+
+  cat > services/environment/vs-tst/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: source-app-vs-tst-default
+    literals:
+      - MARKER=vs-tst-default-v2
+      - ENV=vs-tst
 EOF
 
   # M: dev sealed-secret — modified in source (must NOT be synced to target)
@@ -531,6 +596,40 @@ configMapGenerator:
       - MARKER=envb-v1-app-a
 EOF
 
+  mkdir -p services/environment/teamscope/default \
+           services/environment/vs-ont/default \
+           services/environment/vs-tst/default
+
+  cat > services/environment/teamscope/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-a-teamscope-default
+    literals:
+      - MARKER=teamscope-default-v1
+      - ENV=teamscope
+EOF
+
+  cat > services/environment/vs-ont/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-a-vs-ont-default
+    literals:
+      - MARKER=vs-ont-default-v1
+      - ENV=vs-ont
+EOF
+
+  cat > services/environment/vs-tst/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-a-vs-tst-default
+    literals:
+      - MARKER=vs-tst-default-v1
+      - ENV=vs-tst
+EOF
+
   # App-a's own sealed secret — cluster-specific encrypted values
   cat > overlays/dev/sealed-secret.yaml <<'EOF'
 apiVersion: bitnami.com/v1alpha1
@@ -598,6 +697,40 @@ configMapGenerator:
   - name: app-b-envb
     literals:
       - MARKER=envb-v1-app-b
+EOF
+
+  mkdir -p services/environment/teamscope/default \
+           services/environment/vs-ont/default \
+           services/environment/vs-tst/default
+
+  cat > services/environment/teamscope/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-b-teamscope-default
+    literals:
+      - MARKER=teamscope-default-v1
+      - ENV=teamscope
+EOF
+
+  cat > services/environment/vs-ont/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-b-vs-ont-default
+    literals:
+      - MARKER=vs-ont-default-v1
+      - ENV=vs-ont
+EOF
+
+  cat > services/environment/vs-tst/default/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: app-b-vs-tst-default
+    literals:
+      - MARKER=vs-tst-default-v1
+      - ENV=vs-tst
 EOF
 
   cat > base/deployment.yaml <<'EOF'
@@ -899,6 +1032,32 @@ exists  "$B/overlays/staging/app-b-unique-secret.yaml"                          
 has     "$B/overlays/staging/app-b-unique-secret.yaml"  "name: app-b-unique-secret"  "unique secret name substituted in app-b"
 has_not "$B/overlays/staging/app-b-unique-secret.yaml"  "SourceUniqueEncryptedValue=="  "source values not used in app-b"
 has     "$B/overlays/staging/app-b-unique-secret.yaml"  "TODO: kubeseal"             "encryptedData blanked in app-b"
+
+# ── env/*/default — each kustomization copied to same path, own content only ─
+section "env default dirs — each dir keeps its own content after sync"
+# app-a: teamscope/default
+has     "$A/services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"  "app-a: teamscope/default updated to v2"
+has     "$A/services/environment/teamscope/default/kustomization.yaml"  "ENV=teamscope"                "app-a: teamscope/default has teamscope ENV"
+has_not "$A/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-ont-default"        "app-a: teamscope/default has no vs-ont content"
+has_not "$A/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-tst-default"        "app-a: teamscope/default has no vs-tst content"
+# app-a: vs-ont/default
+has     "$A/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-ont-default-v2"     "app-a: vs-ont/default updated to v2"
+has     "$A/services/environment/vs-ont/default/kustomization.yaml"     "ENV=vs-ont"                   "app-a: vs-ont/default has vs-ont ENV"
+has_not "$A/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-a: vs-ont/default has no teamscope content"
+has_not "$A/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-tst-default"        "app-a: vs-ont/default has no vs-tst content"
+# app-a: vs-tst/default
+has     "$A/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-tst-default-v2"     "app-a: vs-tst/default updated to v2"
+has     "$A/services/environment/vs-tst/default/kustomization.yaml"     "ENV=vs-tst"                   "app-a: vs-tst/default has vs-tst ENV"
+has_not "$A/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-a: vs-tst/default has no teamscope content"
+has_not "$A/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-ont-default"        "app-a: vs-tst/default has no vs-ont content"
+# app-b: same checks
+has     "$B/services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"  "app-b: teamscope/default updated to v2"
+has_not "$B/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-ont-default"        "app-b: teamscope/default has no vs-ont content"
+has_not "$B/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-tst-default"        "app-b: teamscope/default has no vs-tst content"
+has     "$B/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-ont-default-v2"     "app-b: vs-ont/default updated to v2"
+has_not "$B/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-b: vs-ont/default has no teamscope content"
+has     "$B/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-tst-default-v2"     "app-b: vs-tst/default updated to v2"
+has_not "$B/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-b: vs-tst/default has no teamscope content"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
