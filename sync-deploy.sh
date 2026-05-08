@@ -906,12 +906,15 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
         # ── Deleted ───────────────────────────────────────────────────────────
         D)
           tgt_file=$(_sub_path "$file1")
+          log_info "D  src=$file1  →  tgt=$tgt_file"
           if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
             log_info "D $tgt_file"
             git -C "$TARGET_DIR" rm -f "$tgt_file"
             HAS_CHANGES=true
           else
-            log_warn "D $tgt_file — not found in target (already absent, or path mismatch)"
+            log_warn "D $tgt_file — not found in target"
+            log_warn "  checked: $TARGET_DIR/$tgt_file"
+            log_warn "  parent dir: $(ls "$(dirname "$TARGET_DIR/$tgt_file")" 2>/dev/null | tr '\n' '|' || echo '<dir missing>')"
           fi
           ;;
 
