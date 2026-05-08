@@ -905,35 +905,53 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
         R)
           tgt_file1=$(_sub_path "$file1")
           tgt_file2=$(_sub_path "$file2")
-          orig=$(mktemp "$WORK_DIR/.orig_XXXXXX")
-          has_orig=false
-          if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
-            cp "$TARGET_DIR/$tgt_file1" "$orig"
-            has_orig=true
-            git -C "$TARGET_DIR" rm -f "$tgt_file1"
-          fi
-          mkdir -p "$(dirname "$TARGET_DIR/$tgt_file2")"
 
-          if is_sealed_secret "$SOURCE_DIR/$file2"; then
-            if $has_orig && is_sealed_secret "$orig"; then
-              cp "$orig" "$TARGET_DIR/$tgt_file2"
-              apply_subs "$TARGET_DIR/$tgt_file2" "$SED_SCRIPT"
-              SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — target's encrypted values moved to new path")
-            else
-              copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT" || true
-              [[ -f "$TARGET_DIR/$tgt_file2" ]] && strip_encrypted_data "$TARGET_DIR/$tgt_file2"
-              SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — encryptedData blanked; re-seal for this cluster")
+          if [[ "$(dirname "$tgt_file1")" != "$(dirname "$tgt_file2")" ]]; then
+            # Cross-directory renames are almost always false positives from
+            # git's similarity detector (e.g. two kustomization.yaml files
+            # matching each other across unrelated dirs).  Treat as D + A:
+            # remove the old path if target has it, copy the new file.
+            log_info "R $file1 → $file2 (cross-dir rename; treated as D+A)"
+            if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
+              git -C "$TARGET_DIR" rm -f "$tgt_file1"
+              HAS_CHANGES=true
+            fi
+            if copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"; then
+              git -C "$TARGET_DIR" add "$tgt_file2"
+              HAS_CHANGES=true
             fi
           else
-            copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"
-            $has_orig && restore_image_lines "$TARGET_DIR/$tgt_file2" "$orig"
-            if has_image_lines "$TARGET_DIR/$tgt_file2"; then
-              IMAGE_NOTES+=("- \`[RENAMED]\` \`$tgt_file2\` — image tags kept from \`$tgt_file1\`")
+            # Same-directory rename — normal rename handling with image-line restore
+            orig=$(mktemp "$WORK_DIR/.orig_XXXXXX")
+            has_orig=false
+            if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
+              cp "$TARGET_DIR/$tgt_file1" "$orig"
+              has_orig=true
+              git -C "$TARGET_DIR" rm -f "$tgt_file1"
             fi
+            mkdir -p "$(dirname "$TARGET_DIR/$tgt_file2")"
+
+            if is_sealed_secret "$SOURCE_DIR/$file2"; then
+              if $has_orig && is_sealed_secret "$orig"; then
+                cp "$orig" "$TARGET_DIR/$tgt_file2"
+                apply_subs "$TARGET_DIR/$tgt_file2" "$SED_SCRIPT"
+                SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — target's encrypted values moved to new path")
+              else
+                copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT" || true
+                [[ -f "$TARGET_DIR/$tgt_file2" ]] && strip_encrypted_data "$TARGET_DIR/$tgt_file2"
+                SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — encryptedData blanked; re-seal for this cluster")
+              fi
+            else
+              copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"
+              $has_orig && restore_image_lines "$TARGET_DIR/$tgt_file2" "$orig"
+              if has_image_lines "$TARGET_DIR/$tgt_file2"; then
+                IMAGE_NOTES+=("- \`[RENAMED]\` \`$tgt_file2\` — image tags kept from \`$tgt_file1\`")
+              fi
+            fi
+            git -C "$TARGET_DIR" add "$tgt_file2"
+            HAS_CHANGES=true
+            rm -f "$orig"
           fi
-          git -C "$TARGET_DIR" add "$tgt_file2"
-          HAS_CHANGES=true
-          rm -f "$orig"
           ;;
 
         # ── Modified ──────────────────────────────────────────────────────────
