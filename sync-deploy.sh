@@ -939,6 +939,7 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
         # ── Modified ──────────────────────────────────────────────────────────
         M)
           tgt_file=$(_sub_path "$file1")
+          log_info "M  src=$file1  →  tgt=$tgt_file"
           if is_sealed_secret "$SOURCE_DIR/$file1"; then
             SEALED_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — **skipped** (cluster-specific encryption; re-seal manually if value changed)")
           else
@@ -957,6 +958,7 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
         A|C|*)
           src_file="${file2:-$file1}"
           tgt_file=$(_sub_path "$src_file")
+          log_info "A  src=$src_file  →  tgt=$tgt_file"
 
           if is_sealed_secret "$SOURCE_DIR/$src_file"; then
             src_name=$(get_sealed_secret_name "$SOURCE_DIR/$src_file")
