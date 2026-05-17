@@ -942,6 +942,65 @@ EOF
 with_work "app-d-deploy" "" app_d_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-g  (testspace/app-g-deploy)
+# No path_substitutions in config — auto-derive from app_name must work.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-g-deploy"
+
+app_g_initial() {
+  mkdir -p base
+
+  cat > base/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-g
+  namespace: ns-g
+spec:
+  selector:
+    matchLabels:
+      app: app-g
+  template:
+    metadata:
+      labels:
+        app: app-g
+    spec:
+      serviceAccountName: sa-g
+      containers:
+        - name: app-g
+          image: image-g:app-g-v1.0.0
+          env:
+            - name: APP_NAME
+              value: app-g
+            - name: PAAS_PROJECT
+              value: app-g-paas-project
+EOF
+
+  cat > base/configmap.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-g-config
+  namespace: ns-g
+data:
+  DATABASE_URL: app-g-postgres.ns-g.svc.cluster.local
+  APP_SETTING: original-value
+  SERVICE_NAME: app-g-service
+EOF
+
+  cat > base/old-feature.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-g-old-config
+  namespace: ns-g
+data:
+  LEGACY_SETTING: old-value
+EOF
+}
+with_work "app-g-deploy" "" app_g_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TARGET REPO: app-e  (testspace/app-e-deploy)  [copy mode scenario]
 # ─────────────────────────────────────────────────────────────────────────────
 make_bare "app-e-deploy"
@@ -1263,6 +1322,21 @@ cat > "$T/repos.test.json" <<'EOF'
       }
     },
     {
+      "name": "app-g",
+      "deploy": {
+        "repo": "testspace/app-g-deploy",
+        "substitutions": {
+          "service_name":    "app-g-service",
+          "app_name":        "app-g",
+          "paas_name":       "app-g-paas-project",
+          "namespace":       "ns-g",
+          "environment":     "staging",
+          "service_account": "sa-g",
+          "image_name":      "image-g"
+        }
+      }
+    },
+    {
       "name": "app-f",
       "app": {
         "repo": "testspace/app-f-app",
@@ -1516,6 +1590,40 @@ has     "$C/services/environment/vs-tst/default/kustomization.yaml"     "app-c-v
 has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "source-app"                       "app-c: no source-app in vs-tst/default"
 has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"         "app-c: vs-tst/default has no teamscope content"
 has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-ont-default"            "app-c: vs-tst/default has no vs-ont content"
+
+# ── Addition 1: app-f silently skipped during deploy sync ────────────────────
+# app-f has only an "app" section (no "deploy") — must not be cloned or cause
+# any failure during a deploy-type sync run.
+section "app-f silently skipped during deploy sync (no deploy section)"
+if [[ ! -d "$WORK_DIR/app-f" ]]; then
+  ok "app-f not cloned during deploy sync"
+else
+  fail "app-f should not have been cloned during deploy sync (no deploy section)"
+fi
+
+# ── Addition 2: app-g auto-derived path substitution ─────────────────────────
+# app-g has no explicit path_substitutions — the script must auto-derive
+# source-app → app-g from the app_name content substitution.
+G="$WORK_DIR/app-g"
+
+section "app-g  auto-derived path sub — added file renamed correctly"
+absent  "$G/overlays/dev/source-app-internal-svc.yaml"  "source-app filename not present in app-g"
+exists  "$G/overlays/dev/app-g-internal-svc.yaml"        "auto-derived path sub: app-g filename exists"
+has     "$G/overlays/dev/app-g-internal-svc.yaml"  "name: app-g-internal"  "content substituted in auto-derived file"
+has     "$G/overlays/dev/app-g-internal-svc.yaml"  "namespace: ns-g"       "namespace substituted in auto-derived file"
+has_not "$G/overlays/dev/app-g-internal-svc.yaml"  "source-app"            "source-app not in auto-derived file"
+
+section "app-g  auto-derived path sub — content and protected key"
+has     "$G/base/configmap.yaml"  "APP_SETTING: updated-value"                          "non-protected key updated in app-g"
+has     "$G/base/configmap.yaml"  "DATABASE_URL: app-g-postgres.ns-g.svc.cluster.local" "protected DATABASE_URL preserved in app-g"
+has_not "$G/base/configmap.yaml"  "DATABASE_URL: changed-db.internal"                   "source DATABASE_URL not in app-g"
+has_not "$G/base/configmap.yaml"  "source-app"                                           "source-app not in app-g configmap"
+
+section "app-g  auto-derived path sub — deletion and image preservation"
+absent  "$G/base/old-feature.yaml"  "old-feature.yaml deleted from app-g"
+has     "$G/base/deployment.yaml"   "image: image-g:app-g-v1.0.0"  "image tag preserved in app-g"
+has_not "$G/base/deployment.yaml"   "source-image"                  "source-image not in app-g deployment"
+has     "$G/base/deployment.yaml"   "NEW_FEATURE"                   "new env var added in app-g"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO: app-e copy mode

@@ -428,6 +428,21 @@ has_image_lines() {
 
 # ── name-substitution helpers ─────────────────────────────────────────────────
 
+# Derive a path substitution sed script from app_name content substitutions.
+# Used as fallback when no explicit path_substitutions are configured.
+# Returns empty string when auto-derive is not possible.
+derive_path_sed_script() {
+  local src_subs="$1" tgt_subs="$2"
+  local src_app tgt_app src_esc tgt_esc
+  src_app=$(printf '%s\n' "$src_subs" | awk -F'\t' '$1=="app_name"{print $2; exit}')
+  tgt_app=$(printf '%s\n' "$tgt_subs" | awk -F'\t' '$1=="app_name"{print $2; exit}')
+  if [[ -n "$src_app" && -n "$tgt_app" && "$src_app" != "$tgt_app" ]]; then
+    src_esc=$(printf '%s' "$src_app" | sed 's/[[\.*^$()+?{|/]/\\&/g')
+    tgt_esc=$(printf '%s' "$tgt_app" | sed 's/[&|\\]/\\&/g')
+    printf 's|%s|%s|g' "$src_esc" "$tgt_esc"
+  fi
+}
+
 # Build a sed substitution script from source → target subs.
 # Sorted longest-source-value first to prevent partial-string clobbering.
 # Both arguments are KEY<TAB>VALUE lines (from _cf_app_subs).
@@ -1060,7 +1075,10 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
   TARGET_PATH_SUBS=$(_cf_app_path_subs "$_ti" "$SYNC_TYPE")
 
   # Skip apps that don't have the SYNC_TYPE section
-  [[ -z "$TARGET_REPO" ]] && continue
+  if [[ -z "$TARGET_REPO" ]]; then
+    log_info "Skipping $TARGET_NAME — no '$SYNC_TYPE' section configured"
+    continue
+  fi
 
   is_target_included "$TARGET_NAME" || continue
   _tgt_num=$(( _tgt_num + 1 ))
@@ -1070,6 +1088,9 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
   if $DRY_RUN; then
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
     PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
+    if [[ -z "$PATH_SED_SCRIPT" ]]; then
+      PATH_SED_SCRIPT=$(derive_path_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
+    fi
     log_info "[DRY RUN] Branch             : $SYNC_BRANCH"
     log_info "[DRY RUN] Content subs       : ${SED_SCRIPT:-(none)}"
     log_info "[DRY RUN] Path subs          : ${PATH_SED_SCRIPT:-(none)}"
@@ -1093,6 +1114,10 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
     PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
+    if [[ -z "$PATH_SED_SCRIPT" ]]; then
+      PATH_SED_SCRIPT=$(derive_path_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
+      [[ -n "$PATH_SED_SCRIPT" ]] && log_info "Auto-derived path sub from app_name: $PATH_SED_SCRIPT"
+    fi
     log_info "SED_SCRIPT for $TARGET_NAME:"
     log_info "  $SED_SCRIPT"
     HAS_CHANGES=false
