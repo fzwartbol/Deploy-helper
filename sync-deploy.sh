@@ -56,11 +56,14 @@ usage() {
   cat <<'EOF'
 Usage: sync-deploy.sh [OPTIONS]
 
-Syncs deploy-repo changes to all configured Bitbucket repos, applying per-repo
-name substitutions, preserving image tags, and handling Sealed Secrets.
+Syncs deploy-repo (or app-repo) changes to all configured Bitbucket repos,
+applying per-repo name substitutions, preserving image tags, and handling
+Sealed Secrets.
 
 Options:
-  --source <name>    Source repo name (from repos list)
+  --source <name>    Source app name (from repos list)
+  --type <type>      Section type to sync: deploy|app  (default: deploy)
+  --mode <mode>      Sync mode: diff|copy               (default: diff)
   --branch <name>    Source branch to check out  (default: base_branch from config)
   --from <ref>       Start ref — tag or commit  (default: HEAD~1)
   --to <ref>         End ref   — tag or commit  (default: HEAD)
@@ -75,8 +78,9 @@ Environment:
 
 Examples:
   sync-deploy.sh
-  sync-deploy.sh --source source-deploy --from v1.2.0 --to v1.3.0
-  sync-deploy.sh --source app-a --targets app-b,app-c --dry-run
+  sync-deploy.sh --source source --type deploy --from v1.2.0 --to v1.3.0
+  sync-deploy.sh --source source --type app --targets app-a,app-b --dry-run
+  sync-deploy.sh --source source --mode copy --from v1.0.0 --to v1.1.0
 EOF
 }
 
@@ -89,10 +93,14 @@ FROM_EXPLICIT=false
 TO_EXPLICIT=false
 FILTER_TARGETS="all"
 DRY_RUN=false
+SYNC_TYPE=""
+SYNC_MODE="diff"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --source)  SOURCE_NAME="$2"; shift 2 ;;
+    --type)    SYNC_TYPE="$2"; shift 2 ;;
+    --mode)    SYNC_MODE="$2"; shift 2 ;;
     --branch)  SOURCE_BRANCH="$2"; shift 2 ;;
     --from)    FROM_REF="$2"; FROM_EXPLICIT=true; shift 2 ;;
     --to)      TO_REF="$2";   TO_EXPLICIT=true;   shift 2 ;;
@@ -103,6 +111,18 @@ while [[ $# -gt 0 ]]; do
     *) log_error "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
+
+# Validate --mode and --type
+case "$SYNC_MODE" in
+  diff|copy) ;;
+  *) log_error "Invalid --mode '$SYNC_MODE'; must be diff or copy"; exit 1 ;;
+esac
+if [[ -n "$SYNC_TYPE" ]]; then
+  case "$SYNC_TYPE" in
+    deploy|app) ;;
+    *) log_error "Invalid --type '$SYNC_TYPE'; must be deploy or app"; exit 1 ;;
+  esac
+fi
 
 # ── prerequisites ─────────────────────────────────────────────────────────────
 [[ -f "$CONFIG_FILE" ]] || { log_error "Config not found: $CONFIG_FILE"; exit 1; }
@@ -122,59 +142,111 @@ _cf_str() {
   awk -F'"' -v k="$1" '$2==k && NF>=4 { print $4; exit }' "$CONFIG_FILE"
 }
 
-# Count repo entries (by counting "name" keys)
-_cf_repo_count() {
-  awk -F'"' '$2=="name" && NF>=4 { c++ } END { print c+0 }' "$CONFIG_FILE"
+# Brace-depth tracking one-liner:
+#   { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+# pd = pre-line depth, d = post-line depth
+
+# Count app entries inside the "apps" array
+_cf_app_count() {
+  awk '
+    { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+    /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
+    in_apps && pd==1 && d==2 { c++ }
+    END { print c+0 }
+  ' "$CONFIG_FILE"
 }
 
-# 0-based name / path accessors
-_cf_repo_name() {
-  awk -F'"' -v idx="$1" \
-    '$2=="name" && NF>=4 { if (c++==idx) { print $4; exit } }' "$CONFIG_FILE"
-}
-_cf_repo_path() {
-  awk -F'"' -v idx="$1" \
-    '$2=="repo" && NF>=4 { if (c++==idx) { print $4; exit } }' "$CONFIG_FILE"
+# 0-based name of app entry
+_cf_app_name() {
+  awk -F'"' -v idx="$1" '
+    { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+    /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
+    in_apps && pd==1 && d==2 { entry++ }
+    in_apps && entry==idx+1 && pd==2 && $2=="name" && NF>=4 { print $4; exit }
+  ' "$CONFIG_FILE"
 }
 
-# Returns the 0-based index of a repo by name, or "null" if not found
-_cf_repo_index() {
+# 0-based index by name, or "null"
+_cf_app_index() {
   awk -F'"' -v name="$1" '
-    $2=="name" && NF>=4 {
-      if ($4==name) { print c+0; found=1; exit }
-      c++
+    { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+    /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
+    in_apps && pd==1 && d==2 { entry++ }
+    in_apps && entry>0 && pd==2 && $2=="name" && NF>=4 {
+      if ($4==name) { print entry-1; found=1; exit }
     }
     END { if (!found) print "null" }
   ' "$CONFIG_FILE"
 }
 
-_cf_repo_names_csv() {
-  awk -F'"' \
-    '$2=="name" && NF>=4 { printf "%s%s", (sep?", ":""), $4; sep=1 }
-     END { print "" }' "$CONFIG_FILE"
-}
-
-# Returns KEY<TAB>VALUE lines for the substitutions block of repo at index idx
-_cf_repo_subs() {
-  awk -F'"' -v idx="$1" '
-    $2=="name" && NF>=4              { nc++ }
-    nc==idx+1 && $2=="substitutions" { in_s=1; next }
-    in_s && /^[[:space:]]*\}/        { exit }
-    in_s && NF>=4 && $2!="" && $3~/^:/ { print $2 "\t" $4 }
+# Repo path for type "deploy" or "app"
+_cf_app_repo() {
+  local idx="$1" type="$2"
+  awk -F'"' -v idx="$idx" -v type="$type" '
+    { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+    /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
+    in_apps && pd==1 && d==2 { entry++; in_type=0 }
+    in_apps && entry==idx+1 && pd==2 && $2==type { in_type=1 }
+    in_type && pd==3 && $2=="repo" && NF>=4 { print $4; exit }
   ' "$CONFIG_FILE"
 }
 
-# Returns KEY<TAB>VALUE lines for the optional path_substitutions block.
-# When absent, prints nothing → PATH_SED_SCRIPT stays empty → paths are
-# copied verbatim from source to target (correct when all repos share the
-# same directory structure).
-_cf_repo_path_subs() {
-  awk -F'"' -v idx="$1" '
-    $2=="name" && NF>=4                   { nc++ }
-    nc==idx+1 && $2=="path_substitutions" { in_s=1; next }
-    in_s && /^[[:space:]]*\}/             { exit }
-    in_s && NF>=4 && $2!="" && $3~/^:/    { print $2 "\t" $4 }
+# Whether app at idx has the given type section (deploy/app)
+_cf_app_has_type() {
+  [[ -n "$(_cf_app_repo "$1" "$2")" ]]
+}
+
+# KEY<TAB>VALUE substitutions lines
+_cf_app_subs() {
+  local idx="$1" type="$2"
+  awk -F'"' -v idx="$idx" -v type="$type" '
+    { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+    /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
+    in_apps && pd==1 && d==2 { entry++; in_type=0; in_subs=0 }
+    in_apps && entry==idx+1 && pd==2 && $2==type { in_type=1 }
+    in_type && pd==3 && $2=="substitutions" { in_subs=1 }
+    in_subs && d<4 && pd>=4 { in_subs=0 }
+    in_subs && pd==4 && $2!="" && NF>=4 && $3~/^:/ { print $2 "\t" $4 }
   ' "$CONFIG_FILE"
+}
+
+# KEY<TAB>VALUE path_substitutions lines (empty when absent)
+_cf_app_path_subs() {
+  local idx="$1" type="$2"
+  awk -F'"' -v idx="$idx" -v type="$type" '
+    { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+    /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
+    in_apps && pd==1 && d==2 { entry++; in_type=0; in_subs=0 }
+    in_apps && entry==idx+1 && pd==2 && $2==type { in_type=1 }
+    in_type && pd==3 && $2=="path_substitutions" { in_subs=1 }
+    in_subs && d<4 && pd>=4 { in_subs=0 }
+    in_subs && pd==4 && $2!="" && NF>=4 && $3~/^:/ { print $2 "\t" $4 }
+  ' "$CONFIG_FILE"
+}
+
+# Newline-separated list of app names that have the given type section
+# type="" means all apps
+_cf_app_names_csv() {
+  local type="${1:-}"
+  if [[ -z "$type" ]]; then
+    awk -F'"' '
+      { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+      /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
+      in_apps && pd==1 && d==2 { entry++ }
+      in_apps && entry>0 && pd==2 && $2=="name" && NF>=4 { printf "%s%s", (sep?", ":""), $4; sep=1 }
+      END { if (sep) print "" }
+    ' "$CONFIG_FILE"
+  else
+    awk -F'"' -v type="$type" '
+      { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
+      /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
+      in_apps && pd==1 && d==2 { entry++; cur_name=""; has_type=0 }
+      in_apps && entry>0 && pd==2 && $2=="name" && NF>=4 { cur_name=$4 }
+      in_apps && entry>0 && pd==2 && $2==type { has_type=1 }
+      in_apps && entry>0 && cur_name!="" && has_type { printf "%s%s", (sep?", ":""), cur_name; sep=1; cur_name=""; has_type=0 }
+      END { if (sep) print "" }
+    ' "$CONFIG_FILE"
+  fi
 }
 
 # Returns pipe-delimited alternation of protected ConfigMap key names
@@ -358,7 +430,7 @@ has_image_lines() {
 
 # Build a sed substitution script from source → target subs.
 # Sorted longest-source-value first to prevent partial-string clobbering.
-# Both arguments are KEY<TAB>VALUE lines (from _cf_repo_subs).
+# Both arguments are KEY<TAB>VALUE lines (from _cf_app_subs).
 build_sed_script() {
   local src_subs="$1" tgt_subs="$2"
   local src_f tgt_f
@@ -405,17 +477,14 @@ apply_subs() {
   sed -i.bak "$sed_script" "$file" && rm -f "$file.bak"
 }
 
-# Apply path substitution script to a path string.
+# Apply path substitution script to the full path string.
 # Uses PATH_SED_SCRIPT (built from path_substitutions), NOT the content
 # SED_SCRIPT — so content substitutions never accidentally rename directories.
 _sub_path() {
   if [[ -z "${PATH_SED_SCRIPT:-}" ]]; then
     printf '%s' "$1"
   else
-    local _dir _base
-    _dir=$(dirname "$1")
-    _base=$(printf '%s' "$(basename "$1")" | sed "$PATH_SED_SCRIPT")
-    [[ "$_dir" == "." ]] && printf '%s' "$_base" || printf '%s/%s' "$_dir" "$_base"
+    printf '%s' "$1" | sed "$PATH_SED_SCRIPT"
   fi
 }
 
@@ -616,58 +685,95 @@ is_target_included() {
 # ── load static config values ─────────────────────────────────────────────────
 BASE_BRANCH=$(_cf_str base_branch);      BASE_BRANCH="${BASE_BRANCH:-main}"
 PR_TITLE_PREFIX=$(_cf_str title_prefix); PR_TITLE_PREFIX="${PR_TITLE_PREFIX:-chore(sync): }"
-REPO_COUNT=$(_cf_repo_count)
+APP_COUNT=$(_cf_app_count)
 PROTECTED_CM_KEYS=$(_cf_protected_keys)
 
-[[ "$REPO_COUNT" -gt 0 ]] || { log_error "No repos found in $CONFIG_FILE"; exit 1; }
+[[ "$APP_COUNT" -gt 0 ]] || { log_error "No apps found in $CONFIG_FILE"; exit 1; }
 
 mkdir -p "$WORK_DIR"
 
-# Pre-load repo list to avoid repeated awk calls in menus
-_RNAMES=(); _RPATHS=()
-for ((_i=0; _i<REPO_COUNT; _i++)); do
-  _RNAMES+=("$(_cf_repo_name "$_i")")
-  _RPATHS+=("$(_cf_repo_path "$_i")")
+# ── Interactive step 0: select sync type ─────────────────────────────────────
+if [[ -z "$SYNC_TYPE" ]]; then
+  if $_INTERACTIVE; then
+    echo ""
+    echo "### sync-deploy.sh ###"
+    echo "Config: $CONFIG_FILE"
+    echo ""
+    echo "Steps: (0) type  (1) source repo  (2) branch  (3) FROM ref  (4) TO ref  (5) target(s)"
+    echo ""
+    echo "--- Step 0: What do you want to sync? ---"
+    echo "  1) Deploy repos"
+    echo "  2) App repos"
+    printf 'Enter number [1-2, ENTER=1]: '
+    read -r _pick 2>/dev/null || _pick=""
+    [[ -z "$_pick" ]] && _pick=1
+    case "$_pick" in
+      2) SYNC_TYPE="app" ;;
+      *) SYNC_TYPE="deploy" ;;
+    esac
+    echo "-> $SYNC_TYPE"
+    echo ""
+    unset _pick
+  else
+    SYNC_TYPE="deploy"
+  fi
+fi
+
+# Pre-load app list filtered by SYNC_TYPE
+_ANAMES=(); _AREPOS=()
+for ((_i=0; _i<APP_COUNT; _i++)); do
+  _n=$(_cf_app_name "$_i")
+  _r=$(_cf_app_repo "$_i" "$SYNC_TYPE")
+  if [[ -n "$_r" ]]; then
+    _ANAMES+=("$_n")
+    _AREPOS+=("$_r")
+  fi
 done
+_ACOUNT=${#_ANAMES[@]}
 
 # ── Interactive step 1: source repo ──────────────────────────────────────────
 if [[ -z "$SOURCE_NAME" ]]; then
   if ! $_INTERACTIVE; then
     log_error "--source is required in non-interactive mode"
-    log_error "Available repos: $(_cf_repo_names_csv)"
+    log_error "Available apps (${SYNC_TYPE}): $(_cf_app_names_csv "$SYNC_TYPE")"
     usage; exit 1
   fi
 
-  echo ""
-  echo "### sync-deploy.sh ###"
-  echo "Config: $CONFIG_FILE"
-  echo ""
-  echo "Steps: (1) source repo  (2) branch  (3) FROM ref  (4) TO ref  (5) target(s)"
-  echo ""
+  if [[ ! $_INTERACTIVE == true ]]; then
+    echo ""
+    echo "### sync-deploy.sh ###"
+    echo "Config: $CONFIG_FILE"
+    echo ""
+    echo "Steps: (1) source repo  (2) branch  (3) FROM ref  (4) TO ref  (5) target(s)"
+    echo ""
+  fi
   echo "--- Step 1: Select SOURCE repo ---"
   echo "The diff will be computed on this repo."
   echo ""
-  for ((_i=0; _i<REPO_COUNT; _i++)); do
-    printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_RNAMES[$_i]}" "${_RPATHS[$_i]}"
+  for ((_i=0; _i<_ACOUNT; _i++)); do
+    printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_ANAMES[$_i]}" "${_AREPOS[$_i]}"
   done
   echo ""
 
-  if [[ "$REPO_COUNT" -eq 1 ]]; then
-    SOURCE_NAME="${_RNAMES[0]}"
+  if [[ "$_ACOUNT" -eq 1 ]]; then
+    SOURCE_NAME="${_ANAMES[0]}"
     echo "Only one repo — auto-selected: $SOURCE_NAME"
     echo ""
+  elif [[ "$_ACOUNT" -eq 0 ]]; then
+    log_error "No apps with type '$SYNC_TYPE' found in $CONFIG_FILE"
+    exit 1
   else
     while true; do
-      printf 'Enter number [1-%d, ENTER=1]: ' "$REPO_COUNT"
+      printf 'Enter number [1-%d, ENTER=1]: ' "$_ACOUNT"
       read -r _pick 2>/dev/null || _pick=""
       [[ -z "$_pick" ]] && _pick=1
-      if [[ "$_pick" =~ ^[0-9]+$ ]] && ((_pick >= 1 && _pick <= REPO_COUNT)); then
-        SOURCE_NAME="${_RNAMES[$((_pick-1))]}"
+      if [[ "$_pick" =~ ^[0-9]+$ ]] && ((_pick >= 1 && _pick <= _ACOUNT)); then
+        SOURCE_NAME="${_ANAMES[$((_pick-1))]}"
         echo "-> $SOURCE_NAME"
         echo ""
         break
       fi
-      printf 'Enter a number between 1 and %d.\n' "$REPO_COUNT"
+      printf 'Enter a number between 1 and %d.\n' "$_ACOUNT"
     done
     unset _pick
   fi
@@ -675,16 +781,16 @@ fi
 
 # ── Interactive step 2: source branch ────────────────────────────────────────
 if [[ -z "$SOURCE_BRANCH" ]] && $_INTERACTIVE; then
-  _src_path_for_br=""
-  for ((_i=0; _i<REPO_COUNT; _i++)); do
-    [[ "${_RNAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_path_for_br="${_RPATHS[$_i]}"; break; }
+  _src_repo_for_br=""
+  for ((_i=0; _i<_ACOUNT; _i++)); do
+    [[ "${_ANAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_repo_for_br="${_AREPOS[$_i]}"; break; }
   done
 
   echo "--- Step 2: Select source BRANCH ---"
-  log_info "Fetching branches from ${_src_path_for_br} ..."
+  log_info "Fetching branches from ${_src_repo_for_br} ..."
   _branches=()
   while IFS= read -r _b; do [[ -n "$_b" ]] && _branches+=("$_b"); done \
-    < <(_fetch_branches "$_src_path_for_br" 2>/dev/null || true)
+    < <(_fetch_branches "$_src_repo_for_br" 2>/dev/null || true)
 
   if [[ ${#_branches[@]} -eq 0 ]]; then
     SOURCE_BRANCH="$BASE_BRANCH"
@@ -706,22 +812,22 @@ if [[ -z "$SOURCE_BRANCH" ]] && $_INTERACTIVE; then
     echo "-> $SOURCE_BRANCH"
     echo ""
   fi
-  unset _src_path_for_br _branches _nb _show_br _b _pick _j
+  unset _src_repo_for_br _branches _nb _show_br _b _pick _j
 fi
 [[ -z "$SOURCE_BRANCH" ]] && SOURCE_BRANCH="$BASE_BRANCH"
 
 # ── Interactive step 3: FROM and TO refs ─────────────────────────────────────
 if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
   if $_INTERACTIVE; then
-    _src_path=""
-    for ((_i=0; _i<REPO_COUNT; _i++)); do
-      [[ "${_RNAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_path="${_RPATHS[$_i]}"; break; }
+    _src_repo=""
+    for ((_i=0; _i<_ACOUNT; _i++)); do
+      [[ "${_ANAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_repo="${_AREPOS[$_i]}"; break; }
     done
 
-    log_info "Fetching tags from ${_src_path} ..."
+    log_info "Fetching tags from ${_src_repo} ..."
     _tags=()
     while IFS= read -r _t; do [[ -n "$_t" ]] && _tags+=("$_t"); done \
-      < <(_fetch_tags "$_src_path" 2>/dev/null || true)
+      < <(_fetch_tags "$_src_repo" 2>/dev/null || true)
 
     # _pick_ref VARNAME TITLE DEFAULT_LABEL DEFAULT_VALUE [tags…]
     _pick_ref() {
@@ -757,17 +863,17 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
       "Step 3b: TO ref (end of diff — newer tag/commit)" \
       "HEAD — latest commit (default)" "HEAD" \
       "${_tags[@]+"${_tags[@]}"}"
-    unset _t _tags _src_path
+    unset _t _tags _src_repo
   fi
 fi
 
-# ── Interactive step 3: target repos ─────────────────────────────────────────
+# ── Interactive step 4: target repos ─────────────────────────────────────────
 if [[ "$FILTER_TARGETS" == "all" ]]; then
-  _tgt_names=(); _tgt_paths=()
-  for ((_i=0; _i<REPO_COUNT; _i++)); do
-    [[ "${_RNAMES[$_i]}" == "$SOURCE_NAME" ]] && continue
-    _tgt_names+=("${_RNAMES[$_i]}")
-    _tgt_paths+=("${_RPATHS[$_i]}")
+  _tgt_names=(); _tgt_repos=()
+  for ((_i=0; _i<_ACOUNT; _i++)); do
+    [[ "${_ANAMES[$_i]}" == "$SOURCE_NAME" ]] && continue
+    _tgt_names+=("${_ANAMES[$_i]}")
+    _tgt_repos+=("${_AREPOS[$_i]}")
   done
   _nt=${#_tgt_names[@]}
 
@@ -783,7 +889,7 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
     echo "The diff ($FROM_REF -> $TO_REF) will be applied to these repos."
     echo ""
     for ((_i=0; _i<_nt; _i++)); do
-      printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_paths[$_i]}"
+      printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_repos[$_i]}"
     done
     printf '\nEnter numbers (space-separated), or ENTER for all: '
     read -r _picks 2>/dev/null || _picks=""
@@ -805,12 +911,12 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
     echo ""
     unset _picks _p _sel _oifs
   fi
-  unset _tgt_names _tgt_paths _nt
+  unset _tgt_names _tgt_repos _nt
 fi
-unset _RNAMES _RPATHS _i
+unset _ANAMES _AREPOS _i
 
 # ── Compute branch name ───────────────────────────────────────────────────────
-SYNC_BRANCH="sync/deploy-from-$(_sanitize_ref "$FROM_REF")-to-$(_sanitize_ref "$TO_REF")"
+SYNC_BRANCH="sync/${SYNC_TYPE}-${SYNC_MODE}-from-$(_sanitize_ref "$FROM_REF")-to-$(_sanitize_ref "$TO_REF")"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Sync engine — no interactive code below this line
@@ -818,55 +924,143 @@ SYNC_BRANCH="sync/deploy-from-$(_sanitize_ref "$FROM_REF")-to-$(_sanitize_ref "$
 
 [[ -n "$SOURCE_NAME" ]] || { log_error "--source is required"; exit 1; }
 
-_src_idx=$(_cf_repo_index "$SOURCE_NAME")
+_src_idx=$(_cf_app_index "$SOURCE_NAME")
 if [[ "$_src_idx" == "null" ]]; then
-  log_error "Source repo '$SOURCE_NAME' not found in $CONFIG_FILE"
-  log_error "Available: $(_cf_repo_names_csv)"
+  log_error "Source app '$SOURCE_NAME' not found in $CONFIG_FILE"
+  log_error "Available: $(_cf_app_names_csv)"
   exit 1
 fi
-SOURCE_REPO=$(_cf_repo_path "$_src_idx")
-SOURCE_SUBS=$(_cf_repo_subs "$_src_idx")
-SOURCE_PATH_SUBS=$(_cf_repo_path_subs "$_src_idx")
+SOURCE_REPO=$(_cf_app_repo   "$_src_idx" "$SYNC_TYPE")
+if [[ -z "$SOURCE_REPO" ]]; then
+  log_error "Source app '$SOURCE_NAME' has no '$SYNC_TYPE' section in $CONFIG_FILE"
+  exit 1
+fi
+SOURCE_SUBS=$(_cf_app_subs   "$_src_idx" "$SYNC_TYPE")
+SOURCE_PATH_SUBS=$(_cf_app_path_subs "$_src_idx" "$SYNC_TYPE")
 unset _src_idx
 
-log_section "Source: $SOURCE_NAME  ($SOURCE_REPO)  [$FROM_REF → $TO_REF]"
-SOURCE_DIR="$WORK_DIR/source"
+log_section "Source: $SOURCE_NAME  ($SOURCE_REPO)  [$FROM_REF → $TO_REF]  type=$SYNC_TYPE  mode=$SYNC_MODE"
+SOURCE_DIR="$WORK_DIR/source-${SYNC_TYPE}"
 
 if $DRY_RUN; then
   log_info "[DRY RUN] Would clone $SOURCE_REPO and diff $FROM_REF..$TO_REF"
   CHANGED_FILES=$'M\texample/deployment.yaml\nA\tsecrets/new-secret.yaml\nD\texample/old.yaml'
 else
   clone_or_update "$SOURCE_REPO" "$SOURCE_DIR" "$SOURCE_BRANCH"
-  CHANGED_FILES=$(git -C "$SOURCE_DIR" diff --find-renames=80% --name-status "$FROM_REF" "$TO_REF" || true)
+  if [[ "$SYNC_MODE" == "diff" ]]; then
+    CHANGED_FILES=$(git -C "$SOURCE_DIR" diff --find-renames=80% --name-status "$FROM_REF" "$TO_REF" || true)
+  fi
 fi
 
-[[ -n "$CHANGED_FILES" ]] || { log_warn "No changes between $FROM_REF and $TO_REF"; exit 0; }
+if [[ "$SYNC_MODE" == "diff" ]]; then
+  [[ -n "${CHANGED_FILES:-}" ]] || { log_warn "No changes between $FROM_REF and $TO_REF"; exit 0; }
 
-log_info "Changed files:"
-while IFS=$'\t' read -r status f1 f2; do
-  op="${status:0:1}"
-  if [[ "$op" == "R" || "$op" == "C" ]] && [[ -n "$f2" ]]; then
-    printf '  [%s] %s  →  %s\n' "$status" "$f1" "$f2"
-  else
-    printf '  [%s] %s\n' "$status" "$f1"
-  fi
-done <<< "$CHANGED_FILES"
-
-CHANGED_FILES_MD=$(
-  while IFS=$'\t' read -r s f1 f2; do
-    printf '%s\n' "- \`[$s]\` \`${f2:-$f1}\`"
+  log_info "Changed files:"
+  while IFS=$'\t' read -r status f1 f2; do
+    op="${status:0:1}"
+    if [[ "$op" == "R" || "$op" == "C" ]] && [[ -n "$f2" ]]; then
+      printf '  [%s] %s  →  %s\n' "$status" "$f1" "$f2"
+    else
+      printf '  [%s] %s\n' "$status" "$f1"
+    fi
   done <<< "$CHANGED_FILES"
-)
+
+  CHANGED_FILES_MD=$(
+    while IFS=$'\t' read -r s f1 f2; do
+      printf '%s\n' "- \`[$s]\` \`${f2:-$f1}\`"
+    done <<< "$CHANGED_FILES"
+  )
+fi
+
+# ── copy mode function ────────────────────────────────────────────────────────
+sync_copy_mode() {
+  # Receives: TARGET_DIR, SED_SCRIPT, PATH_SED_SCRIPT, SOURCE_DIR, TO_REF
+  # all set as variables in the calling subshell
+
+  # Safety: list all source files at TO_REF
+  local src_files
+  src_files=$(git -C "$SOURCE_DIR" ls-tree -r --name-only "$TO_REF" 2>/dev/null || true)
+
+  if [[ -z "$src_files" ]]; then
+    log_error "copy mode: source has 0 files at $TO_REF — refusing to delete everything"
+    exit 1
+  fi
+
+  declare -A tgt_projected
+  local tmp
+  tmp=$(mktemp "$WORK_DIR/.copy_tmp_XXXXXX")
+
+  while IFS= read -r src_file; do
+    [[ -z "$src_file" ]] && continue
+
+    local tgt_file
+    tgt_file=$(_sub_path "$src_file")
+    tgt_projected["$tgt_file"]=1
+
+    # Extract source file content at TO_REF
+    git -C "$SOURCE_DIR" show "${TO_REF}:${src_file}" > "$tmp" 2>/dev/null || {
+      log_warn "copy mode: cannot read ${TO_REF}:${src_file} — skipping"
+      continue
+    }
+
+    apply_subs "$tmp" "$SED_SCRIPT"
+
+    if is_sealed_secret "$tmp"; then
+      strip_encrypted_data "$tmp"
+      SEALED_NOTES+=("- \`[COPY]\` \`$tgt_file\` — encryptedData blanked; re-seal for this cluster")
+    fi
+
+    # Preserve image lines from existing target file before overwriting
+    local saved_orig
+    saved_orig=$(mktemp "$WORK_DIR/.copy_orig_XXXXXX")
+    if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
+      cp "$TARGET_DIR/$tgt_file" "$saved_orig"
+    fi
+
+    mkdir -p "$(dirname "$TARGET_DIR/$tgt_file")"
+    cp "$tmp" "$TARGET_DIR/$tgt_file"
+
+    # Restore image lines from the saved original (if it existed)
+    if [[ -s "$saved_orig" ]]; then
+      restore_image_lines "$TARGET_DIR/$tgt_file" "$saved_orig"
+      if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
+        IMAGE_NOTES+=("- \`[COPY]\` \`$tgt_file\` — image tags preserved from target")
+      fi
+    elif has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
+      IMAGE_NOTES+=("- \`[COPY]\` \`$tgt_file\` — new file; image tags from source")
+    fi
+    rm -f "$saved_orig"
+
+    git -C "$TARGET_DIR" add "$tgt_file"
+    HAS_CHANGES=true
+
+  done <<< "$src_files"
+
+  rm -f "$tmp"
+
+  # Delete target files not in tgt_projected
+  while IFS= read -r -d '' f; do
+    local rel="${f#"$TARGET_DIR/"}"
+    if [[ -z "${tgt_projected[$rel]+x}" ]]; then
+      log_info "copy mode: deleting $rel (not in source at $TO_REF)"
+      git -C "$TARGET_DIR" rm -f "$rel"
+      HAS_CHANGES=true
+    fi
+  done < <(find "$TARGET_DIR" -not -path '*/.git/*' -type f -print0)
+}
 
 # ── Process each target repo ──────────────────────────────────────────────────
 PASS=(); FAIL=()
 _tgt_num=0
 
-for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
-  TARGET_NAME=$(_cf_repo_name "$_ti")
-  TARGET_REPO=$(_cf_repo_path "$_ti")
-  TARGET_SUBS=$(_cf_repo_subs      "$_ti")
-  TARGET_PATH_SUBS=$(_cf_repo_path_subs "$_ti")
+for ((_ti=0; _ti<APP_COUNT; _ti++)); do
+  TARGET_NAME=$(_cf_app_name "$_ti")
+  TARGET_REPO=$(_cf_app_repo "$_ti" "$SYNC_TYPE")
+  TARGET_SUBS=$(_cf_app_subs      "$_ti" "$SYNC_TYPE")
+  TARGET_PATH_SUBS=$(_cf_app_path_subs "$_ti" "$SYNC_TYPE")
+
+  # Skip apps that don't have the SYNC_TYPE section
+  [[ -z "$TARGET_REPO" ]] && continue
 
   is_target_included "$TARGET_NAME" || continue
   _tgt_num=$(( _tgt_num + 1 ))
@@ -879,8 +1073,16 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
     log_info "[DRY RUN] Branch             : $SYNC_BRANCH"
     log_info "[DRY RUN] Content subs       : ${SED_SCRIPT:-(none)}"
     log_info "[DRY RUN] Path subs          : ${PATH_SED_SCRIPT:-(none)}"
+    log_info "[DRY RUN] Mode               : $SYNC_MODE"
     PASS+=("$TARGET_NAME (dry-run)")
     continue
+  fi
+
+  # Warn and switch to diff if copy mode requested for app repos
+  _effective_mode="$SYNC_MODE"
+  if [[ "$SYNC_MODE" == "copy" && "$SYNC_TYPE" == "app" ]]; then
+    log_warn "copy mode is not supported for app repos — falling back to diff for $TARGET_NAME"
+    _effective_mode="diff"
   fi
 
   (
@@ -898,151 +1100,156 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
     IMAGE_NOTES=()
     CONFLICT_FILES=()
 
-    while IFS=$'\t' read -r status file1 file2; do
-      op="${status:0:1}"  # strip similarity score: R095 → R, C090 → C
+    if [[ "$_effective_mode" == "copy" ]]; then
+      sync_copy_mode
+    else
+      # diff mode
+      while IFS=$'\t' read -r status file1 file2; do
+        op="${status:0:1}"  # strip similarity score: R095 → R, C090 → C
 
-      case "$op" in
+        case "$op" in
 
-        # ── Deleted ───────────────────────────────────────────────────────────
-        D)
-          tgt_file=$(_sub_path "$file1")
-          log_info "D  src=$file1  →  tgt=$tgt_file"
-          if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
-            log_info "D $tgt_file"
-            git -C "$TARGET_DIR" rm -f "$tgt_file"
-            HAS_CHANGES=true
-          else
-            log_warn "D $tgt_file — not found in target"
-            log_warn "  checked: $TARGET_DIR/$tgt_file"
-            log_warn "  parent dir: $(ls "$(dirname "$TARGET_DIR/$tgt_file")" 2>/dev/null | tr '\n' '|' || echo '<dir missing>')"
-          fi
-          ;;
-
-        # ── Renamed ───────────────────────────────────────────────────────────
-        R)
-          tgt_file1=$(_sub_path "$file1")
-          tgt_file2=$(_sub_path "$file2")
-
-          if [[ "$(dirname "$tgt_file1")" != "$(dirname "$tgt_file2")" ]]; then
-            # Cross-directory renames are almost always false positives from
-            # git's similarity detector (e.g. two kustomization.yaml files
-            # matching each other across unrelated dirs).  Treat as D + A:
-            # remove the old path if target has it, copy the new file.
-            log_info "R $file1 → $file2 (cross-dir rename; treated as D+A)"
-            if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
-              git -C "$TARGET_DIR" rm -f "$tgt_file1"
+          # ── Deleted ───────────────────────────────────────────────────────────
+          D)
+            tgt_file=$(_sub_path "$file1")
+            log_info "D  src=$file1  →  tgt=$tgt_file"
+            if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
+              log_info "D $tgt_file"
+              git -C "$TARGET_DIR" rm -f "$tgt_file"
               HAS_CHANGES=true
             else
-              log_warn "R(D) $tgt_file1 — not found in target (already absent, or path mismatch)"
+              log_warn "D $tgt_file — not found in target"
+              log_warn "  checked: $TARGET_DIR/$tgt_file"
+              log_warn "  parent dir: $(ls "$(dirname "$TARGET_DIR/$tgt_file")" 2>/dev/null | tr '\n' '|' || echo '<dir missing>')"
             fi
-            if copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"; then
+            ;;
+
+          # ── Renamed ───────────────────────────────────────────────────────────
+          R)
+            tgt_file1=$(_sub_path "$file1")
+            tgt_file2=$(_sub_path "$file2")
+
+            if [[ "$(dirname "$tgt_file1")" != "$(dirname "$tgt_file2")" ]]; then
+              # Cross-directory renames are almost always false positives from
+              # git's similarity detector (e.g. two kustomization.yaml files
+              # matching each other across unrelated dirs).  Treat as D + A:
+              # remove the old path if target has it, copy the new file.
+              log_info "R $file1 → $file2 (cross-dir rename; treated as D+A)"
+              if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
+                git -C "$TARGET_DIR" rm -f "$tgt_file1"
+                HAS_CHANGES=true
+              else
+                log_warn "R(D) $tgt_file1 — not found in target (already absent, or path mismatch)"
+              fi
+              if copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"; then
+                git -C "$TARGET_DIR" add "$tgt_file2"
+                HAS_CHANGES=true
+              fi
+            else
+              # Same-directory rename — normal rename handling with image-line restore
+              orig=$(mktemp "$WORK_DIR/.orig_XXXXXX")
+              has_orig=false
+              if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
+                cp "$TARGET_DIR/$tgt_file1" "$orig"
+                has_orig=true
+                git -C "$TARGET_DIR" rm -f "$tgt_file1"
+              fi
+              mkdir -p "$(dirname "$TARGET_DIR/$tgt_file2")"
+
+              if is_sealed_secret "$SOURCE_DIR/$file2"; then
+                if $has_orig && is_sealed_secret "$orig"; then
+                  cp "$orig" "$TARGET_DIR/$tgt_file2"
+                  apply_subs "$TARGET_DIR/$tgt_file2" "$SED_SCRIPT"
+                  SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — target's encrypted values moved to new path")
+                else
+                  copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT" || true
+                  [[ -f "$TARGET_DIR/$tgt_file2" ]] && strip_encrypted_data "$TARGET_DIR/$tgt_file2"
+                  SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — encryptedData blanked; re-seal for this cluster")
+                fi
+              else
+                copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"
+                $has_orig && restore_image_lines "$TARGET_DIR/$tgt_file2" "$orig"
+                if has_image_lines "$TARGET_DIR/$tgt_file2"; then
+                  IMAGE_NOTES+=("- \`[RENAMED]\` \`$tgt_file2\` — image tags kept from \`$tgt_file1\`")
+                fi
+              fi
               git -C "$TARGET_DIR" add "$tgt_file2"
               HAS_CHANGES=true
+              rm -f "$orig"
             fi
-          else
-            # Same-directory rename — normal rename handling with image-line restore
-            orig=$(mktemp "$WORK_DIR/.orig_XXXXXX")
-            has_orig=false
-            if [[ -f "$TARGET_DIR/$tgt_file1" ]]; then
-              cp "$TARGET_DIR/$tgt_file1" "$orig"
-              has_orig=true
-              git -C "$TARGET_DIR" rm -f "$tgt_file1"
-            fi
-            mkdir -p "$(dirname "$TARGET_DIR/$tgt_file2")"
+            ;;
 
-            if is_sealed_secret "$SOURCE_DIR/$file2"; then
-              if $has_orig && is_sealed_secret "$orig"; then
-                cp "$orig" "$TARGET_DIR/$tgt_file2"
-                apply_subs "$TARGET_DIR/$tgt_file2" "$SED_SCRIPT"
-                SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — target's encrypted values moved to new path")
-              else
-                copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT" || true
-                [[ -f "$TARGET_DIR/$tgt_file2" ]] && strip_encrypted_data "$TARGET_DIR/$tgt_file2"
-                SEALED_NOTES+=("- \`[RENAMED]\` \`$tgt_file1\` → \`$tgt_file2\` — encryptedData blanked; re-seal for this cluster")
-              fi
+          # ── Modified ──────────────────────────────────────────────────────────
+          M)
+            tgt_file=$(_sub_path "$file1")
+            log_info "M  src=$file1  →  tgt=$tgt_file"
+            if is_sealed_secret "$SOURCE_DIR/$file1"; then
+              SEALED_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — **skipped** (cluster-specific encryption; re-seal manually if value changed)")
             else
-              copy_and_apply "$file2" "$tgt_file2" "$TARGET_DIR" "$SED_SCRIPT"
-              $has_orig && restore_image_lines "$TARGET_DIR/$tgt_file2" "$orig"
-              if has_image_lines "$TARGET_DIR/$tgt_file2"; then
-                IMAGE_NOTES+=("- \`[RENAMED]\` \`$tgt_file2\` — image tags kept from \`$tgt_file1\`")
-              fi
-            fi
-            git -C "$TARGET_DIR" add "$tgt_file2"
-            HAS_CHANGES=true
-            rm -f "$orig"
-          fi
-          ;;
-
-        # ── Modified ──────────────────────────────────────────────────────────
-        M)
-          tgt_file=$(_sub_path "$file1")
-          log_info "M  src=$file1  →  tgt=$tgt_file"
-          if is_sealed_secret "$SOURCE_DIR/$file1"; then
-            SEALED_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — **skipped** (cluster-specific encryption; re-seal manually if value changed)")
-          else
-            merge_rc=0
-            three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
-            [[ $merge_rc -eq 1 ]] && CONFLICT_FILES+=("$tgt_file")
-            if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
-              IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
-            fi
-            git -C "$TARGET_DIR" add "$tgt_file"
-            HAS_CHANGES=true
-          fi
-          ;;
-
-        # ── Added / Copied ────────────────────────────────────────────────────
-        A|C|*)
-          src_file="${file2:-$file1}"
-          tgt_file=$(_sub_path "$src_file")
-          log_info "A  src=$src_file  →  tgt=$tgt_file"
-
-          log_info "A  is_sealed_secret($src_file) → $(is_sealed_secret "$SOURCE_DIR/$src_file" && echo YES || echo no)"
-          if is_sealed_secret "$SOURCE_DIR/$src_file"; then
-            src_name=$(get_sealed_secret_name "$SOURCE_DIR/$src_file")
-            src_other=$(find_sealed_secret_by_name \
-              "$src_name" "$SOURCE_DIR" "$SOURCE_DIR/$src_file" || true)
-            mkdir -p "$(dirname "$TARGET_DIR/$tgt_file")"
-
-            if [[ -n "$src_other" ]]; then
-              # It's a copy of an existing sealed secret — find matching in target
-              if [[ -n "$SED_SCRIPT" ]]; then
-                tgt_name=$(printf '%s' "$src_name" | sed "$SED_SCRIPT")
-              else
-                tgt_name="$src_name"
-              fi
-              tgt_existing=$(find_sealed_secret_by_name "$tgt_name" "$TARGET_DIR" || true)
-              if [[ -n "$tgt_existing" ]]; then
-                cp "$tgt_existing" "$TARGET_DIR/$tgt_file"
-                apply_subs "$TARGET_DIR/$tgt_file" "$SED_SCRIPT"
-                SEALED_NOTES+=("- \`[COPIED]\` \`$tgt_file\` — target's own secret copied from \`${tgt_existing#"$TARGET_DIR/"}\` (encrypted values preserved)")
-              else
-                copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"
-                strip_encrypted_data "$TARGET_DIR/$tgt_file"
-                SEALED_NOTES+=("- \`[COPIED]\` \`$tgt_file\` — no matching secret found in target; encryptedData blanked, re-seal for this cluster")
-              fi
-            else
-              # Truly new sealed secret
-              copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"
-              strip_encrypted_data "$TARGET_DIR/$tgt_file"
-              SEALED_NOTES+=("- \`[ADDED]\` \`$tgt_file\` — new secret; encryptedData blanked, re-seal for this cluster")
-            fi
-            git -C "$TARGET_DIR" add "$tgt_file"
-            HAS_CHANGES=true
-
-          else
-            if copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"; then
-              if has_image_lines "$TARGET_DIR/$tgt_file"; then
-                IMAGE_NOTES+=("- \`[ADDED]\` \`$tgt_file\` — new file; image tags copied from source (review if needed)")
+              merge_rc=0
+              three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
+              [[ $merge_rc -eq 1 ]] && CONFLICT_FILES+=("$tgt_file")
+              if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
+                IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
               fi
               git -C "$TARGET_DIR" add "$tgt_file"
               HAS_CHANGES=true
             fi
-          fi
-          ;;
+            ;;
 
-      esac
-    done <<< "$CHANGED_FILES"
+          # ── Added / Copied ────────────────────────────────────────────────────
+          A|C|*)
+            src_file="${file2:-$file1}"
+            tgt_file=$(_sub_path "$src_file")
+            log_info "A  src=$src_file  →  tgt=$tgt_file"
+
+            log_info "A  is_sealed_secret($src_file) → $(is_sealed_secret "$SOURCE_DIR/$src_file" && echo YES || echo no)"
+            if is_sealed_secret "$SOURCE_DIR/$src_file"; then
+              src_name=$(get_sealed_secret_name "$SOURCE_DIR/$src_file")
+              src_other=$(find_sealed_secret_by_name \
+                "$src_name" "$SOURCE_DIR" "$SOURCE_DIR/$src_file" || true)
+              mkdir -p "$(dirname "$TARGET_DIR/$tgt_file")"
+
+              if [[ -n "$src_other" ]]; then
+                # It's a copy of an existing sealed secret — find matching in target
+                if [[ -n "$SED_SCRIPT" ]]; then
+                  tgt_name=$(printf '%s' "$src_name" | sed "$SED_SCRIPT")
+                else
+                  tgt_name="$src_name"
+                fi
+                tgt_existing=$(find_sealed_secret_by_name "$tgt_name" "$TARGET_DIR" || true)
+                if [[ -n "$tgt_existing" ]]; then
+                  cp "$tgt_existing" "$TARGET_DIR/$tgt_file"
+                  apply_subs "$TARGET_DIR/$tgt_file" "$SED_SCRIPT"
+                  SEALED_NOTES+=("- \`[COPIED]\` \`$tgt_file\` — target's own secret copied from \`${tgt_existing#"$TARGET_DIR/"}\` (encrypted values preserved)")
+                else
+                  copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"
+                  strip_encrypted_data "$TARGET_DIR/$tgt_file"
+                  SEALED_NOTES+=("- \`[COPIED]\` \`$tgt_file\` — no matching secret found in target; encryptedData blanked, re-seal for this cluster")
+                fi
+              else
+                # Truly new sealed secret
+                copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"
+                strip_encrypted_data "$TARGET_DIR/$tgt_file"
+                SEALED_NOTES+=("- \`[ADDED]\` \`$tgt_file\` — new secret; encryptedData blanked, re-seal for this cluster")
+              fi
+              git -C "$TARGET_DIR" add "$tgt_file"
+              HAS_CHANGES=true
+
+            else
+              if copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"; then
+                if has_image_lines "$TARGET_DIR/$tgt_file"; then
+                  IMAGE_NOTES+=("- \`[ADDED]\` \`$tgt_file\` — new file; image tags copied from source (review if needed)")
+                fi
+                git -C "$TARGET_DIR" add "$tgt_file"
+                HAS_CHANGES=true
+              fi
+            fi
+            ;;
+
+        esac
+      done <<< "$CHANGED_FILES"
+    fi
 
     if ! $HAS_CHANGES; then
       if [[ ${#SEALED_NOTES[@]} -gt 0 ]]; then
@@ -1059,8 +1266,8 @@ for ((_ti=0; _ti<REPO_COUNT; _ti++)); do
       "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")"
     git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH"
 
-    # Print conflict resolution hint — branch is already pushed; user resolves in their own clone
-    if [[ ${#CONFLICT_FILES[@]} -gt 0 ]]; then
+    # Print conflict resolution hint — only for diff mode
+    if [[ "$_effective_mode" == "diff" && ${#CONFLICT_FILES[@]} -gt 0 ]]; then
       log_warn "Conflicts in $TARGET_NAME — resolve in your local clone of $TARGET_REPO:"
       log_warn "  1. cd <your local clone>"
       log_warn "  2. git fetch origin && git checkout $SYNC_BRANCH"
@@ -1091,7 +1298,7 @@ $(printf '%s\n' "${IMAGE_NOTES[@]}")
 Image tags are environment-specific and were not copied from source."
 
     CONFLICT_SECTION=""
-    [[ ${#CONFLICT_FILES[@]} -gt 0 ]] && CONFLICT_SECTION="
+    [[ "$_effective_mode" == "diff" && ${#CONFLICT_FILES[@]} -gt 0 ]] && CONFLICT_SECTION="
 
 ### Merge conflicts — resolve before merging
 
@@ -1099,6 +1306,7 @@ $(for _cf in "${CONFLICT_FILES[@]}"; do printf '%s\n' "- \`$_cf\`"; done)
 
 These files contain \`<<<<<<<\` conflict markers. Edit them to resolve, then commit."
 
+    _changed_md="${CHANGED_FILES_MD:-}"
     PR_BODY="## Deploy Sync
 
 Automated sync from \`${SOURCE_REPO}\`
@@ -1111,7 +1319,7 @@ Automated sync from \`${SOURCE_REPO}\`
 | **Timestamp** | \`${TIMESTAMP}\` |
 
 ### Changed files
-${CHANGED_FILES_MD}${SEALED_SECTION}${IMAGE_SECTION}${CONFLICT_SECTION}
+${_changed_md}${SEALED_SECTION}${IMAGE_SECTION}${CONFLICT_SECTION}
 
 ---
 *Auto-generated by sync-deploy.sh — review before merging.*"

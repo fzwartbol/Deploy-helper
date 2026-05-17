@@ -887,7 +887,241 @@ EOF
 with_work "app-c-deploy" "" app_c_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-d  (testspace/app-d-deploy)  [spare target with deploy section]
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-d-deploy"
+
+app_d_initial() {
+  mkdir -p base
+
+  cat > base/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-d
+  namespace: ns-d
+spec:
+  selector:
+    matchLabels:
+      app: app-d
+  template:
+    metadata:
+      labels:
+        app: app-d
+    spec:
+      serviceAccountName: sa-d
+      containers:
+        - name: app-d
+          image: image-d:app-d-v1.0.0
+          env:
+            - name: APP_NAME
+              value: app-d
+EOF
+
+  cat > base/configmap.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-d-config
+  namespace: ns-d
+data:
+  DATABASE_URL: app-d-postgres.ns-d.svc.cluster.local
+  APP_SETTING: original-value
+EOF
+
+  cat > base/old-feature.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-d-old-config
+  namespace: ns-d
+data:
+  LEGACY_SETTING: old-value
+EOF
+}
+with_work "app-d-deploy" "" app_d_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-e  (testspace/app-e-deploy)  [copy mode scenario]
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-e-deploy"
+
+app_e_initial() {
+  mkdir -p base
+
+  cat > base/configmap.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-e-config
+  namespace: ns-e
+data:
+  DATABASE_URL: app-e-postgres.ns-e.svc.cluster.local
+  APP_SETTING: original-value
+  SERVICE_NAME: app-e-service
+EOF
+
+  cat > base/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-e
+  namespace: ns-e
+spec:
+  selector:
+    matchLabels:
+      app: app-e
+  template:
+    metadata:
+      labels:
+        app: app-e
+    spec:
+      serviceAccountName: sa-e
+      containers:
+        - name: app-e
+          image: image-e:app-e-LOCAL-TAG-2.5.0
+          env:
+            - name: APP_NAME
+              value: app-e
+EOF
+
+  # This file is ONLY in app-e target, not in source — must be deleted in copy mode
+  cat > base/extra-target-only.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-e-extra
+  namespace: ns-e
+data:
+  EXTRA: only-in-target
+EOF
+}
+with_work "app-e-deploy" "" app_e_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOURCE APP REPO  (testspace/source-app-repo)  [app-f scenario]
+# v1.0.0 → initial state (Maven project)
+# v1.1.0 → changes: M Service.java, M pom.xml, A NewHelper.java, D OldUtil.java
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-app-repo"
+
+source_app_v1() {
+  mkdir -p "source-app-core/src/main/java/com/source/app"
+  mkdir -p "source-app-core/src/main/resources"
+
+  cat > pom.xml <<'EOF'
+<project>
+  <groupId>com.source.app</groupId>
+  <artifactId>source-app</artifactId>
+  <version>1.0.0</version>
+</project>
+EOF
+
+  cat > "source-app-core/pom.xml" <<'EOF'
+<project>
+  <artifactId>source-app-core</artifactId>
+  <version>1.0.0</version>
+</project>
+EOF
+
+  cat > "source-app-core/src/main/java/com/source/app/Service.java" <<'EOF'
+package com.source.app;
+public class Service {
+  public String greet() { return "hello from source-app"; }
+}
+EOF
+
+  cat > "source-app-core/src/main/java/com/source/app/OldUtil.java" <<'EOF'
+package com.source.app;
+public class OldUtil {}
+EOF
+
+  cat > "source-app-core/src/main/resources/application.properties" <<'EOF'
+app.name=source-app
+app.version=1.0.0
+EOF
+}
+with_work "source-app-repo" "v1.0.0" source_app_v1
+
+source_app_v2() {
+  # M: Service.java — add version() method
+  cat > "source-app-core/src/main/java/com/source/app/Service.java" <<'EOF'
+package com.source.app;
+public class Service {
+  public String greet() { return "hello from source-app"; }
+  public String version() { return "1.1.0"; }
+}
+EOF
+
+  # M: pom.xml — add description
+  cat > pom.xml <<'EOF'
+<project>
+  <groupId>com.source.app</groupId>
+  <artifactId>source-app</artifactId>
+  <version>1.0.0</version>
+  <description>Updated description for source-app</description>
+</project>
+EOF
+
+  # A: NewHelper.java added
+  cat > "source-app-core/src/main/java/com/source/app/NewHelper.java" <<'EOF'
+package com.source.app;
+public class NewHelper { public static String help() { return "source-app helper"; } }
+EOF
+
+  # D: OldUtil.java deleted
+  rm -f "source-app-core/src/main/java/com/source/app/OldUtil.java"
+}
+with_work "source-app-repo" "v1.1.0" source_app_v2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET APP REPO: app-f  (testspace/app-f-app)
+# Mirrors source v1.0.0 structure but with substitutions applied
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-f-app"
+
+app_f_initial() {
+  mkdir -p "app-f-core/src/main/java/com/app/f"
+  mkdir -p "app-f-core/src/main/resources"
+
+  cat > pom.xml <<'EOF'
+<project>
+  <groupId>com.app.f</groupId>
+  <artifactId>app-f</artifactId>
+  <version>1.0.0</version>
+</project>
+EOF
+
+  cat > "app-f-core/pom.xml" <<'EOF'
+<project>
+  <artifactId>app-f-core</artifactId>
+  <version>1.0.0</version>
+</project>
+EOF
+
+  cat > "app-f-core/src/main/java/com/app/f/Service.java" <<'EOF'
+package com.app.f;
+public class Service {
+  public String greet() { return "hello from app-f"; }
+  public String localExtra() { return "only in app-f"; }
+}
+EOF
+
+  cat > "app-f-core/src/main/java/com/app/f/OldUtil.java" <<'EOF'
+package com.app.f;
+public class OldUtil {}
+EOF
+
+  cat > "app-f-core/src/main/resources/application.properties" <<'EOF'
+app.name=app-f
+app.version=1.0.0
+EOF
+}
+with_work "app-f-app" "" app_f_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generate test repos.json pointing to our local testspace/ repos
+# Uses the new grouped "apps" structure
 # ─────────────────────────────────────────────────────────────────────────────
 cat > "$T/repos.test.json" <<'EOF'
 {
@@ -896,77 +1130,150 @@ cat > "$T/repos.test.json" <<'EOF'
     "title_prefix": "chore(sync): "
   },
   "protected_configmap_keys": ["DATABASE_URL"],
-  "repos": [
+  "apps": [
     {
-      "name": "source-deploy",
-      "repo": "testspace/source-deploy-repo",
-      "substitutions": {
-        "service_name":    "source-service",
-        "app_name":        "source-app",
-        "paas_name":       "source-paas-project",
-        "namespace":       "source-namespace",
-        "environment":     "source-env",
-        "service_account": "source-sa",
-        "image_name":      "source-image",
-        "context_url":     "source-app.example.com",
-        "health_url":      "source-app.example.com/actuator/health"
+      "name": "source",
+      "deploy": {
+        "repo": "testspace/source-deploy-repo",
+        "substitutions": {
+          "service_name":    "source-service",
+          "app_name":        "source-app",
+          "paas_name":       "source-paas-project",
+          "namespace":       "source-namespace",
+          "environment":     "source-env",
+          "service_account": "source-sa",
+          "image_name":      "source-image",
+          "context_url":     "source-app.example.com",
+          "health_url":      "source-app.example.com/actuator/health"
+        },
+        "path_substitutions": {
+          "app_name": "source-app"
+        }
       },
-      "path_substitutions": {
-        "app_name": "source-app"
+      "app": {
+        "repo": "testspace/source-app-repo",
+        "substitutions": {
+          "app_name":      "source-app",
+          "java_package":  "com.source.app"
+        },
+        "path_substitutions": {
+          "source-app": "source-app",
+          "source/app": "source/app"
+        }
       }
     },
     {
       "name": "app-a",
-      "repo": "testspace/app-a-deploy",
-      "substitutions": {
-        "service_name":    "app-a-service",
-        "app_name":        "app-a",
-        "paas_name":       "app-a-paas-project",
-        "namespace":       "ns-a",
-        "environment":     "development",
-        "service_account": "sa-a",
-        "image_name":      "image-a",
-        "context_url":     "app-a.example.com",
-        "health_url":      "app-a.example.com/actuator/health"
-      },
-      "path_substitutions": {
-        "app_name": "app-a"
+      "deploy": {
+        "repo": "testspace/app-a-deploy",
+        "substitutions": {
+          "service_name":    "app-a-service",
+          "app_name":        "app-a",
+          "paas_name":       "app-a-paas-project",
+          "namespace":       "ns-a",
+          "environment":     "development",
+          "service_account": "sa-a",
+          "image_name":      "image-a",
+          "context_url":     "app-a.example.com",
+          "health_url":      "app-a.example.com/actuator/health"
+        },
+        "path_substitutions": {
+          "app_name": "app-a"
+        }
       }
     },
     {
       "name": "app-b",
-      "repo": "testspace/app-b-deploy",
-      "substitutions": {
-        "service_name":    "app-b-service",
-        "app_name":        "app-b",
-        "paas_name":       "app-b-paas-project",
-        "namespace":       "ns-b",
-        "environment":     "production",
-        "service_account": "sa-b",
-        "image_name":      "image-b",
-        "context_url":     "app-b.example.com",
-        "health_url":      "app-b.example.com/actuator/health"
-      },
-      "path_substitutions": {
-        "app_name": "app-b"
+      "deploy": {
+        "repo": "testspace/app-b-deploy",
+        "substitutions": {
+          "service_name":    "app-b-service",
+          "app_name":        "app-b",
+          "paas_name":       "app-b-paas-project",
+          "namespace":       "ns-b",
+          "environment":     "production",
+          "service_account": "sa-b",
+          "image_name":      "image-b",
+          "context_url":     "app-b.example.com",
+          "health_url":      "app-b.example.com/actuator/health"
+        },
+        "path_substitutions": {
+          "app_name": "app-b"
+        }
       }
     },
     {
       "name": "app-c",
-      "repo": "testspace/app-c-deploy",
-      "substitutions": {
-        "service_name":    "app-c-service",
-        "app_name":        "app-c",
-        "paas_name":       "app-c-paas-project",
-        "namespace":       "ns-c",
-        "environment":     "staging",
-        "service_account": "sa-c",
-        "image_name":      "image-c",
-        "context_url":     "app-c.example.com",
-        "health_url":      "app-c.example.com/actuator/health"
-      },
-      "path_substitutions": {
-        "app_name": "app-c"
+      "deploy": {
+        "repo": "testspace/app-c-deploy",
+        "substitutions": {
+          "service_name":    "app-c-service",
+          "app_name":        "app-c",
+          "paas_name":       "app-c-paas-project",
+          "namespace":       "ns-c",
+          "environment":     "staging",
+          "service_account": "sa-c",
+          "image_name":      "image-c",
+          "context_url":     "app-c.example.com",
+          "health_url":      "app-c.example.com/actuator/health"
+        },
+        "path_substitutions": {
+          "app_name": "app-c"
+        }
+      }
+    },
+    {
+      "name": "app-d",
+      "deploy": {
+        "repo": "testspace/app-d-deploy",
+        "substitutions": {
+          "service_name":    "app-d-service",
+          "app_name":        "app-d",
+          "paas_name":       "app-d-paas-project",
+          "namespace":       "ns-d",
+          "environment":     "staging",
+          "service_account": "sa-d",
+          "image_name":      "image-d",
+          "context_url":     "app-d.example.com",
+          "health_url":      "app-d.example.com/actuator/health"
+        },
+        "path_substitutions": {
+          "app_name": "app-d"
+        }
+      }
+    },
+    {
+      "name": "app-e",
+      "deploy": {
+        "repo": "testspace/app-e-deploy",
+        "substitutions": {
+          "service_name":    "app-e-service",
+          "app_name":        "app-e",
+          "paas_name":       "app-e-paas-project",
+          "namespace":       "ns-e",
+          "environment":     "staging",
+          "service_account": "sa-e",
+          "image_name":      "image-e",
+          "context_url":     "app-e.example.com",
+          "health_url":      "app-e.example.com/actuator/health"
+        },
+        "path_substitutions": {
+          "app_name": "app-e"
+        }
+      }
+    },
+    {
+      "name": "app-f",
+      "app": {
+        "repo": "testspace/app-f-app",
+        "substitutions": {
+          "app_name":      "app-f",
+          "java_package":  "com.app.f"
+        },
+        "path_substitutions": {
+          "source-app": "app-f",
+          "source/app": "app/f"
+        }
       }
     }
   ]
@@ -975,13 +1282,15 @@ EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Run the sync  (non-interactive: --from / --to / --targets all explicit)
+# Using --source source --type deploy (replaces old --source source-deploy)
 # ─────────────────────────────────────────────────────────────────────────────
-echo -e "\n${BOLD}Running sync-deploy.sh  (v1.0.0 → v1.1.0, all targets)${NC}"
+echo -e "\n${BOLD}Running sync-deploy.sh  (v1.0.0 → v1.1.0, deploy type, all targets)${NC}"
 rm -rf "$WORK_DIR"
 
 bash "$SYNC_SCRIPT" \
   --config "$T/repos.test.json" \
-  --source source-deploy \
+  --source source \
+  --type   deploy \
   --from   v1.0.0 \
   --to     v1.1.0
 
@@ -1073,13 +1382,13 @@ exists  "$B/overlays/dev/app-b-internal-svc.yaml"       "filename with app-b sub
 has     "$B/overlays/dev/app-b-internal-svc.yaml"  "name: app-b-internal"  "content substituted in app-b"
 has     "$B/overlays/dev/app-b-internal-svc.yaml"  "namespace: ns-b"       "namespace correct in app-b"
 
-# ── Branch name contains FROM/TO refs ────────────────────────────────────────
-section "Branch name contains FROM and TO refs"
+# ── Branch name contains FROM/TO refs and type+mode ──────────────────────────
+section "Branch name contains type, mode, FROM and TO refs"
 _branch=$(git -C "$WORK_DIR/app-a" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-if [[ "$_branch" == "sync/deploy-from-v1.0.0-to-v1.1.0" ]]; then
-  ok "branch is sync/deploy-from-v1.0.0-to-v1.1.0"
+if [[ "$_branch" == "sync/deploy-diff-from-v1.0.0-to-v1.1.0" ]]; then
+  ok "branch is sync/deploy-diff-from-v1.0.0-to-v1.1.0"
 else
-  fail "expected sync/deploy-from-v1.0.0-to-v1.1.0, got $_branch"
+  fail "expected sync/deploy-diff-from-v1.0.0-to-v1.1.0, got $_branch"
 fi
 unset _branch
 
@@ -1207,6 +1516,112 @@ has     "$C/services/environment/vs-tst/default/kustomization.yaml"     "app-c-v
 has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "source-app"                       "app-c: no source-app in vs-tst/default"
 has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"         "app-c: vs-tst/default has no teamscope content"
 has_not "$C/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-ont-default"            "app-c: vs-tst/default has no vs-ont content"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO: app-e copy mode
+# Run a second sync invocation with --mode copy
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (copy mode: source → app-e, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source \
+  --type    deploy \
+  --mode    copy \
+  --targets app-e \
+  --from    v1.0.0 \
+  --to      v1.1.0
+
+E="$WORK_DIR/app-e"
+
+section "app-e  copy mode — files present"
+exists  "$E/base/configmap.yaml"    "base/configmap.yaml exists (from source)"
+exists  "$E/base/deployment.yaml"   "base/deployment.yaml exists (from source)"
+exists  "$E/base/service.yaml"      "base/service.yaml exists (from source, not in diff but in tree)"
+
+section "app-e  copy mode — extra-target-only.yaml deleted"
+absent  "$E/base/extra-target-only.yaml"  "base/extra-target-only.yaml absent (not in source)"
+
+section "app-e  copy mode — old-feature.yaml absent"
+absent  "$E/base/old-feature.yaml"  "base/old-feature.yaml absent (not in source at v1.1.0)"
+
+section "app-e  copy mode — no conflict markers"
+has_not "$E/base/configmap.yaml"    "<<<<<<<"  "no conflict markers in configmap"
+has_not "$E/base/deployment.yaml"   "<<<<<<<"  "no conflict markers in deployment"
+
+section "app-e  copy mode — substitutions applied"
+has     "$E/base/configmap.yaml"    "app-e"              "app-e name in configmap"
+has_not "$E/base/configmap.yaml"    "source-app"         "source-app not in configmap"
+has     "$E/base/configmap.yaml"    "SERVICE_NAME: app-e-service"  "service name substituted"
+
+section "app-e  copy mode — image tag preserved from target"
+has     "$E/base/deployment.yaml"   "image-e:app-e-LOCAL-TAG-2.5.0"  "local image tag preserved in copy mode"
+has_not "$E/base/deployment.yaml"   "image-e:v1.0.0"                 "source image tag not used"
+has_not "$E/base/deployment.yaml"   "source-image"                   "source image name not present"
+
+section "app-e  copy mode — branch name correct"
+_branch_e=$(git -C "$E" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+if [[ "$_branch_e" == "sync/deploy-copy-from-v1.0.0-to-v1.1.0" ]]; then
+  ok "branch is sync/deploy-copy-from-v1.0.0-to-v1.1.0"
+else
+  fail "expected sync/deploy-copy-from-v1.0.0-to-v1.1.0, got $_branch_e"
+fi
+unset _branch_e
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO: app-f Maven app repo, diff mode
+# Run a third sync invocation with --type app
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (app type diff mode: source → app-f, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source \
+  --type    app \
+  --targets app-f \
+  --from    v1.0.0 \
+  --to      v1.1.0
+
+F="$WORK_DIR/app-f"
+
+section "app-f  app repo diff — Service.java updated"
+exists  "$F/app-f-core/src/main/java/com/app/f/Service.java"  "Service.java exists at app-f path"
+has     "$F/app-f-core/src/main/java/com/app/f/Service.java"  "version()"         "version() method added from source diff"
+has     "$F/app-f-core/src/main/java/com/app/f/Service.java"  "localExtra()"      "localExtra() preserved from target"
+has     "$F/app-f-core/src/main/java/com/app/f/Service.java"  "com.app.f"         "package substituted to com.app.f"
+has_not "$F/app-f-core/src/main/java/com/app/f/Service.java"  "com.source.app"    "source package not present"
+
+section "app-f  app repo diff — NewHelper.java added with path substitution"
+exists  "$F/app-f-core/src/main/java/com/app/f/NewHelper.java"    "NewHelper.java at app-f path"
+has     "$F/app-f-core/src/main/java/com/app/f/NewHelper.java"    "com.app.f"       "package substituted in NewHelper"
+has_not "$F/app-f-core/src/main/java/com/app/f/NewHelper.java"    "com.source.app"  "source package not in NewHelper"
+absent  "$F/source-app-core/src/main/java/com/source/app/NewHelper.java"  "NewHelper not at source path"
+
+section "app-f  app repo diff — OldUtil.java deleted"
+absent  "$F/app-f-core/src/main/java/com/app/f/OldUtil.java"  "OldUtil.java deleted"
+
+section "app-f  app repo diff — pom.xml updated"
+has     "$F/pom.xml"  "Updated description"   "description added from source"
+has     "$F/pom.xml"  "app-f"                 "app-f in pom.xml"
+has_not "$F/pom.xml"  "source-app"            "source-app not in pom.xml"
+
+section "app-f  app repo diff — source-app-core path absent"
+# The path substitution maps source-app-core → app-f-core
+# So source-app-core/ directory should not exist in app-f
+if [[ -d "$F/source-app-core" ]]; then
+  fail "source-app-core/ directory should not exist in app-f (path not substituted)"
+else
+  ok "source-app-core/ absent from app-f clone (paths correctly substituted)"
+fi
+
+section "app-f  app repo diff — branch name correct"
+_branch_f=$(git -C "$F" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+if [[ "$_branch_f" == "sync/app-diff-from-v1.0.0-to-v1.1.0" ]]; then
+  ok "branch is sync/app-diff-from-v1.0.0-to-v1.1.0"
+else
+  fail "expected sync/app-diff-from-v1.0.0-to-v1.1.0, got $_branch_f"
+fi
+unset _branch_f
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
