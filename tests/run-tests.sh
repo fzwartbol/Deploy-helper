@@ -66,11 +66,12 @@ export PATH="$T/bin:$PATH"
 
 # ── isolated git config (no signing, redirect bitbucket → local bare repos) ──
 export GIT_CONFIG_GLOBAL="$T/gitconfig"
-git config --global user.email    "test@sync-deploy.test"
-git config --global user.name     "Sync-Deploy Test"
-git config --global commit.gpgsign false
-git config --global tag.gpgsign    false
-git config --global init.defaultBranch main
+git config --global user.email              "test@sync-deploy.test"
+git config --global user.name              "Sync-Deploy Test"
+git config --global commit.gpgsign         false
+git config --global tag.gpgsign            false
+git config --global init.defaultBranch     main
+git config --global advice.addIgnoredFile  false
 
 export BITBUCKET_USER=testuser
 export BITBUCKET_TOKEN=testtoken

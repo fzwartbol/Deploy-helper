@@ -366,6 +366,7 @@ clone_or_update() {
     "$(git config --global user.email 2>/dev/null || printf 'sync-deploy@automation')"
   git -C "$dir" config user.name \
     "$(git config --global user.name  2>/dev/null || printf 'Deploy Sync Bot')"
+  git -C "$dir" config advice.addIgnoredFile false
 }
 
 # Fetch tag names from a remote without cloning (for interactive menus)
@@ -705,6 +706,8 @@ PROTECTED_CM_KEYS=$(_cf_protected_keys)
 
 [[ "$APP_COUNT" -gt 0 ]] || { log_error "No apps found in $CONFIG_FILE"; exit 1; }
 
+# Clean work dir at the start of every run for a reproducible state
+rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 
 # ── Interactive step 0: select sync type ─────────────────────────────────────
@@ -794,18 +797,40 @@ if [[ -z "$SOURCE_NAME" ]]; then
   fi
 fi
 
+# ── Early source clone for date-sorted branch/tag listing ─────────────────────
+# Done right after SOURCE_NAME is known so steps 2 & 3 can use local git.
+SOURCE_DIR="$WORK_DIR/source-${SYNC_TYPE}"
+if $_INTERACTIVE && [[ -n "$SOURCE_NAME" ]] && ! $DRY_RUN; then
+  _early_idx=$(_cf_app_index "$SOURCE_NAME")
+  _early_repo=$(_cf_app_repo "$_early_idx" "$SYNC_TYPE")
+  if [[ -n "$_early_repo" ]]; then
+    log_info "Fetching source repo for branch/tag listing..."
+    clone_or_update "$_early_repo" "$SOURCE_DIR" "$BASE_BRANCH" >/dev/null 2>&1 || true
+  fi
+  unset _early_idx _early_repo
+fi
+
 # ── Interactive step 2: source branch ────────────────────────────────────────
 if [[ -z "$SOURCE_BRANCH" ]] && $_INTERACTIVE; then
-  _src_repo_for_br=""
-  for ((_i=0; _i<_ACOUNT; _i++)); do
-    [[ "${_ANAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_repo_for_br="${_AREPOS[$_i]}"; break; }
-  done
-
   echo "--- Step 2: Select source BRANCH ---"
-  log_info "Fetching branches from ${_src_repo_for_br} ..."
   _branches=()
-  while IFS= read -r _b; do [[ -n "$_b" ]] && _branches+=("$_b"); done \
-    < <(_fetch_branches "$_src_repo_for_br" 2>/dev/null || true)
+  if [[ -d "$SOURCE_DIR/.git" ]]; then
+    while IFS= read -r _b; do
+      _b="${_b#"${_b%%[![:space:]]*}"}"   # ltrim
+      _b="${_b#*/}"                       # strip remote prefix (origin/)
+      [[ -n "$_b" ]] && _branches+=("$_b")
+    done < <(git -C "$SOURCE_DIR" branch -r --sort=-committerdate 2>/dev/null \
+               | grep -v 'HEAD' || true)
+  else
+    _src_repo_for_br=""
+    for ((_i=0; _i<_ACOUNT; _i++)); do
+      [[ "${_ANAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_repo_for_br="${_AREPOS[$_i]}"; break; }
+    done
+    log_info "Fetching branches from ${_src_repo_for_br} ..."
+    while IFS= read -r _b; do [[ -n "$_b" ]] && _branches+=("$_b"); done \
+      < <(_fetch_branches "$_src_repo_for_br" 2>/dev/null || true)
+    unset _src_repo_for_br
+  fi
 
   if [[ ${#_branches[@]} -eq 0 ]]; then
     SOURCE_BRANCH="$BASE_BRANCH"
@@ -813,60 +838,93 @@ if [[ -z "$SOURCE_BRANCH" ]] && $_INTERACTIVE; then
     echo ""
   else
     _nb=${#_branches[@]}
-    _show_br=$(( _nb < 16 ? _nb : 16 ))
-    echo ""
-    for ((_j=0; _j<_show_br; _j++)); do
-      printf '  %d) %s\n' "$((_j+1))" "${_branches[$_j]}"
+    _pg=0; _pgsz=20
+    while true; do
+      _pgs=$(( _pg * _pgsz )); _pge=$(( _pgs + _pgsz ))
+      [[ $_pge -gt $_nb ]] && _pge=$_nb
+      echo ""
+      for ((_j=_pgs; _j<_pge; _j++)); do
+        printf '  %d) %s\n' "$((_j+1))" "${_branches[$_j]}"
+      done
+      if [[ $_nb -gt $_pge ]]; then
+        printf '  (showing %d–%d of %d — enter n for next page)\n' \
+          "$((_pgs+1))" "$_pge" "$_nb"
+        printf '\nEnter number [1-%d, ENTER=1, n=next]: ' "$_nb"
+      else
+        printf '\nEnter number [1-%d, ENTER=1]: ' "$_nb"
+      fi
+      read -r _pick 2>/dev/null || _pick=""
+      [[ -z "$_pick" ]] && _pick=1
+      if [[ ("$_pick" == "n" || "$_pick" == "N") && $_nb -gt $_pge ]]; then
+        _pg=$(( _pg + 1 )); continue
+      fi
+      { [[ "$_pick" =~ ^[0-9]+$ ]] && ((_pick >= 1 && _pick <= _nb)); } || _pick=1
+      SOURCE_BRANCH="${_branches[$((_pick-1))]}"
+      echo "-> $SOURCE_BRANCH"
+      echo ""
+      break
     done
-    [[ $_nb -gt $_show_br ]] && printf '  ... (%d more)\n' "$((_nb-_show_br))"
-    printf '\nEnter number [1-%d, ENTER=1]: ' "$_show_br"
-    read -r _pick 2>/dev/null || _pick=""
-    [[ -z "$_pick" ]] && _pick=1
-    { [[ "$_pick" =~ ^[0-9]+$ ]] && ((_pick >= 1 && _pick <= _show_br)); } || _pick=1
-    SOURCE_BRANCH="${_branches[$((_pick-1))]}"
-    echo "-> $SOURCE_BRANCH"
-    echo ""
+    unset _nb _pg _pgsz _pgs _pge _j _pick
   fi
-  unset _src_repo_for_br _branches _nb _show_br _b _pick _j
+  unset _branches _b
 fi
 [[ -z "$SOURCE_BRANCH" ]] && SOURCE_BRANCH="$BASE_BRANCH"
 
 # ── Interactive step 3: FROM and TO refs ─────────────────────────────────────
 if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
   if $_INTERACTIVE; then
-    _src_repo=""
-    for ((_i=0; _i<_ACOUNT; _i++)); do
-      [[ "${_ANAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_repo="${_AREPOS[$_i]}"; break; }
-    done
-
-    log_info "Fetching tags from ${_src_repo} ..."
+    # Prefer date-sorted tags from local clone; fall back to remote ls
     _tags=()
-    while IFS= read -r _t; do [[ -n "$_t" ]] && _tags+=("$_t"); done \
-      < <(_fetch_tags "$_src_repo" 2>/dev/null || true)
+    if [[ -d "$SOURCE_DIR/.git" ]]; then
+      while IFS= read -r _t; do [[ -n "$_t" ]] && _tags+=("$_t"); done \
+        < <(git -C "$SOURCE_DIR" tag --sort=-creatordate 2>/dev/null || true)
+    else
+      _src_repo=""
+      for ((_i=0; _i<_ACOUNT; _i++)); do
+        [[ "${_ANAMES[$_i]}" == "$SOURCE_NAME" ]] && { _src_repo="${_AREPOS[$_i]}"; break; }
+      done
+      log_info "Fetching tags from ${_src_repo} ..."
+      while IFS= read -r _t; do [[ -n "$_t" ]] && _tags+=("$_t"); done \
+        < <(_fetch_tags "$_src_repo" 2>/dev/null || true)
+      unset _src_repo
+    fi
 
-    # _pick_ref VARNAME TITLE DEFAULT_LABEL DEFAULT_VALUE [tags…]
+    # Scrollable paginated tag/ref picker.
+    # Usage: _pick_ref VARNAME TITLE DEFAULT_LABEL DEFAULT_VALUE [items…]
     _pick_ref() {
       local _rv="$1" _title="$2" _dlabel="$3" _dval="$4"; shift 4
       local -a _labels=("$_dlabel") _values=("$_dval")
       local _x; for _x in "$@"; do _labels+=("$_x"); _values+=("$_x"); done
       local _n=${#_labels[@]}
-      local _show=$(( _n < 16 ? _n : 16 ))
+      local _pg=0 _pgsz=20
 
-      echo "--- $_title ---"
-      echo ""
-      local _j
-      for ((_j=0; _j<_show; _j++)); do
-        printf '  %d) %s\n' "$((_j+1))" "${_labels[$_j]}"
+      while true; do
+        local _pgs=$(( _pg * _pgsz )) _pge=$(( _pg * _pgsz + _pgsz ))
+        [[ $_pge -gt $_n ]] && _pge=$_n
+        echo "--- $_title ---"
+        echo ""
+        local _j
+        for ((_j=_pgs; _j<_pge; _j++)); do
+          printf '  %d) %s\n' "$((_j+1))" "${_labels[$_j]}"
+        done
+        if [[ $_n -gt $_pge ]]; then
+          printf '  (showing %d–%d of %d — enter n for next page)\n' \
+            "$((_pgs+1))" "$_pge" "$((_n-1))"
+          printf '\nEnter number [1-%d, ENTER=1, n=next]: ' "$_n"
+        else
+          printf '\nEnter number [1-%d, ENTER=1]: ' "$_n"
+        fi
+        local _r; read -r _r 2>/dev/null || _r=""
+        [[ -z "$_r" ]] && _r=1
+        if [[ ("$_r" == "n" || "$_r" == "N") && $_n -gt $_pge ]]; then
+          _pg=$(( _pg + 1 )); continue
+        fi
+        { [[ "$_r" =~ ^[0-9]+$ ]] && ((_r>=1 && _r<=_n)); } || _r=1
+        printf -v "$_rv" '%s' "${_values[$((_r-1))]}"
+        echo "-> ${_labels[$((_r-1))]}"
+        echo ""
+        return
       done
-      [[ $_n -gt $_show ]] && printf '  ... (%d more tags not listed)\n' "$((_n-_show))"
-      printf '\nEnter number [1-%d, ENTER=1]: ' "$_show"
-
-      local _r; read -r _r 2>/dev/null || _r=""
-      [[ -z "$_r" ]] && _r=1
-      { [[ "$_r" =~ ^[0-9]+$ ]] && ((_r>=1 && _r<=_show)); } || _r=1
-      printf -v "$_rv" '%s' "${_values[$((_r-1))]}"
-      echo "-> ${_labels[$((_r-1))]}"
-      echo ""
     }
 
     printf '\n'
@@ -878,7 +936,7 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
       "Step 3b: TO ref (end of diff — newer tag/commit)" \
       "HEAD — latest commit (default)" "HEAD" \
       "${_tags[@]+"${_tags[@]}"}"
-    unset _t _tags _src_repo
+    unset _t _tags
   fi
 fi
 
@@ -954,8 +1012,8 @@ SOURCE_SUBS=$(_cf_app_subs   "$_src_idx" "$SYNC_TYPE")
 SOURCE_PATH_SUBS=$(_cf_app_path_subs "$_src_idx" "$SYNC_TYPE")
 unset _src_idx
 
-log_section "Source: $SOURCE_NAME  ($SOURCE_REPO)  [$FROM_REF → $TO_REF]  type=$SYNC_TYPE  mode=$SYNC_MODE"
 SOURCE_DIR="$WORK_DIR/source-${SYNC_TYPE}"
+log_section "Source: $SOURCE_NAME  ($SOURCE_REPO)  [$FROM_REF → $TO_REF]  type=$SYNC_TYPE  mode=$SYNC_MODE"
 
 if $DRY_RUN; then
   log_info "[DRY RUN] Would clone $SOURCE_REPO and diff $FROM_REF..$TO_REF"
