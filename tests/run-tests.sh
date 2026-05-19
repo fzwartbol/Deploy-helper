@@ -1205,20 +1205,14 @@ cat > "$T/repos.test.json" <<'EOF'
           "image_name":      "source-image",
           "context_url":     "source-app.example.com",
           "health_url":      "source-app.example.com/actuator/health"
-        },
-        "path_substitutions": {
-          "app_name": "source-app"
         }
       },
       "app": {
         "repo": "testspace/source-app-repo",
         "substitutions": {
-          "app_name":      "source-app",
-          "java_package":  "com.source.app"
-        },
-        "path_substitutions": {
-          "source-app": "source-app",
-          "source/app": "source/app"
+          "app_name":     "source-app",
+          "java_package": "com.source.app",
+          "java_path":    "com/source/app"
         }
       }
     },
@@ -1236,9 +1230,6 @@ cat > "$T/repos.test.json" <<'EOF'
           "image_name":      "image-a",
           "context_url":     "app-a.example.com",
           "health_url":      "app-a.example.com/actuator/health"
-        },
-        "path_substitutions": {
-          "app_name": "app-a"
         }
       }
     },
@@ -1256,9 +1247,6 @@ cat > "$T/repos.test.json" <<'EOF'
           "image_name":      "image-b",
           "context_url":     "app-b.example.com",
           "health_url":      "app-b.example.com/actuator/health"
-        },
-        "path_substitutions": {
-          "app_name": "app-b"
         }
       }
     },
@@ -1276,9 +1264,6 @@ cat > "$T/repos.test.json" <<'EOF'
           "image_name":      "image-c",
           "context_url":     "app-c.example.com",
           "health_url":      "app-c.example.com/actuator/health"
-        },
-        "path_substitutions": {
-          "app_name": "app-c"
         }
       }
     },
@@ -1296,9 +1281,6 @@ cat > "$T/repos.test.json" <<'EOF'
           "image_name":      "image-d",
           "context_url":     "app-d.example.com",
           "health_url":      "app-d.example.com/actuator/health"
-        },
-        "path_substitutions": {
-          "app_name": "app-d"
         }
       }
     },
@@ -1316,9 +1298,6 @@ cat > "$T/repos.test.json" <<'EOF'
           "image_name":      "image-e",
           "context_url":     "app-e.example.com",
           "health_url":      "app-e.example.com/actuator/health"
-        },
-        "path_substitutions": {
-          "app_name": "app-e"
         }
       }
     },
@@ -1342,12 +1321,9 @@ cat > "$T/repos.test.json" <<'EOF'
       "app": {
         "repo": "testspace/app-f-app",
         "substitutions": {
-          "app_name":      "app-f",
-          "java_package":  "com.app.f"
-        },
-        "path_substitutions": {
-          "source-app": "app-f",
-          "source/app": "app/f"
+          "app_name":     "app-f",
+          "java_package": "com.app.f",
+          "java_path":    "com/app/f"
         }
       }
     }

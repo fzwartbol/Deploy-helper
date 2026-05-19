@@ -210,20 +210,6 @@ _cf_app_subs() {
   ' "$CONFIG_FILE"
 }
 
-# KEY<TAB>VALUE path_substitutions lines (empty when absent)
-_cf_app_path_subs() {
-  local idx="$1" type="$2"
-  awk -F'"' -v idx="$idx" -v type="$type" '
-    { pd=d; tmp=$0; d+=gsub(/{/,"",tmp); tmp=$0; d-=gsub(/}/,"",tmp) }
-    /"apps"[[:space:]]*:/ && d==1 { in_apps=1 }
-    in_apps && pd==1 && d==2 { entry++; in_type=0; in_subs=0 }
-    in_apps && entry==idx+1 && pd==2 && $2==type { in_type=1 }
-    in_type && pd==3 && $2=="path_substitutions" { in_subs=1 }
-    in_subs && d<4 && pd>=4 { in_subs=0 }
-    in_subs && pd==4 && $2!="" && NF>=4 && $3~/^:/ { print $2 "\t" $4 }
-  ' "$CONFIG_FILE"
-}
-
 # Newline-separated list of app names that have the given type section
 # type="" means all apps
 _cf_app_names_csv() {
@@ -429,21 +415,6 @@ has_image_lines() {
 
 # ── name-substitution helpers ─────────────────────────────────────────────────
 
-# Derive a path substitution sed script from app_name content substitutions.
-# Used as fallback when no explicit path_substitutions are configured.
-# Returns empty string when auto-derive is not possible.
-derive_path_sed_script() {
-  local src_subs="$1" tgt_subs="$2"
-  local src_app tgt_app src_esc tgt_esc
-  src_app=$(printf '%s\n' "$src_subs" | awk -F'\t' '$1=="app_name"{print $2; exit}')
-  tgt_app=$(printf '%s\n' "$tgt_subs" | awk -F'\t' '$1=="app_name"{print $2; exit}')
-  if [[ -n "$src_app" && -n "$tgt_app" && "$src_app" != "$tgt_app" ]]; then
-    src_esc=$(printf '%s' "$src_app" | sed 's/[[\.*^$()+?{|/]/\\&/g')
-    tgt_esc=$(printf '%s' "$tgt_app" | sed 's/[&|\\]/\\&/g')
-    printf 's|%s|%s|g' "$src_esc" "$tgt_esc"
-  fi
-}
-
 # Build a sed substitution script from source → target subs.
 # Sorted longest-source-value first to prevent partial-string clobbering.
 # Both arguments are KEY<TAB>VALUE lines (from _cf_app_subs).
@@ -493,14 +464,14 @@ apply_subs() {
   sed -i.bak "$sed_script" "$file" && rm -f "$file.bak"
 }
 
-# Apply path substitution script to the full path string.
-# Uses PATH_SED_SCRIPT (built from path_substitutions), NOT the content
-# SED_SCRIPT — so content substitutions never accidentally rename directories.
+# Apply substitutions to a full path string (filename + directories).
+# Uses the same SED_SCRIPT as file content so one set of substitution rules
+# covers everything: file content, filenames, directory names, module names.
 _sub_path() {
-  if [[ -z "${PATH_SED_SCRIPT:-}" ]]; then
+  if [[ -z "${SED_SCRIPT:-}" ]]; then
     printf '%s' "$1"
   else
-    printf '%s' "$1" | sed "$PATH_SED_SCRIPT"
+    printf '%s' "$1" | sed "$SED_SCRIPT"
   fi
 }
 
@@ -1008,8 +979,7 @@ if [[ -z "$SOURCE_REPO" ]]; then
   log_error "Source app '$SOURCE_NAME' has no '$SYNC_TYPE' section in $CONFIG_FILE"
   exit 1
 fi
-SOURCE_SUBS=$(_cf_app_subs   "$_src_idx" "$SYNC_TYPE")
-SOURCE_PATH_SUBS=$(_cf_app_path_subs "$_src_idx" "$SYNC_TYPE")
+SOURCE_SUBS=$(_cf_app_subs "$_src_idx" "$SYNC_TYPE")
 unset _src_idx
 
 SOURCE_DIR="$WORK_DIR/source-${SYNC_TYPE}"
@@ -1047,7 +1017,7 @@ fi
 
 # ── copy mode function ────────────────────────────────────────────────────────
 sync_copy_mode() {
-  # Receives: TARGET_DIR, SED_SCRIPT, PATH_SED_SCRIPT, SOURCE_DIR, TO_REF
+  # Receives: TARGET_DIR, SED_SCRIPT, SOURCE_DIR, TO_REF
   # all set as variables in the calling subshell
 
   # Safety: list all source files at TO_REF
@@ -1129,8 +1099,7 @@ _tgt_num=0
 for ((_ti=0; _ti<APP_COUNT; _ti++)); do
   TARGET_NAME=$(_cf_app_name "$_ti")
   TARGET_REPO=$(_cf_app_repo "$_ti" "$SYNC_TYPE")
-  TARGET_SUBS=$(_cf_app_subs      "$_ti" "$SYNC_TYPE")
-  TARGET_PATH_SUBS=$(_cf_app_path_subs "$_ti" "$SYNC_TYPE")
+  TARGET_SUBS=$(_cf_app_subs "$_ti" "$SYNC_TYPE")
 
   # Skip apps that don't have the SYNC_TYPE section
   if [[ -z "$TARGET_REPO" ]]; then
@@ -1145,13 +1114,8 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
 
   if $DRY_RUN; then
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
-    PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
-    if [[ -z "$PATH_SED_SCRIPT" ]]; then
-      PATH_SED_SCRIPT=$(derive_path_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
-    fi
     log_info "[DRY RUN] Branch             : $SYNC_BRANCH"
-    log_info "[DRY RUN] Content subs       : ${SED_SCRIPT:-(none)}"
-    log_info "[DRY RUN] Path subs          : ${PATH_SED_SCRIPT:-(none)}"
+    log_info "[DRY RUN] Substitutions      : ${SED_SCRIPT:-(none)}"
     log_info "[DRY RUN] Mode               : $SYNC_MODE"
     PASS+=("$TARGET_NAME (dry-run)")
     continue
@@ -1171,11 +1135,6 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
     git -C "$TARGET_DIR" checkout -B "$SYNC_BRANCH"
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
-    PATH_SED_SCRIPT=$(build_sed_script "$SOURCE_PATH_SUBS" "$TARGET_PATH_SUBS")
-    if [[ -z "$PATH_SED_SCRIPT" ]]; then
-      PATH_SED_SCRIPT=$(derive_path_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
-      [[ -n "$PATH_SED_SCRIPT" ]] && log_info "Auto-derived path sub from app_name: $PATH_SED_SCRIPT"
-    fi
     log_info "SED_SCRIPT for $TARGET_NAME:"
     log_info "  $SED_SCRIPT"
     HAS_CHANGES=false
