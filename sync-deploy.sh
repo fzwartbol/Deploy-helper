@@ -126,7 +126,7 @@ fi
 
 # ── prerequisites ─────────────────────────────────────────────────────────────
 [[ -f "$CONFIG_FILE" ]] || { log_error "Config not found: $CONFIG_FILE"; exit 1; }
-for _c in git curl awk; do
+for _c in git curl awk patch diff; do
   command -v "$_c" >/dev/null || { log_error "Required tool not found: $_c"; exit 1; }
 done
 unset _c
@@ -555,20 +555,109 @@ neutralize_configmap_keys() {
   ' "$target" "$theirs" > "$theirs.tmp" && mv "$theirs.tmp" "$theirs"
 }
 
-# Three-way merge a modified file into the target repo.
+# Parse a patch .rej file and inject conflict markers into the target file.
+# For each rejected hunk, tries to locate it in the target using the hunk's
+# context-before lines; falls back to matching the removed lines; falls back
+# to appending at end of file when no match is found.
+_inject_rej_conflicts() {
+  local tgt_abs="$1" rej_file="$2" from_ref="$3" to_ref="$4"
+  local tmp
+  tmp=$(mktemp "$WORK_DIR/.inj_XXXXXX")
+
+  awk -v from_ref="$from_ref" -v to_ref="$to_ref" '
+  BEGIN { tline = 0; hunk = 0 }
+
+  # ── First file: parse .rej into hunk arrays ───────────────────────────────
+  NR == FNR {
+    if (/^---/ || /^\+\+\+/) { next }
+    if (/^@@/) {
+      hunk++
+      del_count[hunk] = add_count[hunk] = cb_count[hunk] = seen_del[hunk] = 0
+      next
+    }
+    if (hunk == 0) next
+    if (/^-/) {
+      del_lines[hunk, ++del_count[hunk]] = substr($0, 2)
+      seen_del[hunk] = 1
+    } else if (/^\+/) {
+      add_lines[hunk, ++add_count[hunk]] = substr($0, 2)
+    } else if (/^ / && !seen_del[hunk]) {
+      ctx_before[hunk, ++cb_count[hunk]] = substr($0, 2)
+    }
+    next
+  }
+
+  # ── Second file: read target into array ───────────────────────────────────
+  { tgt[++tline] = $0 }
+
+  END {
+    for (h = 1; h <= hunk; h++) inject(h, find_loc(h))
+    for (i = 1; i <= tline; i++) print tgt[i]
+  }
+
+  function find_loc(h,    i, j, ok, n) {
+    n = cb_count[h]
+    if (n > 0) {
+      for (i = 1; i <= tline - n + 1; i++) {
+        ok = 1
+        for (j = 1; j <= n; j++)
+          if (tgt[i+j-1] != ctx_before[h,j]) { ok = 0; break }
+        if (ok) return i + n
+      }
+    }
+    n = del_count[h]
+    if (n > 0) {
+      for (i = 1; i <= tline - n + 1; i++) {
+        ok = 1
+        for (j = 1; j <= n; j++)
+          if (tgt[i+j-1] != del_lines[h,j]) { ok = 0; break }
+        if (ok) return i
+      }
+    }
+    return 0
+  }
+
+  function inject(h, loc,    i, n, nt, nn) {
+    nn = 0; split("", nt)
+    if (loc > 0) {
+      n = del_count[h]
+      if (loc + n - 1 > tline) n = tline - loc + 1
+      for (i = 1;       i < loc;     i++) nt[++nn] = tgt[i]
+      nt[++nn] = "<<<<<<< target (ours)"
+      for (i = loc;     i < loc + n; i++) nt[++nn] = tgt[i]
+      nt[++nn] = "======="
+      for (i = 1; i <= add_count[h]; i++) nt[++nn] = add_lines[h,i]
+      nt[++nn] = ">>>>>>> source patch (" from_ref " -> " to_ref ")"
+      for (i = loc + n; i <= tline;  i++) nt[++nn] = tgt[i]
+    } else {
+      for (i = 1; i <= tline; i++) nt[++nn] = tgt[i]
+      nt[++nn] = "# CONFLICT: patch hunk location not found in target"
+      nt[++nn] = "<<<<<<< target (ours -- context not matched above)"
+      for (i = 1; i <= del_count[h]; i++) nt[++nn] = "# expected: " del_lines[h,i]
+      nt[++nn] = "======="
+      for (i = 1; i <= add_count[h]; i++) nt[++nn] = add_lines[h,i]
+      nt[++nn] = ">>>>>>> source patch (" from_ref " -> " to_ref ")"
+    }
+    tline = nn
+    for (i = 1; i <= nn; i++) tgt[i] = nt[i]
+  }
+  ' "$rej_file" "$tgt_abs" > "$tmp"
+
+  mv "$tmp" "$tgt_abs"
+}
+
+# Patch-based file sync for modified files.
 #
-# base   = source file at FROM_REF with substitutions applied
-# theirs = source file at TO_REF   with substitutions applied
-# ours   = current target file (written in-place by git merge-file)
+# Computes diff(source_A_subs, source_B_subs) and applies it with
+# `patch --fuzz=3`.  Only the actual A->B delta touches the target;
+# pre-existing differences between source and target that are outside
+# the changed hunks are ignored entirely, eliminating spurious conflicts.
 #
-# For existing target files: image-tag lines and protected ConfigMap values
-# in THEIRS are replaced with BASE values before merging, so git merge-file
-# always keeps the target's own values.  Conflicts get markers written.
+# Image-tag lines and protected ConfigMap keys are neutralised in source_B
+# before the diff is generated so they never appear in the patch.
 #
-# For new files (no target yet): THEIRS is written directly (first-time copy).
-#
-# Returns: 0=clean merge, 1=conflict markers written, 2+=hard error
-three_way_merge_file() {
+# Returns: 0=clean apply, 1=conflict markers written, 2+=hard error
+patch_merge_file() {
   local orig_src="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
 
   local src_path
@@ -576,66 +665,88 @@ three_way_merge_file() {
   local src_abs="$SOURCE_DIR/$src_path"
   local tgt_abs="$tgt_dir/$tgt_path"
 
-  local base theirs ours_save
-  base=$(mktemp      "$WORK_DIR/.3wm_base_XXXXXX")
-  theirs=$(mktemp    "$WORK_DIR/.3wm_theirs_XXXXXX")
-  ours_save=$(mktemp "$WORK_DIR/.3wm_ours_XXXXXX")
+  local base theirs
+  base=$(mktemp   "$WORK_DIR/.pm_base_XXXXXX")
+  theirs=$(mktemp "$WORK_DIR/.pm_theirs_XXXXXX")
 
-  # base: source at FROM_REF; fall back to simple copy if file is brand-new
+  # base: source at FROM_REF; fall back to first-time copy if brand-new
   if ! git -C "$SOURCE_DIR" show "${FROM_REF}:${src_path}" > "$base" 2>/dev/null; then
-    rm -f "$base" "$theirs" "$ours_save"
+    rm -f "$base" "$theirs"
     copy_and_apply "$src_path" "$tgt_path" "$tgt_dir" "$sed_script"
     return $?
   fi
   apply_subs "$base" "$sed_script"
 
-  # theirs: source at TO_REF
+  # theirs: source at TO_REF with subs applied
   cp "$src_abs" "$theirs"
   apply_subs "$theirs" "$sed_script"
 
   if [[ ! -f "$tgt_abs" ]]; then
-    # Target doesn't have this file yet — first-time copy.
     mkdir -p "$(dirname "$tgt_abs")"
-    log_info "3wm first-time copy: src=$src_path → tgt=$tgt_path"
-    log_info "3wm first-time copy content: $(head -6 "$theirs" | tr '\n' '|')"
+    log_info "pm first-time copy: src=$src_path -> tgt=$tgt_path"
     cp "$theirs" "$tgt_abs"
-    rm -f "$base" "$theirs" "$ours_save"
+    rm -f "$base" "$theirs"
     return 0
   fi
 
-  # Existing file: neutralise env-specific lines so merge keeps target values
+  # Neutralise env-specific content so it is absent from the generated patch:
+  #   image/tag lines       -> keep base values (won't appear in diff -> not patched)
+  #   protected ConfigMap keys -> keep target values
   restore_image_lines       "$theirs" "$base"
   neutralize_configmap_keys "$theirs" "$tgt_abs"
 
-  # Save ours before merge so we can register it as stage 2 on conflict
+  # Generate the delta: only what genuinely changed A -> B (after neutralisation)
+  local patch_file
+  patch_file=$(mktemp "$WORK_DIR/.pm_patch_XXXXXX")
+  diff -u "$base" "$theirs" > "$patch_file" || true
+
+  if [[ ! -s "$patch_file" ]]; then
+    rm -f "$base" "$theirs" "$patch_file"
+    return 0
+  fi
+
+  # Save pre-patch target for git index stage 2 (needed if conflict)
+  local ours_save
+  ours_save=$(mktemp "$WORK_DIR/.pm_ours_XXXXXX")
   cp "$tgt_abs" "$ours_save"
 
-  local rc=0
-  git merge-file \
-    -L "target (ours)" \
-    -L "base (${FROM_REF})" \
-    -L "source (${TO_REF})" \
-    "$tgt_abs" "$base" "$theirs" || rc=$?
+  # Apply patch; fuzz=3 tolerates minor context drift between source and target
+  local rej_file patch_rc=0
+  rej_file=$(mktemp "$WORK_DIR/.pm_rej_XXXXXX")
+  patch --no-backup-if-mismatch --fuzz=3 \
+    --reject-file="$rej_file" \
+    "$tgt_abs" < "$patch_file" 2>/dev/null || patch_rc=$?
+  rm -f "$patch_file"
 
-  if [[ $rc -eq 1 ]]; then
-    # Conflict markers written to tgt_abs.
-    # Register git index stages 1/2/3 so "git mergetool" can open the file.
-    local base_hash ours_hash theirs_hash
-    base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
-    ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
-    theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
-    {
-      printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
-      printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
-      printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
-    } | git -C "$tgt_dir" update-index --index-info
+  if [[ $patch_rc -eq 0 ]]; then
+    rm -f "$base" "$theirs" "$ours_save" "$rej_file"
+    return 0
   fi
+
+  if [[ $patch_rc -gt 1 ]]; then
+    log_error "patch error ($patch_rc) on $tgt_path"
+    rm -f "$base" "$theirs" "$ours_save" "$rej_file"
+    return 2
+  fi
+
+  # patch_rc == 1: rejected hunks — inject conflict markers and set up git stages
+  log_warn "pm: rejected hunk(s) in $tgt_path — injecting conflict markers"
+  [[ -s "$rej_file" ]] && _inject_rej_conflicts "$tgt_abs" "$rej_file" "$FROM_REF" "$TO_REF"
+  rm -f "$rej_file"
+
+  # Register git index stages 1/2/3 so git mergetool opens the three-way dialog
+  local base_hash ours_hash theirs_hash
+  base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
+  ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
+  theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
+  {
+    printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
+    printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
+    printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
+  } | git -C "$tgt_dir" update-index --index-info
 
   rm -f "$base" "$theirs" "$ours_save"
-
-  if   [[ $rc -eq 1 ]]; then return 1
-  elif [[ $rc -gt 1 ]]; then log_error "git merge-file error ($rc): $tgt_path"; return 2
-  fi
+  return 1
 }
 
 # ── Bitbucket PR creation ─────────────────────────────────────────────────────
@@ -1246,7 +1357,7 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
               SEALED_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — **skipped** (cluster-specific encryption; re-seal manually if value changed)")
             else
               merge_rc=0
-              three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
+              patch_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
               if [[ $merge_rc -eq 1 ]]; then
                 CONFLICT_FILES+=("$tgt_file")
                 # Index stages 1/2/3 are already registered — do not git add here
