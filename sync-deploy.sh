@@ -710,10 +710,11 @@ patch_merge_file() {
   ours_save=$(mktemp "$WORK_DIR/.pm_ours_XXXXXX")
   cp "$tgt_abs" "$ours_save"
 
-  # Apply patch; fuzz=3 tolerates minor context drift between source and target
+  # Apply patch; fuzz=3 tolerates minor context drift between source and target.
+  # --forward: skip hunks that are already applied (no interactive prompt).
   local rej_file patch_rc=0
   rej_file=$(mktemp "$WORK_DIR/.pm_rej_XXXXXX")
-  patch --no-backup-if-mismatch --fuzz=3 \
+  patch --no-backup-if-mismatch --forward --fuzz=3 \
     --reject-file="$rej_file" \
     "$tgt_abs" < "$patch_file" 2>/dev/null || patch_rc=$?
   rm -f "$patch_file"
@@ -729,9 +730,15 @@ patch_merge_file() {
     return 2
   fi
 
-  # patch_rc == 1: rejected hunks — inject conflict markers and set up git stages
+  # patch_rc == 1 but rej file empty: all hunks were already applied — nothing to do
+  if [[ ! -s "$rej_file" ]]; then
+    rm -f "$base" "$theirs" "$ours_save" "$rej_file"
+    return 0
+  fi
+
+  # patch_rc == 1 with genuine rejected hunks — inject conflict markers
   log_warn "pm: rejected hunk(s) in $tgt_path — injecting conflict markers"
-  [[ -s "$rej_file" ]] && _inject_rej_conflicts "$tgt_abs" "$rej_file" "$FROM_REF" "$TO_REF"
+  _inject_rej_conflicts "$tgt_abs" "$rej_file" "$FROM_REF" "$TO_REF"
   rm -f "$rej_file"
 
   # Register git index stages 1/2/3 so git mergetool opens the three-way dialog
