@@ -576,13 +576,14 @@ three_way_merge_file() {
   local src_abs="$SOURCE_DIR/$src_path"
   local tgt_abs="$tgt_dir/$tgt_path"
 
-  local base theirs
-  base=$(mktemp   "$WORK_DIR/.3wm_base_XXXXXX")
-  theirs=$(mktemp "$WORK_DIR/.3wm_theirs_XXXXXX")
+  local base theirs ours_save
+  base=$(mktemp      "$WORK_DIR/.3wm_base_XXXXXX")
+  theirs=$(mktemp    "$WORK_DIR/.3wm_theirs_XXXXXX")
+  ours_save=$(mktemp "$WORK_DIR/.3wm_ours_XXXXXX")
 
   # base: source at FROM_REF; fall back to simple copy if file is brand-new
   if ! git -C "$SOURCE_DIR" show "${FROM_REF}:${src_path}" > "$base" 2>/dev/null; then
-    rm -f "$base" "$theirs"
+    rm -f "$base" "$theirs" "$ours_save"
     copy_and_apply "$src_path" "$tgt_path" "$tgt_dir" "$sed_script"
     return $?
   fi
@@ -598,7 +599,7 @@ three_way_merge_file() {
     log_info "3wm first-time copy: src=$src_path → tgt=$tgt_path"
     log_info "3wm first-time copy content: $(head -6 "$theirs" | tr '\n' '|')"
     cp "$theirs" "$tgt_abs"
-    rm -f "$base" "$theirs"
+    rm -f "$base" "$theirs" "$ours_save"
     return 0
   fi
 
@@ -606,13 +607,31 @@ three_way_merge_file() {
   restore_image_lines       "$theirs" "$base"
   neutralize_configmap_keys "$theirs" "$tgt_abs"
 
+  # Save ours before merge so we can register it as stage 2 on conflict
+  cp "$tgt_abs" "$ours_save"
+
   local rc=0
   git merge-file \
     -L "target (ours)" \
     -L "base (${FROM_REF})" \
     -L "source (${TO_REF})" \
     "$tgt_abs" "$base" "$theirs" || rc=$?
-  rm -f "$base" "$theirs"
+
+  if [[ $rc -eq 1 ]]; then
+    # Conflict markers written to tgt_abs.
+    # Register git index stages 1/2/3 so "git mergetool" can open the file.
+    local base_hash ours_hash theirs_hash
+    base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
+    ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
+    theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
+    {
+      printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
+      printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
+      printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
+    } | git -C "$tgt_dir" update-index --index-info
+  fi
+
+  rm -f "$base" "$theirs" "$ours_save"
 
   if   [[ $rc -eq 1 ]]; then return 1
   elif [[ $rc -gt 1 ]]; then log_error "git merge-file error ($rc): $tgt_path"; return 2
@@ -632,8 +651,6 @@ create_bitbucket_pr() {
   local api_token="${BITBUCKET_TOKEN:-}"
 
   if [[ -z "$api_user" || -z "$api_token" ]]; then
-    log_warn "BITBUCKET_USER / BITBUCKET_TOKEN not set — skipping PR creation"
-    log_warn "Create the PR manually at: https://bitbucket.org/${repo_slug}/pull-requests/new?source=${branch}"
     return 0
   fi
 
@@ -1230,11 +1247,15 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
             else
               merge_rc=0
               three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
-              [[ $merge_rc -eq 1 ]] && CONFLICT_FILES+=("$tgt_file")
-              if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
-                IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
+              if [[ $merge_rc -eq 1 ]]; then
+                CONFLICT_FILES+=("$tgt_file")
+                # Index stages 1/2/3 are already registered — do not git add here
+              else
+                if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
+                  IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
+                fi
+                git -C "$TARGET_DIR" add "$tgt_file"
               fi
-              git -C "$TARGET_DIR" add "$tgt_file"
               HAS_CHANGES=true
             fi
             ;;
@@ -1303,22 +1324,31 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
       exit 0
     fi
 
+    # ── Conflict resolution ───────────────────────────────────────────────────
+    if [[ "$_effective_mode" == "diff" && ${#CONFLICT_FILES[@]} -gt 0 ]]; then
+      if $_INTERACTIVE; then
+        log_warn "Conflicts in $TARGET_NAME — launching merge tool..."
+        log_warn "Resolve each file, save and close the dialog to continue."
+        git -C "$TARGET_DIR" mergetool --no-prompt
+        _still=$(git -C "$TARGET_DIR" diff --name-only --diff-filter=U 2>/dev/null || true)
+        if [[ -n "$_still" ]]; then
+          log_error "Unresolved conflicts remain in $TARGET_NAME — aborting push"
+          printf '  %s\n' "$_still" >&2
+          exit 1
+        fi
+      else
+        log_warn "Conflicts in $TARGET_NAME (non-interactive) — committing with markers"
+        log_warn "Resolve: git fetch origin && git checkout $SYNC_BRANCH && git mergetool"
+        for _cf in "${CONFLICT_FILES[@]}"; do
+          git -C "$TARGET_DIR" add "$_cf"
+        done
+      fi
+    fi
+
     git -C "$TARGET_DIR" commit -m "$(printf \
       'chore(sync): deploy changes from %s\n\nSource: %s\nRef:    %s → %s\nRun:    %s' \
       "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")"
     git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH"
-
-    # Print conflict resolution hint — only for diff mode
-    if [[ "$_effective_mode" == "diff" && ${#CONFLICT_FILES[@]} -gt 0 ]]; then
-      log_warn "Conflicts in $TARGET_NAME — resolve in your local clone of $TARGET_REPO:"
-      log_warn "  1. cd <your local clone>"
-      log_warn "  2. git fetch origin && git checkout $SYNC_BRANCH"
-      log_warn "  3. Resolve conflict markers in:"
-      for _cf in "${CONFLICT_FILES[@]}"; do
-        log_warn "       $_cf"
-      done
-      log_warn "  4. git add <files> && git commit && git push"
-    fi
 
     # ── Build PR body ─────────────────────────────────────────────────────────
     SEALED_SECTION=""
