@@ -1180,6 +1180,96 @@ EOF
 with_work "app-f-app" "" app_f_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SOURCE KV REPO  (testspace/source-kv-repo)
+# Minimal app repo exercising the two global-key-search scenarios:
+#   app.properties — version on line 1, no context before → global search
+#   pom.xml        — version inside <parent> block
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-kv-repo"
+
+source_kv_v1() {
+  # app.version is line 1 → unified diff has zero context-before lines
+  cat > app.properties <<'EOF'
+app.version=1.0.0
+app.name=source-app
+EOF
+
+  # pom.xml: <version> nested inside <parent>
+  cat > pom.xml <<'EOF'
+<project>
+  <parent>
+    <groupId>com.source</groupId>
+    <version>1.0.0</version>
+  </parent>
+  <groupId>com.source.app</groupId>
+  <artifactId>source-app</artifactId>
+</project>
+EOF
+}
+with_work "source-kv-repo" "v1.0.0" source_kv_v1
+
+source_kv_v2() {
+  # Bump version in both files
+  cat > app.properties <<'EOF'
+app.version=1.1.0
+app.name=source-app
+EOF
+
+  cat > pom.xml <<'EOF'
+<project>
+  <parent>
+    <groupId>com.source</groupId>
+    <version>1.1.0</version>
+  </parent>
+  <groupId>com.source.app</groupId>
+  <artifactId>source-app</artifactId>
+</project>
+EOF
+}
+with_work "source-kv-repo" "v1.1.0" source_kv_v2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET KV REPO: app-h  (testspace/app-h-kv)
+# Two files that exercise distinct fallback paths:
+#
+#   app.properties
+#     app.version=2.5.0  ← differs from base 1.0.0, patch rejects hunk.
+#     No context before version line (line 1) → cb_count=0 → global search.
+#     Expected: global key-search finds app.version= and updates to 1.1.0.
+#
+#   pom.xml
+#     Has NO <parent> block.  The diff targets <parent>/<version>.
+#     Global search finds two <version> elements, but NEITHER is inside
+#     <parent> → container check rejects both → conflict markers written,
+#     project <version>3.0.0</version> is preserved unchanged.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-h-kv"
+
+app_h_initial() {
+  cat > app.properties <<'EOF'
+app.version=2.5.0
+app.name=app-h
+EOF
+
+  # No <parent> block; has project version and a dependency version
+  cat > pom.xml <<'EOF'
+<project>
+  <groupId>com.app.h</groupId>
+  <artifactId>app-h</artifactId>
+  <version>3.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>lib</artifactId>
+      <version>5.0.0</version>
+    </dependency>
+  </dependencies>
+</project>
+EOF
+}
+with_work "app-h-kv" "" app_h_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generate test repos.json pointing to our local testspace/ repos
 # Uses the new grouped "apps" structure
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1324,6 +1414,28 @@ cat > "$T/repos.test.json" <<'EOF'
           "app_name":     "app-f",
           "java_package": "com.app.f",
           "java_path":    "com/app/f"
+        }
+      }
+    },
+    {
+      "name": "source-kv",
+      "app": {
+        "repo": "testspace/source-kv-repo",
+        "substitutions": {
+          "app_name":     "source-app",
+          "java_package": "com.source.app",
+          "java_path":    "com/source/app"
+        }
+      }
+    },
+    {
+      "name": "app-h",
+      "app": {
+        "repo": "testspace/app-h-kv",
+        "substitutions": {
+          "app_name":     "app-h",
+          "java_package": "com.app.h",
+          "java_path":    "com/app/h"
         }
       }
     }
@@ -1707,6 +1819,41 @@ else
   fail "expected sync/app-diff-from-v1.0.0-to-v1.1.0, got $_branch_f"
 fi
 unset _branch_f
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4th sync: app-h — global key-search and container discrimination
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (app type diff mode: source-kv → app-h, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-kv \
+  --type    app \
+  --targets app-h \
+  --from    v1.0.0 \
+  --to      v1.1.0 || true   # conflict in pom.xml → exit 1 expected
+
+H="$WORK_DIR/app-h"
+
+# ── global key-search: properties file ───────────────────────────────────────
+# app.version is on line 1 (no context before).  The target has a different
+# value (2.5.0 ≠ 1.0.0), so patch rejects the hunk.  _inject_rej_conflicts
+# falls through to try_apply_global which scans the file and applies 1.1.0.
+section "app-h  global key-search (no context) — properties version updated"
+has     "$H/app.properties"  "app.version=1.1.0"  "version updated to 1.1.0 via global key-search"
+has     "$H/app.properties"  "app.name=app-h"     "app name preserved unchanged"
+has_not "$H/app.properties"  "app.version=2.5.0"  "old version 2.5.0 replaced"
+
+# ── container discrimination: pom.xml ────────────────────────────────────────
+# Source diff changes <version> inside <parent>.  Target has no <parent> block.
+# Global search finds two <version> elements but both fail in_xml_container
+# ("parent" not found as ancestor) → try_apply_global returns 0 → conflict
+# markers written.  The existing project <version>3.0.0</version> must NOT be
+# overwritten; the dependency <version>5.0.0</version> must also be untouched.
+section "app-h  container discrimination — project version preserved"
+has     "$H/pom.xml"  "<version>3.0.0</version>"  "project version 3.0.0 not overwritten by wrong-container match"
+has     "$H/pom.xml"  "<version>5.0.0</version>"  "dependency version 5.0.0 untouched"
+has     "$H/pom.xml"  "<<<<<<<"                   "conflict markers written for unlocatable parent version"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary

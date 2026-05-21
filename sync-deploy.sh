@@ -676,15 +676,20 @@ _inject_rej_conflicts() {
     return 1
   }
 
-  # File-wide key search: used when context lines were not found in the target.
-  # Scans the entire file for consecutive del-lines matched by key and rewrites
-  # them via make_val — identical logic to try_apply but without a loc window.
-  function try_apply_global(h,    i,j,dloc,nl,nn,nt,ok) {
+  # File-wide key search with XML container awareness.
+  # Used when context-based find_loc() returns 0 (no matching context in target).
+  # Scans the entire file for del-lines matched by key.  For XML files, also
+  # checks that the candidate is nested inside the same parent element that
+  # surrounds the hunk in the diff (hunk_container), preventing a <version>
+  # inside <dependencies> from being updated when the diff targets <parent>.
+  function try_apply_global(h,    i,j,dloc,nl,nn,nt,ok,container) {
     if (!del_count[h] || del_count[h]!=add_count[h]) return 0
+    container=hunk_container(h)
     dloc=0
     for (i=1; i<=tline-del_count[h]+1; i++) {
       ok=1
       for (j=1;j<=del_count[h];j++) if (!lmatch(tgt[i+j-1],del_lines[h,j],0)) {ok=0;break}
+      if (ok && !in_xml_container(i, container)) ok=0
       if (ok) { dloc=i; break }
     }
     if (!dloc) return 0
@@ -698,6 +703,55 @@ _inject_rej_conflicts() {
     for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
     tline=nn; for (i=1;i<=nn;i++) tgt[i]=nt[i]
     return 1
+  }
+
+  # Extract the XML tag name from a line starting with "<[/]".
+  # Returns "" for self-closing, comments, or proc-instructions.
+  function xml_tag_name(s,    i,c,name) {
+    name=""; i=2
+    if (i<=length(s) && substr(s,i,1)=="/") i++    # skip "/" in closing tags
+    for (; i<=length(s); i++) {
+      c=substr(s,i,1)
+      if (c==">" || c==" " || c=="\t" || c=="/") break
+      name=name c
+    }
+    return name
+  }
+
+  # Innermost unclosed XML opening tag in the hunk context-before lines.
+  # Returns "" for non-XML files or when the change is not inside any element.
+  function hunk_container(h,    i,s,tag,stack,top) {
+    top=0; split("",stack)
+    for (i=1; i<=cb_count[h]; i++) {
+      s=ctx_before[h,i]; gsub(/^[[:space:]]+/,"",s)
+      if (length(s)<2 || substr(s,1,1)!="<") continue
+      if (substr(s,2,1)=="!" || substr(s,2,1)=="?") continue
+      if (substr(s,2,1)=="/") { if (top>0) top--; continue }
+      tag=xml_tag_name(s)
+      if (tag=="") continue
+      if (index(s,"/>")>0) continue                # self-closing
+      if (index(s,"</" tag ">")>0) continue        # inline open+close
+      stack[++top]=tag
+    }
+    return (top>0) ? stack[top] : ""
+  }
+
+  # True if tgt[pos] is inside a <container> ancestor (scan up to 100 lines back).
+  # container="" means no XML nesting requirement — always returns true.
+  function in_xml_container(pos, container,    i,s,tag,depth) {
+    if (container=="") return 1
+    depth=0
+    for (i=pos-1; i>=1 && i>=pos-100; i--) {
+      s=tgt[i]; gsub(/^[[:space:]]+/,"",s)
+      if (length(s)<2 || substr(s,1,1)!="<") continue
+      if (substr(s,2,1)=="!" || substr(s,2,1)=="?") continue
+      tag=xml_tag_name(s)
+      if (tag!=container) continue
+      if (substr(s,2,1)=="/") { depth++; continue }    # </container>
+      if (depth==0) return 1                            # <container> found open
+      depth--
+    }
+    return 0
   }
 
   # Build replacement line: preserve target indent and key; take value from add_line
