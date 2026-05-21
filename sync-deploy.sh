@@ -600,6 +600,8 @@ _inject_rej_conflicts() {
       if (eloc && try_apply(h,eloc)) continue
       kloc=find_loc(h,0)              # key-based context match
       if (kloc && try_apply(h,kloc)) continue
+      # Level 3: no context found at all — scan entire file for del-lines by key
+      if (!eloc && !kloc && try_apply_global(h)) continue
       best=(eloc>0) ? eloc : kloc
       if (best) do_inject(h,best)
       else      do_append(h)
@@ -662,6 +664,30 @@ _inject_rej_conflicts() {
     }
     if (!dloc) return 0
     # Build replacement; abort if any line cannot be rewritten
+    nn=0; split("",nt)
+    for (i=1; i<dloc; i++) nt[++nn]=tgt[i]
+    for (j=1; j<=del_count[h]; j++) {
+      nl=make_val(tgt[dloc+j-1], del_lines[h,j], add_lines[h,j])
+      if (nl=="") return 0
+      nt[++nn]=nl
+    }
+    for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
+    tline=nn; for (i=1;i<=nn;i++) tgt[i]=nt[i]
+    return 1
+  }
+
+  # File-wide key search: used when context lines were not found in the target.
+  # Scans the entire file for consecutive del-lines matched by key and rewrites
+  # them via make_val — identical logic to try_apply but without a loc window.
+  function try_apply_global(h,    i,j,dloc,nl,nn,nt,ok) {
+    if (!del_count[h] || del_count[h]!=add_count[h]) return 0
+    dloc=0
+    for (i=1; i<=tline-del_count[h]+1; i++) {
+      ok=1
+      for (j=1;j<=del_count[h];j++) if (!lmatch(tgt[i+j-1],del_lines[h,j],0)) {ok=0;break}
+      if (ok) { dloc=i; break }
+    }
+    if (!dloc) return 0
     nn=0; split("",nt)
     for (i=1; i<dloc; i++) nt[++nn]=tgt[i]
     for (j=1; j<=del_count[h]; j++) {
@@ -833,18 +859,19 @@ patch_merge_file() {
   # patch_rc == 1 with genuine rejected hunks.
   # Try key-value replacement first; only write conflict markers for hunks that
   # cannot be resolved that way.  inj_rc=0 means all resolved cleanly.
-  log_warn "pm: rejected hunk(s) in $tgt_path — attempting key-value resolution"
+  log_info "pm: rejected hunk(s) in $tgt_path — attempting key-value resolution"
   local inj_rc=0
   _inject_rej_conflicts "$tgt_abs" "$rej_file" "$FROM_REF" "$TO_REF" || inj_rc=$?
   rm -f "$rej_file"
 
   if [[ $inj_rc -eq 0 ]]; then
-    log_info "pm: all rejected hunk(s) resolved by key-value replacement in $tgt_path"
+    log_info "pm: all rejected hunk(s) resolved by key-value in $tgt_path"
     rm -f "$base" "$theirs" "$ours_save"
     return 0
   fi
 
   # Conflict markers were written — register git index stages 1/2/3 so
+  log_warn "pm: unresolved conflict(s) in $tgt_path — needs manual merge"
   # git mergetool opens the three-way dialog in IntelliJ
   local base_hash ours_hash theirs_hash
   base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
