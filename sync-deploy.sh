@@ -555,95 +555,189 @@ neutralize_configmap_keys() {
   ' "$target" "$theirs" > "$theirs.tmp" && mv "$theirs.tmp" "$theirs"
 }
 
-# Parse a patch .rej file and inject conflict markers into the target file.
-# For each rejected hunk, tries to locate it in the target using the hunk's
-# context-before lines; falls back to matching the removed lines; falls back
-# to appending at end of file when no match is found.
+# Apply rejected hunks to the target file using a two-level strategy:
+#
+#   Level 1 – key-value replacement (handles most real cases):
+#     For each hunk, first try exact context matching to locate the block,
+#     then key-only matching as fallback.  Once located, match del-lines by
+#     their structural key (ignoring value differences) and replace just the
+#     value from the add-line.  Works for YAML (key: value), XML single-line
+#     elements (<tag>val</tag>), and properties (key=value).
+#
+#   Level 2 – conflict markers:
+#     Hunks whose del/add count differs (structural block changes) or where
+#     the key cannot be found in the target fall through to <<<<<<< markers.
+#
+# Exits 0 if all rejected hunks were resolved by key-value replacement.
+# Exits 1 if any conflict markers were written (caller sets git stages).
 _inject_rej_conflicts() {
   local tgt_abs="$1" rej_file="$2" from_ref="$3" to_ref="$4"
   local tmp
   tmp=$(mktemp "$WORK_DIR/.inj_XXXXXX")
 
   awk -v from_ref="$from_ref" -v to_ref="$to_ref" '
-  BEGIN { tline = 0; hunk = 0 }
+  BEGIN { tline=0; hunk=0; had_conflict=0 }
 
   # ── First file: parse .rej into hunk arrays ───────────────────────────────
-  NR == FNR {
-    if (/^---/ || /^\+\+\+/) { next }
+  NR==FNR {
+    if (/^---/ || /^\+\+\+/) next
     if (/^@@/) {
-      hunk++
-      del_count[hunk] = add_count[hunk] = cb_count[hunk] = seen_del[hunk] = 0
-      next
+      hunk++; del_count[hunk]=add_count[hunk]=cb_count[hunk]=seen_del[hunk]=0; next
     }
-    if (hunk == 0) next
-    if (/^-/) {
-      del_lines[hunk, ++del_count[hunk]] = substr($0, 2)
-      seen_del[hunk] = 1
-    } else if (/^\+/) {
-      add_lines[hunk, ++add_count[hunk]] = substr($0, 2)
-    } else if (/^ / && !seen_del[hunk]) {
-      ctx_before[hunk, ++cb_count[hunk]] = substr($0, 2)
-    }
+    if (!hunk) next
+    if      (/^-/) { del_lines[hunk,++del_count[hunk]]=substr($0,2); seen_del[hunk]=1 }
+    else if (/^\+/) { add_lines[hunk,++add_count[hunk]]=substr($0,2) }
+    else if (/^ /  && !seen_del[hunk]) { ctx_before[hunk,++cb_count[hunk]]=substr($0,2) }
     next
   }
 
   # ── Second file: read target into array ───────────────────────────────────
-  { tgt[++tline] = $0 }
+  { tgt[++tline]=$0 }
 
   END {
-    for (h = 1; h <= hunk; h++) inject(h, find_loc(h))
-    for (i = 1; i <= tline; i++) print tgt[i]
+    for (h=1; h<=hunk; h++) {
+      eloc=find_loc(h,1)              # exact context match
+      if (eloc && try_apply(h,eloc)) continue
+      kloc=find_loc(h,0)              # key-based context match
+      if (kloc && try_apply(h,kloc)) continue
+      best=(eloc>0) ? eloc : kloc
+      if (best) do_inject(h,best)
+      else      do_append(h)
+      had_conflict=1
+    }
+    for (i=1; i<=tline; i++) print tgt[i]
+    exit had_conflict
   }
 
-  function find_loc(h,    i, j, ok, n) {
-    n = cb_count[h]
-    if (n > 0) {
-      for (i = 1; i <= tline - n + 1; i++) {
-        ok = 1
-        for (j = 1; j <= n; j++)
-          if (tgt[i+j-1] != ctx_before[h,j]) { ok = 0; break }
-        if (ok) return i + n
+  # ── lkey: structural key of a line, ignoring its value ────────────────────
+  # YAML  "  replicas: 3"       -> "replicas:"
+  # XML   "  <version>1.0</..>" -> "<version"
+  # Props "  timeout=30"        -> "timeout="
+  function lkey(line,    s,i,c,n) {
+    s=line; gsub(/^[[:space:]]+/,"",s); n=length(s)
+    # XML element (not closing/comment/proc-instr)
+    if (n>1 && substr(s,1,1)=="<" && index("/!?",substr(s,2,1))==0) {
+      for (i=2;i<=n;i++) { c=substr(s,i,1); if (c==">"||c==" "||c=="\t"||c=="/") break }
+      return substr(s,1,i-1)
+    }
+    # YAML: first ":" followed by space, tab, or EOL
+    for (i=1;i<=n;i++) {
+      if (substr(s,i,1)==":") {
+        c=substr(s,i+1,1)
+        if (c==" "||c=="\t"||c=="") return substr(s,1,i)
       }
     }
-    n = del_count[h]
-    if (n > 0) {
-      for (i = 1; i <= tline - n + 1; i++) {
-        ok = 1
-        for (j = 1; j <= n; j++)
-          if (tgt[i+j-1] != del_lines[h,j]) { ok = 0; break }
-        if (ok) return i
-      }
+    # Properties: first "="
+    for (i=1;i<=n;i++) if (substr(s,i,1)=="=") return substr(s,1,i)
+    return s
+  }
+
+  # Does candidate match ref? exact=1: identical; exact=0: same key
+  function lmatch(candidate, ref, exact,    k) {
+    if (exact) return (candidate==ref)
+    k=lkey(ref); if (k=="") return 0
+    return (lkey(candidate)==k)
+  }
+
+  # First line in tgt[] just AFTER ctx_before of hunk h; 0 if not found
+  function find_loc(h, exact,    i,j,ok,n) {
+    n=cb_count[h]; if (!n) return 0
+    for (i=1; i<=tline-n+1; i++) {
+      ok=1
+      for (j=1;j<=n;j++) if (!lmatch(tgt[i+j-1],ctx_before[h,j],exact)) {ok=0;break}
+      if (ok) return i+n
     }
     return 0
   }
 
-  function inject(h, loc,    i, n, nt, nn) {
-    nn = 0; split("", nt)
-    if (loc > 0) {
-      n = del_count[h]
-      if (loc + n - 1 > tline) n = tline - loc + 1
-      for (i = 1;       i < loc;     i++) nt[++nn] = tgt[i]
-      nt[++nn] = "<<<<<<< target (ours)"
-      for (i = loc;     i < loc + n; i++) nt[++nn] = tgt[i]
-      nt[++nn] = "======="
-      for (i = 1; i <= add_count[h]; i++) nt[++nn] = add_lines[h,i]
-      nt[++nn] = ">>>>>>> source patch (" from_ref " -> " to_ref ")"
-      for (i = loc + n; i <= tline;  i++) nt[++nn] = tgt[i]
-    } else {
-      for (i = 1; i <= tline; i++) nt[++nn] = tgt[i]
-      nt[++nn] = "# CONFLICT: patch hunk location not found in target"
-      nt[++nn] = "<<<<<<< target (ours -- context not matched above)"
-      for (i = 1; i <= del_count[h]; i++) nt[++nn] = "# expected: " del_lines[h,i]
-      nt[++nn] = "======="
-      for (i = 1; i <= add_count[h]; i++) nt[++nn] = add_lines[h,i]
-      nt[++nn] = ">>>>>>> source patch (" from_ref " -> " to_ref ")"
+  # Try key-value replacement at loc; return 1=applied 0=not applicable
+  function try_apply(h, loc,    i,j,dloc,nl,nn,nt,ok) {
+    if (!del_count[h] || del_count[h]!=add_count[h]) return 0
+    # Find del lines by key within a 30-line window after loc
+    dloc=0
+    for (i=loc; i<=loc+30 && i+del_count[h]-1<=tline; i++) {
+      ok=1
+      for (j=1;j<=del_count[h];j++) if (!lmatch(tgt[i+j-1],del_lines[h,j],0)) {ok=0;break}
+      if (ok) { dloc=i; break }
     }
-    tline = nn
-    for (i = 1; i <= nn; i++) tgt[i] = nt[i]
+    if (!dloc) return 0
+    # Build replacement; abort if any line cannot be rewritten
+    nn=0; split("",nt)
+    for (i=1; i<dloc; i++) nt[++nn]=tgt[i]
+    for (j=1; j<=del_count[h]; j++) {
+      nl=make_val(tgt[dloc+j-1], del_lines[h,j], add_lines[h,j])
+      if (nl=="") return 0
+      nt[++nn]=nl
+    }
+    for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
+    tline=nn; for (i=1;i<=nn;i++) tgt[i]=nt[i]
+    return 1
+  }
+
+  # Build replacement line: preserve target indent and key; take value from add_line
+  function make_val(tgt_l, del_l, add_l,    ind,ts,ds,as_,i,c,p,q,nv,tp,tcl) {
+    ind=""; ts=tgt_l
+    while (length(ts) && (substr(ts,1,1)==" "||substr(ts,1,1)=="\t")) {
+      ind=ind substr(ts,1,1); ts=substr(ts,2)
+    }
+    ds=del_l; gsub(/^[[:space:]]+/,"",ds)
+    as_=add_l; gsub(/^[[:space:]]+/,"",as_)
+
+    # YAML: key: value  →  preserve "key: ", replace value
+    p=0; for (i=1;i<=length(ds);i++) { if (substr(ds,i,1)==":") { c=substr(ds,i+1,1); if (c==" "||c=="\t"||c=="") {p=i;break} } }
+    q=0; for (i=1;i<=length(as_);i++) { if (substr(as_,i,1)==":") { c=substr(as_,i+1,1); if (c==" "||c=="\t"||c=="") {q=i;break} } }
+    if (p>0 && q>0) {
+      nv=substr(as_,q+1); gsub(/^[[:space:]]+/,"",nv)
+      return ind substr(ds,1,p) " " nv
+    }
+
+    # XML single-line: <tag>value</tag>  →  preserve tag, replace content
+    if (substr(ds,1,1)=="<" && index(ds,"</")>0 && substr(as_,1,1)=="<") {
+      p=index(as_,">"); q=index(as_,"</")
+      if (p>0 && q>0) {
+        nv=substr(as_,p+1,q-p-1)
+        tp=index(ts,">"); tcl=index(ts,"</")
+        if (tp>0 && tcl>0) return ind substr(ts,1,tp) nv substr(ts,tcl)
+        p=index(ds,">"); q=index(ds,"</")
+        if (p>0 && q>0) return ind substr(ds,1,p) nv substr(ds,q)
+      }
+    }
+
+    # Properties: key=value  →  preserve key=, replace value
+    p=index(ds,"="); q=index(as_,"=")
+    if (p>0 && q>0) return ind substr(ds,1,p) substr(as_,q+1)
+
+    return ""
+  }
+
+  function do_inject(h, loc,    i,n,nn,nt) {
+    n=del_count[h]; if (loc+n-1>tline) n=tline-loc+1
+    nn=0; split("",nt)
+    for (i=1;    i<loc;    i++) nt[++nn]=tgt[i]
+    nt[++nn]="<<<<<<< target (ours)"
+    for (i=loc;  i<loc+n;  i++) nt[++nn]=tgt[i]
+    nt[++nn]="======="
+    for (i=1; i<=add_count[h]; i++) nt[++nn]=add_lines[h,i]
+    nt[++nn]=">>>>>>> source patch (" from_ref " -> " to_ref ")"
+    for (i=loc+n; i<=tline; i++) nt[++nn]=tgt[i]
+    tline=nn; for (i=1;i<=nn;i++) tgt[i]=nt[i]
+  }
+
+  function do_append(h,    i,nn,nt) {
+    nn=0; split("",nt)
+    for (i=1; i<=tline; i++) nt[++nn]=tgt[i]
+    nt[++nn]="# CONFLICT: patch hunk could not be located in target"
+    nt[++nn]="<<<<<<< target (ours -- context not matched)"
+    for (i=1; i<=del_count[h]; i++) nt[++nn]="# expected: " del_lines[h,i]
+    nt[++nn]="======="
+    for (i=1; i<=add_count[h]; i++) nt[++nn]=add_lines[h,i]
+    nt[++nn]=">>>>>>> source patch (" from_ref " -> " to_ref ")"
+    tline=nn; for (i=1;i<=nn;i++) tgt[i]=nt[i]
   }
   ' "$rej_file" "$tgt_abs" > "$tmp"
-
+  local awk_rc=$?
   mv "$tmp" "$tgt_abs"
+  return $awk_rc
 }
 
 # Patch-based file sync for modified files.
@@ -736,12 +830,22 @@ patch_merge_file() {
     return 0
   fi
 
-  # patch_rc == 1 with genuine rejected hunks — inject conflict markers
-  log_warn "pm: rejected hunk(s) in $tgt_path — injecting conflict markers"
-  _inject_rej_conflicts "$tgt_abs" "$rej_file" "$FROM_REF" "$TO_REF"
+  # patch_rc == 1 with genuine rejected hunks.
+  # Try key-value replacement first; only write conflict markers for hunks that
+  # cannot be resolved that way.  inj_rc=0 means all resolved cleanly.
+  log_warn "pm: rejected hunk(s) in $tgt_path — attempting key-value resolution"
+  local inj_rc=0
+  _inject_rej_conflicts "$tgt_abs" "$rej_file" "$FROM_REF" "$TO_REF" || inj_rc=$?
   rm -f "$rej_file"
 
-  # Register git index stages 1/2/3 so git mergetool opens the three-way dialog
+  if [[ $inj_rc -eq 0 ]]; then
+    log_info "pm: all rejected hunk(s) resolved by key-value replacement in $tgt_path"
+    rm -f "$base" "$theirs" "$ours_save"
+    return 0
+  fi
+
+  # Conflict markers were written — register git index stages 1/2/3 so
+  # git mergetool opens the three-way dialog in IntelliJ
   local base_hash ours_hash theirs_hash
   base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
