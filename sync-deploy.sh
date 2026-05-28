@@ -879,11 +879,6 @@ patch_merge_file() {
     return 0
   fi
 
-  # Save pre-patch target for git index stage 2 (needed if conflict)
-  local ours_save
-  ours_save=$(mktemp "$WORK_DIR/.pm_ours_XXXXXX")
-  cp "$tgt_abs" "$ours_save"
-
   # Apply patch; fuzz=3 tolerates minor context drift between source and target.
   # --forward: skip hunks that are already applied (no interactive prompt).
   local rej_file patch_rc=0
@@ -894,19 +889,19 @@ patch_merge_file() {
   rm -f "$patch_file"
 
   if [[ $patch_rc -eq 0 ]]; then
-    rm -f "$base" "$theirs" "$ours_save" "$rej_file"
+    rm -f "$base" "$theirs" "$rej_file"
     return 0
   fi
 
   if [[ $patch_rc -gt 1 ]]; then
     log_error "patch error ($patch_rc) on $tgt_path"
-    rm -f "$base" "$theirs" "$ours_save" "$rej_file"
+    rm -f "$base" "$theirs" "$rej_file"
     return 2
   fi
 
   # patch_rc == 1 but rej file empty: all hunks were already applied — nothing to do
   if [[ ! -s "$rej_file" ]]; then
-    rm -f "$base" "$theirs" "$ours_save" "$rej_file"
+    rm -f "$base" "$theirs" "$rej_file"
     return 0
   fi
 
@@ -920,24 +915,37 @@ patch_merge_file() {
 
   if [[ $inj_rc -eq 0 ]]; then
     log_info "pm: all rejected hunk(s) resolved by key-value in $tgt_path"
-    rm -f "$base" "$theirs" "$ours_save"
+    rm -f "$base" "$theirs"
     return 0
   fi
 
-  # Conflict markers were written — register git index stages 1/2/3 so
+  # Conflict markers were written.  Derive ours/theirs versions from the
+  # marker file so that stage 2 and stage 3 differ ONLY at the conflict
+  # locations.  This means IntelliJ's merge dialog shows ONLY the rejected
+  # hunks as conflicts — every successfully patched line is identical in
+  # both panels and needs no user interaction.
+  #
+  # Stage 1 = stage 2 = ours_ver  (patched result, ours side at conflicts)
+  # Stage 3              theirs_ver (patched result, theirs side at conflicts)
   log_warn "pm: unresolved conflict(s) in $tgt_path — needs manual merge"
-  # git mergetool opens the three-way dialog in IntelliJ
-  local base_hash ours_hash theirs_hash
-  base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
-  ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
-  theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
+  local ours_ver theirs_ver
+  ours_ver=$(mktemp  "$WORK_DIR/.pm_ours_ver_XXXXXX")
+  theirs_ver=$(mktemp "$WORK_DIR/.pm_theirs_ver_XXXXXX")
+  # ours_ver:   remove ======= … >>>>>>> blocks, remove bare <<<<<<< lines
+  sed '/^=======/,/^>>>>>>>/d; /^<<<<<<</d'     "$tgt_abs" > "$ours_ver"
+  # theirs_ver: remove <<<<<<< … ======= blocks, remove bare >>>>>>> lines
+  sed '/^<<<<<<<[^<]/,/^=======/d; /^>>>>>>>/d' "$tgt_abs" > "$theirs_ver"
+
+  local ours_hash theirs_hash
+  ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_ver")
+  theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs_ver")
   {
-    printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
+    printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
     printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
     printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
   } | git -C "$tgt_dir" update-index --index-info
 
-  rm -f "$base" "$theirs" "$ours_save"
+  rm -f "$base" "$theirs" "$ours_ver" "$theirs_ver"
   return 1
 }
 

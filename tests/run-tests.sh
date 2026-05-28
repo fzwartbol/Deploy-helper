@@ -1855,6 +1855,43 @@ has     "$H/pom.xml"  "<version>3.0.0</version>"  "project version 3.0.0 not ove
 has     "$H/pom.xml"  "<version>5.0.0</version>"  "dependency version 5.0.0 untouched"
 has     "$H/pom.xml"  "<<<<<<<"                   "conflict markers written for unlocatable parent version"
 
+# ── stage setup: stages 2 and 3 differ only at conflict locations ─────────────
+# The key UX fix: stages are derived from the conflict-marker file so that
+# IntelliJ's merge dialog shows ONLY the rejected-hunk regions as conflicts.
+# Successfully-patched lines must be identical in stage 2 and stage 3.
+section "app-h  stage setup — stage 2 and 3 differ only at conflict location"
+_stage2=$(git -C "$H" cat-file blob :2:pom.xml 2>/dev/null || true)
+_stage3=$(git -C "$H" cat-file blob :3:pom.xml 2>/dev/null || true)
+# Both stages must exist
+if [[ -z "$_stage2" || -z "$_stage3" ]]; then
+  fail "stage 2 or 3 missing for pom.xml"
+else
+  ok "stage 2 and stage 3 registered for pom.xml"
+  # Stage 2 must NOT contain the theirs version change (1.1.0) — it should have ours side
+  if echo "$_stage2" | grep -qF "1.1.0"; then
+    fail "stage 2 should not contain theirs version 1.1.0"
+  else
+    ok "stage 2 does not contain source version 1.1.0 (correct ours-side content)"
+  fi
+  # Stage 3 must contain the theirs version (1.1.0) from the source patch
+  if echo "$_stage3" | grep -qF "1.1.0"; then
+    ok "stage 3 contains source version 1.1.0 (correct theirs-side content)"
+  else
+    fail "stage 3 should contain theirs version 1.1.0"
+  fi
+  # Crucially: lines NOT at conflict locations must be identical in both stages
+  # The project <version>3.0.0</version> and dependency <version>5.0.0</version>
+  # should appear identically in both stages (no spurious whole-file conflict)
+  _s2_v3=$(echo "$_stage2" | grep -c "3.0.0" || true)
+  _s3_v3=$(echo "$_stage3" | grep -c "3.0.0" || true)
+  if [[ "$_s2_v3" == "$_s3_v3" && "$_s2_v3" -gt 0 ]]; then
+    ok "project version 3.0.0 identical in stage 2 and stage 3 (not a conflict)"
+  else
+    fail "project version 3.0.0 differs between stages (spurious conflict)"
+  fi
+fi
+unset _stage2 _stage3 _s2_v3 _s3_v3
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
