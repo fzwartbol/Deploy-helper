@@ -1270,6 +1270,82 @@ EOF
 with_work "app-h-kv" "" app_h_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SOURCE INJ REPO  (testspace/source-inj-repo)
+# Exercises two new fallback paths:
+#   app.xml   — del_count=1, add_count=2 (unequal counts) with context that
+#               doesn't match target → try_inject_by_key places conflict at
+#               correct <mode> line instead of appending to file end.
+#   legacy.xml — pure deletion hunk (add_count=0) whose context doesn't match
+#               target but exact del-line value matches → try_apply_global
+#               auto-deletes the line cleanly.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-inj-repo"
+
+source_inj_v1() {
+  cat > app.xml <<'EOF'
+<application>
+  <context>original</context>
+  <mode>simple</mode>
+</application>
+EOF
+
+  cat > legacy.xml <<'EOF'
+<legacy>
+  <section-origin>from-source</section-origin>
+  <item>remove-this</item>
+</legacy>
+EOF
+}
+with_work "source-inj-repo" "v1.0.0" source_inj_v1
+
+source_inj_v2() {
+  # mode: one line becomes two (del_count=1, add_count=2)
+  cat > app.xml <<'EOF'
+<application>
+  <context>original</context>
+  <mode>advanced</mode>
+  <plugin>enabled</plugin>
+</application>
+EOF
+
+  # legacy.xml: pure deletion of <item> line (add_count=0)
+  cat > legacy.xml <<'EOF'
+<legacy>
+  <section-origin>from-source</section-origin>
+</legacy>
+EOF
+}
+with_work "source-inj-repo" "v1.1.0" source_inj_v2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET INJ REPO: app-l  (testspace/app-l-inj)
+# app.xml  — context line differs (customized vs original) so find_loc fails.
+#            The <mode> key IS present → try_inject_by_key places conflict there.
+# legacy.xml — context line differs but <item>remove-this</item> is verbatim
+#              from source_A → try_apply_global (exact_del) auto-deletes it.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-l-inj"
+
+app_l_initial() {
+  # <context> value differs from source → patch context won't match
+  cat > app.xml <<'EOF'
+<application>
+  <context>customized</context>
+  <mode>enterprise</mode>
+</application>
+EOF
+
+  # <section-diff> differs from source context, but <item> is verbatim
+  cat > legacy.xml <<'EOF'
+<legacy>
+  <section-diff>different-context</section-diff>
+  <item>remove-this</item>
+</legacy>
+EOF
+}
+with_work "app-l-inj" "" app_l_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generate test repos.json pointing to our local testspace/ repos
 # Uses the new grouped "apps" structure
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1436,6 +1512,28 @@ cat > "$T/repos.test.json" <<'EOF'
           "app_name":     "app-h",
           "java_package": "com.app.h",
           "java_path":    "com/app/h"
+        }
+      }
+    },
+    {
+      "name": "source-inj",
+      "app": {
+        "repo": "testspace/source-inj-repo",
+        "substitutions": {
+          "app_name":     "source-inj",
+          "java_package": "com.source.inj",
+          "java_path":    "com/source/inj"
+        }
+      }
+    },
+    {
+      "name": "app-l",
+      "app": {
+        "repo": "testspace/app-l-inj",
+        "substitutions": {
+          "app_name":     "app-l",
+          "java_package": "com.app.l",
+          "java_path":    "com/app/l"
         }
       }
     }
@@ -1891,6 +1989,51 @@ else
   fi
 fi
 unset _stage2 _stage3 _s2_v3 _s3_v3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5th sync: app-l — try_inject_by_key and deletion auto-apply
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (app type diff mode: source-inj → app-l, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-inj \
+  --type    app \
+  --targets app-l \
+  --from    v1.0.0 \
+  --to      v1.1.0 || true   # conflict in app.xml → exit 1 expected
+
+L="$WORK_DIR/app-l"
+
+# ── try_inject_by_key: conflict placed at correct key location ────────────────
+# del_count=1, add_count=2 (unequal counts) → try_apply/try_apply_global skip.
+# Context before (<context>original</context>) doesn't match target
+# (<context>customized</context>) → find_loc returns 0, best=0.
+# try_inject_by_key scans for <mode key → finds <mode>enterprise</mode> at the
+# correct line and calls do_inject there instead of appending to file end.
+section "app-l  try_inject_by_key — conflict placed at <mode> line, not file end"
+has     "$L/app.xml"  "<<<<<<<"                      "conflict marker written for unequal-count hunk"
+has     "$L/app.xml"  "<mode>enterprise</mode>"      "ours side contains current target value"
+has     "$L/app.xml"  "<mode>advanced</mode>"         "theirs side contains desired new value"
+has     "$L/app.xml"  "<plugin>enabled</plugin>"      "theirs side contains new add-only line"
+# Verify conflict is NOT at end of file: </application> must appear AFTER >>>>>>>
+_app_xml=$(cat "$L/app.xml")
+_theirs_line=$(echo "$_app_xml" | grep -n ">>>>>>>" | tail -1 | cut -d: -f1)
+_close_line=$(echo  "$_app_xml" | grep -n "</application>" | tail -1 | cut -d: -f1)
+if [[ -n "$_theirs_line" && -n "$_close_line" && "$_close_line" -gt "$_theirs_line" ]]; then
+  ok "closing </application> tag appears after conflict block (conflict not at file end)"
+else
+  fail "conflict appears to be at file end — try_inject_by_key may not have fired"
+fi
+unset _app_xml _theirs_line _close_line
+
+# ── deletion auto-apply: try_apply_global exact_del path ─────────────────────
+# add_count=0: pure deletion hunk.  Context (<section-origin>) doesn't match
+# target (<section-diff>) so patch rejects it and find_loc returns 0.
+# try_apply_global with exact_del=1 finds the verbatim <item> line and deletes it.
+section "app-l  deletion auto-apply — <item> line removed cleanly when exact match found"
+has_not "$L/legacy.xml"  "<item>remove-this</item>"  "<item> line auto-deleted (no conflict needed)"
+has     "$L/legacy.xml"  "<section-diff>"             "surrounding target content preserved"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary

@@ -602,9 +602,11 @@ _inject_rej_conflicts() {
       if (kloc && try_apply(h,kloc)) continue
       # Level 3: no context found at all — scan entire file for del-lines by key
       if (!eloc && !kloc && try_apply_global(h)) continue
+      # Level 4: value mismatch or make_val failed — conflict at correct key location
       best=(eloc>0) ? eloc : kloc
-      if (best) do_inject(h,best)
-      else      do_append(h)
+      if (best)                    do_inject(h, best)
+      else if (try_inject_by_key(h)) { had_conflict=1; continue }
+      else                         do_append(h)
       had_conflict=1
     }
     for (i=1; i<=tline; i++) print tgt[i]
@@ -652,26 +654,37 @@ _inject_rej_conflicts() {
     return 0
   }
 
-  # Try key-value replacement at loc; return 1=applied 0=not applicable
-  function try_apply(h, loc,    i,j,dloc,nl,nn,nt,ok) {
-    if (!del_count[h] || del_count[h]!=add_count[h]) return 0
-    # Find del lines by key within a 30-line window after loc
+  # Try key-value replacement (or pure deletion) at loc; return 1=applied 0=not applicable
+  function try_apply(h, loc,    i,j,dloc,nl,nn,nt,ok,exact_del) {
+    if (!del_count[h]) return 0
+    if (del_count[h]!=add_count[h] && add_count[h]!=0) return 0
+    exact_del=(add_count[h]==0)
+    # Find del lines within a 30-line window after loc
     dloc=0
     for (i=loc; i<=loc+30 && i+del_count[h]-1<=tline; i++) {
       ok=1
-      for (j=1;j<=del_count[h];j++) if (!lmatch(tgt[i+j-1],del_lines[h,j],0)) {ok=0;break}
+      if (exact_del) {
+        for (j=1;j<=del_count[h];j++) if (tgt[i+j-1]!=del_lines[h,j]) {ok=0;break}
+      } else {
+        for (j=1;j<=del_count[h];j++) if (!lmatch(tgt[i+j-1],del_lines[h,j],0)) {ok=0;break}
+      }
       if (ok) { dloc=i; break }
     }
     if (!dloc) return 0
-    # Build replacement; abort if any line cannot be rewritten
     nn=0; split("",nt)
     for (i=1; i<dloc; i++) nt[++nn]=tgt[i]
-    for (j=1; j<=del_count[h]; j++) {
-      nl=make_val(tgt[dloc+j-1], del_lines[h,j], add_lines[h,j])
-      if (nl=="") return 0
-      nt[++nn]=nl
+    if (exact_del) {
+      # Pure deletion: drop the matched lines
+      for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
+    } else {
+      # Key-value replacement; abort if any line cannot be rewritten
+      for (j=1; j<=del_count[h]; j++) {
+        nl=make_val(tgt[dloc+j-1], del_lines[h,j], add_lines[h,j])
+        if (nl=="") return 0
+        nt[++nn]=nl
+      }
+      for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
     }
-    for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
     tline=nn; for (i=1;i<=nn;i++) tgt[i]=nt[i]
     return 1
   }
@@ -682,26 +695,59 @@ _inject_rej_conflicts() {
   # checks that the candidate is nested inside the same parent element that
   # surrounds the hunk in the diff (hunk_container), preventing a <version>
   # inside <dependencies> from being updated when the diff targets <parent>.
-  function try_apply_global(h,    i,j,dloc,nl,nn,nt,ok,container) {
-    if (!del_count[h] || del_count[h]!=add_count[h]) return 0
+  # Handles pure deletions (add_count==0) when values match exactly.
+  function try_apply_global(h,    i,j,dloc,nl,nn,nt,ok,container,exact_del) {
+    if (!del_count[h]) return 0
+    if (del_count[h]!=add_count[h] && add_count[h]!=0) return 0
+    exact_del=(add_count[h]==0)
     container=hunk_container(h)
     dloc=0
     for (i=1; i<=tline-del_count[h]+1; i++) {
       ok=1
-      for (j=1;j<=del_count[h];j++) if (!lmatch(tgt[i+j-1],del_lines[h,j],0)) {ok=0;break}
+      if (exact_del) {
+        for (j=1;j<=del_count[h];j++) if (tgt[i+j-1]!=del_lines[h,j]) {ok=0;break}
+      } else {
+        for (j=1;j<=del_count[h];j++) if (!lmatch(tgt[i+j-1],del_lines[h,j],0)) {ok=0;break}
+      }
       if (ok && !in_xml_container(i, container)) ok=0
       if (ok) { dloc=i; break }
     }
     if (!dloc) return 0
     nn=0; split("",nt)
     for (i=1; i<dloc; i++) nt[++nn]=tgt[i]
-    for (j=1; j<=del_count[h]; j++) {
-      nl=make_val(tgt[dloc+j-1], del_lines[h,j], add_lines[h,j])
-      if (nl=="") return 0
-      nt[++nn]=nl
+    if (exact_del) {
+      for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
+    } else {
+      for (j=1; j<=del_count[h]; j++) {
+        nl=make_val(tgt[dloc+j-1], del_lines[h,j], add_lines[h,j])
+        if (nl=="") return 0
+        nt[++nn]=nl
+      }
+      for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
     }
-    for (i=dloc+del_count[h]; i<=tline; i++) nt[++nn]=tgt[i]
     tline=nn; for (i=1;i<=nn;i++) tgt[i]=nt[i]
+    return 1
+  }
+
+  # Locate hunk by structural key alone (ignoring value), then inject a conflict
+  # marker at that position.  Called when every value-based strategy has failed
+  # (e.g. target value diverged from source_A so make_val cannot rewrite it, or
+  # del/add counts differ).  Container-aware for XML files.
+  function try_inject_by_key(h,    i,j,dloc,ok,container,k) {
+    if (!del_count[h]) return 0
+    container=hunk_container(h)
+    dloc=0
+    for (i=1; i<=tline-del_count[h]+1; i++) {
+      ok=1
+      for (j=1; j<=del_count[h]; j++) {
+        k=lkey(del_lines[h,j])
+        if (k=="" || lkey(tgt[i+j-1])!=k) { ok=0; break }
+      }
+      if (ok && !in_xml_container(i, container)) ok=0
+      if (ok) { dloc=i; break }
+    }
+    if (!dloc) return 0
+    do_inject(h, dloc)
     return 1
   }
 
@@ -808,7 +854,7 @@ _inject_rej_conflicts() {
     for (i=1; i<=tline; i++) nt[++nn]=tgt[i]
     nt[++nn]="# CONFLICT: patch hunk could not be located in target"
     nt[++nn]="<<<<<<< target (ours -- context not matched)"
-    for (i=1; i<=del_count[h]; i++) nt[++nn]="# expected: " del_lines[h,i]
+    for (i=1; i<=del_count[h]; i++) nt[++nn]=del_lines[h,i]
     nt[++nn]="======="
     for (i=1; i<=add_count[h]; i++) nt[++nn]=add_lines[h,i]
     nt[++nn]=">>>>>>> source patch (" from_ref " -> " to_ref ")"
@@ -883,7 +929,7 @@ patch_merge_file() {
   # --forward: skip hunks that are already applied (no interactive prompt).
   local rej_file patch_rc=0
   rej_file=$(mktemp "$WORK_DIR/.pm_rej_XXXXXX")
-  patch --no-backup-if-mismatch --forward --fuzz=3 \
+  patch --no-backup-if-mismatch --forward --fuzz=3 --ignore-whitespace \
     --reject-file="$rej_file" \
     "$tgt_abs" < "$patch_file" 2>/dev/null || patch_rc=$?
   rm -f "$patch_file"
