@@ -555,63 +555,15 @@ neutralize_configmap_keys() {
   ' "$target" "$theirs" > "$theirs.tmp" && mv "$theirs.tmp" "$theirs"
 }
 
-# Inject a conflict-marker block for every diff hunk between tgt_abs and theirs.
-# Unchanged lines pass through; each hunk becomes <<<<<<< / ======= / >>>>>>> blocks.
-_inject_diff_conflicts() {
-  local tgt_abs="$1" theirs="$2" label_ours="$3" label_theirs="$4"
-  local tmp
-  tmp=$(mktemp "$WORK_DIR/.idc_XXXXXX")
 
-  diff -U 0 "$tgt_abs" "$theirs" | awk \
-    -v tgt="$tgt_abs" \
-    -v lo="$label_ours" \
-    -v lt="$label_theirs" '
-  BEGIN {
-    n = 0
-    while ((getline line < tgt) > 0) lines[++n] = line
-    pos = 0; del_n = 0; add_n = 0
-  }
-  /^(---|\+\+\+)/ { next }
-  /^@@/ {
-    if (del_n + add_n > 0) _flush()
-    s = $0; sub(/^@@ -/, "", s)
-    split(s, a, " "); split(a[1], b, ",")
-    old_start = b[1]+0
-    old_count = (length(b) > 1) ? b[2]+0 : 1
-    upto = (old_count > 0) ? old_start - 1 : old_start
-    while (pos < upto) { pos++; print lines[pos] }
-    del_n = 0; add_n = 0
-    next
-  }
-  /^-/ { del_buf[++del_n] = substr($0, 2); next }
-  /^\+/ { add_buf[++add_n] = substr($0, 2); next }
-  END {
-    if (del_n + add_n > 0) _flush()
-    while (pos < n) { pos++; print lines[pos] }
-  }
-  function _flush(    i) {
-    print "<<<<<<< " lo
-    for (i = 1; i <= del_n; i++) print del_buf[i]
-    print "======="
-    for (i = 1; i <= add_n; i++) print add_buf[i]
-    print ">>>>>>> " lt
-    pos += del_n; del_n = 0; add_n = 0
-    split("", del_buf); split("", add_buf)
-  }
-  ' > "$tmp"
-
-  mv "$tmp" "$tgt_abs"
-}
-
-
-# Inject a conflict marker for every diff hunk between target and source_B.
+# Set stages so IntelliJ opens the 3-way merge tool showing source_B changes.
 #
 # Neutralises env-specific content (image tags, protected ConfigMap keys)
-# so those lines never appear as diffs.  Unchanged lines pass through.
+# so those lines never appear as diffs.  Working tree stays as clean target.
 # Stage 1 = Stage 2 = target original (LEFT panel: clean, no highlights).
-# Stage 3 = source_B (RIGHT panel: all differences highlighted).
+# Stage 3 = source_B (RIGHT panel: all diffs highlighted GREEN — theirs-only).
 #
-# Returns: 0=already in sync (no diffs), 1=conflict markers written, 2=error
+# Returns: 0=already in sync (no diffs), 1=stages set (needs manual merge)
 patch_merge_file() {
   local orig_src="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
 
@@ -664,16 +616,12 @@ patch_merge_file() {
   ours_save=$(mktemp "$WORK_DIR/.pm_ours_save_XXXXXX")
   cp "$tgt_abs" "$ours_save"
 
-  # Write conflict markers for every diff hunk: target lines in ours section,
-  # source_B lines in theirs section.  Unchanged lines pass through unchanged.
-  _inject_diff_conflicts "$tgt_abs" "$theirs" \
-    "target (ours)" "source (${TO_REF})"
-
   log_warn "pm: diffs in $tgt_path — needs manual merge"
 
   # Register stages for IntelliJ 3-way merge dialog:
   #   Stage 1 = Stage 2 = target original → left panel is clean (no highlights)
-  #   Stage 3 = source_B                  → right panel has all diffs highlighted
+  #   Stage 3 = source_B                  → right panel has all diffs GREEN
+  #                                          (theirs-only — left never changed)
   local ours_hash theirs_hash
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
   theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")

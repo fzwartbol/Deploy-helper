@@ -49,6 +49,12 @@ has()     { grep -qF  "$2" "$1" 2>/dev/null && ok  "$3" || fail "$3  [missing '$
 has_not() { grep -qF  "$2" "$1" 2>/dev/null && fail "$3  [found '$2' in ${1##"$WORK_DIR/"}]" || ok "$3"; }
 exists()  { [[ -f "$1" ]] && ok  "${2:-${1##"$WORK_DIR/"} exists}"  || fail "${2:-${1##"$WORK_DIR/"} exists}"; }
 absent()  { [[ ! -f "$1" ]] && ok "${2:-${1##"$WORK_DIR/"} absent}" || fail "${2:-${1##"$WORK_DIR/"} absent}"; }
+# has_stage3 REPO REL_PATH PATTERN MSG — checks git stage 3 (theirs/right panel)
+has_stage3() {
+  local _s3
+  _s3=$(git -C "$1" cat-file blob ":3:$2" 2>/dev/null || true)
+  echo "$_s3" | grep -qF -- "$3" 2>/dev/null && ok "$4" || fail "$4  [missing '$3' in stage 3:$2]"
+}
 
 # ── mock curl (Bitbucket PR API) ──────────────────────────────────────────────
 mkdir -p "$T/bin"
@@ -1564,9 +1570,9 @@ C="$WORK_DIR/app-c"
 
 # ── app-a: ConfigMap (M) ──────────────────────────────────────────────────────
 section "app-a  ConfigMap — three-way merge"
-has     "$A/base/configmap.yaml"  "APP_SETTING: updated-value"  "non-protected key updated"
-has     "$A/base/configmap.yaml"  "NEW_SETTING: new-feature-enabled"  "new key added"
-has     "$A/base/configmap.yaml"  "SERVICE_NAME: app-a-service"  "app substitution applied to value"
+has_stage3 "$A" "base/configmap.yaml"  "APP_SETTING: updated-value"        "non-protected key in stage 3 right panel"
+has_stage3 "$A" "base/configmap.yaml"  "NEW_SETTING: new-feature-enabled"  "new key in stage 3 right panel"
+has        "$A/base/configmap.yaml"  "SERVICE_NAME: app-a-service"  "app substitution applied to value"
 # DATABASE_URL is in protected_configmap_keys → must stay as app-a's own value
 has     "$A/base/configmap.yaml"  "DATABASE_URL: app-a-postgres.ns-a.svc.cluster.local"  "protected DATABASE_URL preserved from target"
 has_not "$A/base/configmap.yaml"  "DATABASE_URL: changed-db.internal"  "source DATABASE_URL NOT copied"
@@ -1580,7 +1586,7 @@ section "app-a  Deployment — image tag preserved"
 has     "$A/base/deployment.yaml"  "image: image-a:app-a-prod-1.5.0"  "image tag preserved from target"
 has_not "$A/base/deployment.yaml"  "image: image-a:v2.0.0"            "source image tag NOT copied"
 has_not "$A/base/deployment.yaml"  "image: source-image"              "source image name NOT present"
-has     "$A/base/deployment.yaml"  "NEW_FEATURE"                      "new env var added from source"
+has_stage3 "$A" "base/deployment.yaml"  "NEW_FEATURE"  "new env var in stage 3 right panel"
 has     "$A/base/deployment.yaml"  "serviceAccountName: sa-a"         "service account substituted"
 has     "$A/base/deployment.yaml"  "namespace: ns-a"                  "namespace substituted"
 
@@ -1620,8 +1626,8 @@ has_not "$A/overlays/staging/sealed-secret.yaml"  "SourceEncryptedPassword=="   
 
 # ── app-b: ConfigMap (M) ─────────────────────────────────────────────────────
 section "app-b  ConfigMap — substitutions and protected key"
-has     "$B/base/configmap.yaml"  "APP_SETTING: updated-value"   "non-protected key updated in app-b"
-has     "$B/base/configmap.yaml"  "NEW_SETTING: new-feature-enabled"  "new key added in app-b"
+has_stage3 "$B" "base/configmap.yaml"  "APP_SETTING: updated-value"        "non-protected key in stage 3 right panel"
+has_stage3 "$B" "base/configmap.yaml"  "NEW_SETTING: new-feature-enabled"  "new key in stage 3 right panel"
 has     "$B/base/configmap.yaml"  "DATABASE_URL: app-b-postgres.ns-b.svc.cluster.local"  "protected DATABASE_URL preserved in app-b"
 has_not "$B/base/configmap.yaml"  "DATABASE_URL: changed-db.internal"  "source DATABASE_URL not in app-b"
 has     "$B/base/configmap.yaml"  "SERVICE_NAME: app-b-service"  "app-b service name substituted"
@@ -1629,7 +1635,7 @@ has     "$B/base/configmap.yaml"  "SERVICE_NAME: app-b-service"  "app-b service 
 # ── app-b: Deployment (M) ────────────────────────────────────────────────────
 section "app-b  Deployment — image tag preserved"
 has     "$B/base/deployment.yaml"  "image: image-b:app-b-release-2.1.0"  "image tag preserved in app-b"
-has     "$B/base/deployment.yaml"  "NEW_FEATURE"                          "new env var added in app-b"
+has_stage3 "$B" "base/deployment.yaml"  "NEW_FEATURE"  "new env var in stage 3 right panel"
 has     "$B/base/deployment.yaml"  "serviceAccountName: sa-b"             "app-b service account"
 
 # ── app-b: Deletion ───────────────────────────────────────────────────────────
@@ -1659,7 +1665,7 @@ has     "$A/overlays/dev/kustomization.yaml"  "newTag: app-a-custom-v1.5.0"  "ta
 has_not "$A/overlays/dev/kustomization.yaml"  "newTag: v2.0.0"               "source newTag not copied"
 has_not "$A/overlays/dev/kustomization.yaml"  "newTag: v1.0.0"               "base newTag not copied either"
 has     "$A/overlays/dev/kustomization.yaml"  "name: image-a"                "image name substituted"
-has     "$A/overlays/dev/kustomization.yaml"  "app-a-configmap-v2.yaml"      "resources reference updated to v2"
+has_stage3 "$A" "overlays/dev/kustomization.yaml"  "app-a-configmap-v2.yaml"  "v2 reference in stage 3 right panel"
 has     "$A/overlays/dev/kustomization.yaml"  "app-a-configmap-v1.yaml"      "v1 reference in conflict ours section (click >> to accept v2)"
 has_not "$A/overlays/dev/kustomization.yaml"  "source-image"                 "no source-image in kustomization"
 
@@ -1677,7 +1683,7 @@ has_not "$B/overlays/dev/kustomization.yaml"  "source-image"                 "no
 # Changes go to the matching dir in every target; other env dirs are untouched.
 section "environment kustomization.yaml — same structure, teamscope updated"
 exists  "$A/services/environment/teamscope/kustomization.yaml"             "teamscope exists in app-a"
-has     "$A/services/environment/teamscope/kustomization.yaml"  "MARKER=teamscope-v2"   "teamscope updated in app-a"
+has_stage3 "$A" "services/environment/teamscope/kustomization.yaml"  "MARKER=teamscope-v2"  "teamscope v2 in stage 3 right panel (app-a)"
 has     "$A/services/environment/teamscope/kustomization.yaml"  "app-a-teamscope"        "app-a name substituted in teamscope"
 has_not "$A/services/environment/teamscope/kustomization.yaml"  "source-app"             "source name not present in app-a teamscope"
 has     "$A/services/environment/enva/kustomization.yaml"       "MARKER=app-a-enva-target"  "app-a enva content preserved (not in diff)"
@@ -1685,7 +1691,7 @@ has_not "$A/services/environment/enva/kustomization.yaml"       "MARKER=teamscop
 has     "$A/services/environment/envb/kustomization.yaml"       "MARKER=envb-v1-app-a"   "app-a envb content preserved (not in diff)"
 has_not "$A/services/environment/envb/kustomization.yaml"       "MARKER=teamscope-v2"    "teamscope change not bleed into envb"
 exists  "$B/services/environment/teamscope/kustomization.yaml"             "teamscope exists in app-b"
-has     "$B/services/environment/teamscope/kustomization.yaml"  "MARKER=teamscope-v2"   "teamscope updated in app-b"
+has_stage3 "$B" "services/environment/teamscope/kustomization.yaml"  "MARKER=teamscope-v2"  "teamscope v2 in stage 3 right panel (app-b)"
 has     "$B/services/environment/teamscope/kustomization.yaml"  "app-b-teamscope"        "app-b name substituted in teamscope"
 has_not "$B/services/environment/teamscope/kustomization.yaml"  "source-app"             "source name not present in app-b teamscope"
 has     "$B/services/environment/enva/kustomization.yaml"       "MARKER=enva-v1-app-b"   "app-b enva content preserved (not in diff)"
@@ -1728,28 +1734,28 @@ has     "$B/overlays/staging/app-b-unique-secret.yaml"  "TODO: kubeseal"        
 # ── env/*/default — each kustomization copied to same path, own content only ─
 section "env default dirs — each dir keeps its own content after sync"
 # app-a: teamscope/default
-has     "$A/services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"  "app-a: teamscope/default updated to v2"
-has     "$A/services/environment/teamscope/default/kustomization.yaml"  "ENV=teamscope"                "app-a: teamscope/default has teamscope ENV"
-has_not "$A/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-ont-default"        "app-a: teamscope/default has no vs-ont content"
-has_not "$A/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-tst-default"        "app-a: teamscope/default has no vs-tst content"
+has_stage3 "$A" "services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"  "app-a: teamscope/default v2 in stage 3 right panel"
+has        "$A/services/environment/teamscope/default/kustomization.yaml"  "ENV=teamscope"                "app-a: teamscope/default has teamscope ENV"
+has_not    "$A/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-ont-default"        "app-a: teamscope/default has no vs-ont content"
+has_not    "$A/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-tst-default"        "app-a: teamscope/default has no vs-tst content"
 # app-a: vs-ont/default
-has     "$A/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-ont-default-v2"     "app-a: vs-ont/default updated to v2"
-has     "$A/services/environment/vs-ont/default/kustomization.yaml"     "ENV=vs-ont"                   "app-a: vs-ont/default has vs-ont ENV"
-has_not "$A/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-a: vs-ont/default has no teamscope content"
-has_not "$A/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-tst-default"        "app-a: vs-ont/default has no vs-tst content"
+has_stage3 "$A" "services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-ont-default-v2"     "app-a: vs-ont/default v2 in stage 3 right panel"
+has        "$A/services/environment/vs-ont/default/kustomization.yaml"     "ENV=vs-ont"                   "app-a: vs-ont/default has vs-ont ENV"
+has_not    "$A/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-a: vs-ont/default has no teamscope content"
+has_not    "$A/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-tst-default"        "app-a: vs-ont/default has no vs-tst content"
 # app-a: vs-tst/default
-has     "$A/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-tst-default-v2"     "app-a: vs-tst/default updated to v2"
-has     "$A/services/environment/vs-tst/default/kustomization.yaml"     "ENV=vs-tst"                   "app-a: vs-tst/default has vs-tst ENV"
-has_not "$A/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-a: vs-tst/default has no teamscope content"
-has_not "$A/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-ont-default"        "app-a: vs-tst/default has no vs-ont content"
+has_stage3 "$A" "services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-tst-default-v2"     "app-a: vs-tst/default v2 in stage 3 right panel"
+has        "$A/services/environment/vs-tst/default/kustomization.yaml"     "ENV=vs-tst"                   "app-a: vs-tst/default has vs-tst ENV"
+has_not    "$A/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-a: vs-tst/default has no teamscope content"
+has_not    "$A/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-ont-default"        "app-a: vs-tst/default has no vs-ont content"
 # app-b: same checks
-has     "$B/services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"  "app-b: teamscope/default updated to v2"
-has_not "$B/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-ont-default"        "app-b: teamscope/default has no vs-ont content"
-has_not "$B/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-tst-default"        "app-b: teamscope/default has no vs-tst content"
-has     "$B/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-ont-default-v2"     "app-b: vs-ont/default updated to v2"
-has_not "$B/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-b: vs-ont/default has no teamscope content"
-has     "$B/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-tst-default-v2"     "app-b: vs-tst/default updated to v2"
-has_not "$B/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-b: vs-tst/default has no teamscope content"
+has_stage3 "$B" "services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"  "app-b: teamscope/default v2 in stage 3 right panel"
+has_not    "$B/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-ont-default"        "app-b: teamscope/default has no vs-ont content"
+has_not    "$B/services/environment/teamscope/default/kustomization.yaml"  "MARKER=vs-tst-default"        "app-b: teamscope/default has no vs-tst content"
+has_stage3 "$B" "services/environment/vs-ont/default/kustomization.yaml"     "MARKER=vs-ont-default-v2"     "app-b: vs-ont/default v2 in stage 3 right panel"
+has_not    "$B/services/environment/vs-ont/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-b: vs-ont/default has no teamscope content"
+has_stage3 "$B" "services/environment/vs-tst/default/kustomization.yaml"     "MARKER=vs-tst-default-v2"     "app-b: vs-tst/default v2 in stage 3 right panel"
+has_not    "$B/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=teamscope-default"     "app-b: vs-tst/default has no teamscope content"
 
 # ── app-c: brand-new target dirs — substitutions applied on first copy ────────
 # app-c starts with ONLY teamscope/default.  vs-ont/default and vs-tst/default
@@ -1758,7 +1764,7 @@ has_not "$B/services/environment/vs-tst/default/kustomization.yaml"     "MARKER=
 #   b) substitutions applied (source-app → app-c)
 section "app-c  new target dirs — content correct and substitutions applied"
 exists  "$C/services/environment/teamscope/default/kustomization.yaml"  "app-c: teamscope/default exists"
-has     "$C/services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"      "app-c: teamscope/default updated to v2"
+has_stage3 "$C" "services/environment/teamscope/default/kustomization.yaml"  "MARKER=teamscope-default-v2"  "app-c: teamscope/default v2 in stage 3 right panel"
 has     "$C/services/environment/teamscope/default/kustomization.yaml"  "app-c-teamscope-default"          "app-c: teamscope/default substitution applied"
 has_not "$C/services/environment/teamscope/default/kustomization.yaml"  "source-app"                       "app-c: no source-app in teamscope/default"
 # vs-ont/default: brand new — created from source, substitution applied
@@ -1801,7 +1807,7 @@ has     "$G/overlays/dev/app-g-internal-svc.yaml"  "namespace: ns-g"       "name
 has_not "$G/overlays/dev/app-g-internal-svc.yaml"  "source-app"            "source-app not in auto-derived file"
 
 section "app-g  auto-derived path sub — content and protected key"
-has     "$G/base/configmap.yaml"  "APP_SETTING: updated-value"                          "non-protected key updated in app-g"
+has_stage3 "$G" "base/configmap.yaml"  "APP_SETTING: updated-value"  "non-protected key in stage 3 right panel (app-g)"
 has     "$G/base/configmap.yaml"  "DATABASE_URL: app-g-postgres.ns-g.svc.cluster.local" "protected DATABASE_URL preserved in app-g"
 has_not "$G/base/configmap.yaml"  "DATABASE_URL: changed-db.internal"                   "source DATABASE_URL not in app-g"
 has_not "$G/base/configmap.yaml"  "source-app"                                           "source-app not in app-g configmap"
@@ -1810,7 +1816,7 @@ section "app-g  auto-derived path sub — deletion and image preservation"
 absent  "$G/base/old-feature.yaml"  "old-feature.yaml deleted from app-g"
 has     "$G/base/deployment.yaml"   "image: image-g:app-g-v1.0.0"  "image tag preserved in app-g"
 has_not "$G/base/deployment.yaml"   "source-image"                  "source-image not in app-g deployment"
-has     "$G/base/deployment.yaml"   "NEW_FEATURE"                   "new env var added in app-g"
+has_stage3 "$G" "base/deployment.yaml"  "NEW_FEATURE"  "new env var in stage 3 right panel (app-g)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO: app-e copy mode
@@ -1881,7 +1887,7 @@ F="$WORK_DIR/app-f"
 
 section "app-f  app repo diff — Service.java updated"
 exists  "$F/app-f-core/src/main/java/com/app/f/Service.java"  "Service.java exists at app-f path"
-has     "$F/app-f-core/src/main/java/com/app/f/Service.java"  "version()"         "version() method added from source diff"
+has_stage3 "$F" "app-f-core/src/main/java/com/app/f/Service.java"  "version()"  "version() method in stage 3 right panel"
 has     "$F/app-f-core/src/main/java/com/app/f/Service.java"  "localExtra()"      "localExtra() preserved from target"
 has     "$F/app-f-core/src/main/java/com/app/f/Service.java"  "com.app.f"         "package substituted to com.app.f"
 has_not "$F/app-f-core/src/main/java/com/app/f/Service.java"  "com.source.app"    "source package not present"
@@ -1896,7 +1902,7 @@ section "app-f  app repo diff — OldUtil.java deleted"
 absent  "$F/app-f-core/src/main/java/com/app/f/OldUtil.java"  "OldUtil.java deleted"
 
 section "app-f  app repo diff — pom.xml updated"
-has     "$F/pom.xml"  "Updated description"   "description added from source"
+has_stage3 "$F" "pom.xml"  "Updated description"  "description in stage 3 right panel"
 has     "$F/pom.xml"  "app-f"                 "app-f in pom.xml"
 has_not "$F/pom.xml"  "source-app"            "source-app not in pom.xml"
 
@@ -1933,13 +1939,14 @@ bash "$SYNC_SCRIPT" \
 
 H="$WORK_DIR/app-h"
 
-# ── properties file: version diff shown as conflict ──────────────────────────
-# app.version differs between target (2.5.0) and source_B (1.1.0).
-# Both values appear in the conflict block; developer clicks >> to apply 1.1.0.
-section "app-h  properties — version diff in conflict, both values visible"
-has     "$H/app.properties"  "app.version=1.1.0"  "source version 1.1.0 in conflict theirs section"
-has     "$H/app.properties"  "app.name=app-h"     "app name unchanged (no diff)"
-has     "$H/app.properties"  "app.version=2.5.0"  "target version 2.5.0 in conflict ours section"
+# ── properties file: version diff in stages, working tree clean ───────────────
+# app.version differs: target has 2.5.0, source_B has 1.1.0.
+# Working tree stays as clean target; stage 3 has 1.1.0 (shown green in IntelliJ).
+section "app-h  properties — version diff in stages, working tree clean"
+has_not "$H/app.properties"  "app.version=1.1.0"  "source version not in working tree (in stage 3 right panel)"
+has     "$H/app.properties"  "app.name=app-h"     "unchanged line preserved in working tree"
+has     "$H/app.properties"  "app.version=2.5.0"  "target version in clean working tree"
+has_not "$H/app.properties"  "<<<<<<<"             "working tree clean — conflict in git stages"
 
 # ── container discrimination: pom.xml ────────────────────────────────────────
 # Source diff changes <version> inside <parent>.  Target has no <parent> block.
@@ -1950,7 +1957,7 @@ has     "$H/app.properties"  "app.version=2.5.0"  "target version 2.5.0 in confl
 section "app-h  container discrimination — project version preserved"
 has     "$H/pom.xml"  "<version>3.0.0</version>"  "project version 3.0.0 not overwritten by wrong-container match"
 has     "$H/pom.xml"  "<version>5.0.0</version>"  "dependency version 5.0.0 untouched"
-has     "$H/pom.xml"  "<<<<<<<"                   "working tree has conflict markers for every diff"
+has_not "$H/pom.xml"  "<<<<<<<"                   "working tree clean — conflict in git stages"
 
 # ── stage setup: correct LEFT / RIGHT panels for IntelliJ merge dialog ────────
 # Stage 1 = Stage 2 = target original (LEFT panel: clean target, no highlights).
@@ -2020,9 +2027,9 @@ L="$WORK_DIR/app-l"
 # Every diff between target and source_B gets a conflict marker.
 # Target value (<mode>enterprise</mode>) is in ours section.
 # Source value (<mode>advanced</mode> + <plugin>) is in theirs section.
-section "app-l  diff conflicts in working tree, stages set for IntelliJ"
-has     "$L/app.xml"  "<<<<<<<"                  "working tree has conflict markers"
-has     "$L/app.xml"  "<mode>enterprise</mode>"  "target value in conflict ours section"
+section "app-l  diff in stages, working tree clean"
+has_not "$L/app.xml"  "<<<<<<<"                  "working tree clean — conflict in git stages"
+has     "$L/app.xml"  "<mode>enterprise</mode>"  "target value in clean working tree"
 _stg1_app=$(git -C "$L" cat-file blob :1:app.xml 2>/dev/null || true)
 _stg2_app=$(git -C "$L" cat-file blob :2:app.xml 2>/dev/null || true)
 _stg3_app=$(git -C "$L" cat-file blob :3:app.xml 2>/dev/null || true)
@@ -2051,8 +2058,8 @@ unset _stg1_app _stg2_app _stg3_app
 # ── deletion shown as conflict ────────────────────────────────────────────────
 # Source deleted <item>remove-this</item>; target still has it.
 # Conflict marker wraps the deletion: target line in ours, empty in theirs.
-section "app-l  deletion — <item> in conflict ours section, developer clicks >>"
-has     "$L/legacy.xml"  "<item>remove-this</item>"  "<item> in conflict ours section (needs manual resolution)"
+section "app-l  deletion — <item> in stage 2 (right panel shows deletion green)"
+has     "$L/legacy.xml"  "<item>remove-this</item>"  "<item> in working tree (stage 3 right panel shows deletion — click >>)"
 has     "$L/legacy.xml"  "<section-diff>"             "surrounding target content preserved"
 
 # ─────────────────────────────────────────────────────────────────────────────
