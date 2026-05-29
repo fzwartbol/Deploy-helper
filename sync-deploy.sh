@@ -622,10 +622,10 @@ patch_merge_file() {
   # Applying this diff to target keeps target's customisations untouched and
   # highlights only the actual source changes in IntelliJ's right panel.
   #
-  # For hunks whose context does not match target (context-mismatch), we fall
-  # back to key-based substitution (YAML/properties: KEY: old → KEY: new) and,
-  # for pure additions with no context anchor, append to end of stage3 so the
-  # user can still see the source change highlighted on the right.
+  # For hunks whose context does not match target, we fall back to key-based
+  # substitution (YAML/properties KEY: old → KEY: new).  Pure additions with no
+  # paired deletion are inserted after their nearest preceding context key in
+  # target rather than appended at the end, so ordering is preserved.
   local v1v2_diff ours_save stage3
   v1v2_diff=$(mktemp "$WORK_DIR/.pm_v1v2_XXXXXX")
   ours_save=$(mktemp "$WORK_DIR/.pm_ours_save_XXXXXX")
@@ -635,47 +635,74 @@ patch_merge_file() {
 
   diff -U 3 "$base" "$theirs" > "$v1v2_diff" || true
 
-  # Apply v1→v2 patch; --fuzz=3 tolerates minor context drift.
+  # Apply v1→v2 patch with strict context matching (fuzz=0).  Any hunk whose
+  # context does not match target exactly goes to .rej for key-based fallback
+  # below.  Avoiding fuzz means patch never silently misplaces additions at the
+  # end of the file when context lines are absent from target.
   local rej="${stage3}.rej"
-  patch --fuzz=3 "$stage3" < "$v1v2_diff" 2>/dev/null || true
+  patch --fuzz=0 "$stage3" < "$v1v2_diff" 2>/dev/null || true
   rm -f "${stage3}.orig"
 
   # Key-based fallback for rejected hunks.
   # Paired change (- KEY: old  +  KEY: new): find KEY in stage3, swap line.
-  # Pure addition (+ NEW_KEY: val with no matching -): append at end of stage3.
+  # Pure addition (+ KEY: val with no matching -): insert AFTER the last context
+  # key seen before the addition in the hunk; fall back to appending at end only
+  # when no suitable key anchor exists (e.g. structural XML).
   if [[ -f "$rej" ]]; then
     awk '
-      function key(line,  k) {
-        k = line
-        sub(/[[:space:]]*[=:].*/, "", k)
-        gsub(/^[[:space:]]*/, "", k)
-        return (k != line && k != "") ? k : ""
+      function linekey(line,  k, s) {
+        s = line; gsub(/^[[:space:]]+/, "", s)
+        k = s; sub(/[[:space:]]*[=:].*/, "", k)
+        return (k != s && k != "") ? k : ""
       }
       function flush(  i, k, dm) {
         split("", dm)
-        for (i = 1; i <= di; i++) { k = key(dels[i]); if (k) dm[k] = 1 }
+        for (i = 1; i <= di; i++) { k = linekey(dels[i]); if (k) dm[k] = 1 }
         for (i = 1; i <= ai; i++) {
-          k = key(adds[i])
-          if (k && (k in dm)) { repl[k] = adds[i]; delete dm[k] }
-          else                 { added[++nadd] = adds[i] }
+          k = linekey(adds[i])
+          if (k && (k in dm)) {
+            repl[k] = adds[i]; delete dm[k]
+          } else {
+            anchor = ""
+            for (j = pre_n; j >= 1; j--) {
+              ak = linekey(pre_ctx[j])
+              if (ak != "") { anchor = ak; break }
+            }
+            if (anchor != "")
+              anchor_ins[anchor] = anchor_ins[anchor] SUBSEP adds[i]
+            else
+              added[++nadd] = adds[i]
+          }
         }
-        di = ai = 0
+        di = ai = 0; pre_n = 0; saw_chg = 0
       }
-      BEGIN { di = 0; ai = 0; nadd = 0 }
+      BEGIN { di = ai = nadd = pre_n = saw_chg = 0 }
       NR == FNR {
-        if (/^--- |^\+\+\+ |^\\/)  { next }
-        if (/^@@ /)                { flush(); next }
-        if (/^-/)                  { dels[++di] = substr($0, 2); next }
-        if (/^\+/)                 { adds[++ai] = substr($0, 2); next }
+        if (/^--- |^\+\+\+ |^\\/) next
+        if (/^@@ /)  { flush(); next }
+        if (/^-/)    { dels[++di] = substr($0,2); saw_chg = 1; next }
+        if (/^\+/)   { adds[++ai] = substr($0,2); saw_chg = 1; next }
+        if (/^ / && !saw_chg) { pre_ctx[++pre_n] = substr($0,2) }
         next
       }
       FNR == 1 && NR > 1 { flush() }
       {
-        k = key($0)
-        if (k && (k in repl)) { print repl[k]; delete repl[k]; next }
-        print
+        k = linekey($0)
+        if (k && (k in repl)) { print repl[k]; delete repl[k] }
+        else print
+        if (k && (k in anchor_ins)) {
+          n = split(anchor_ins[k], parts, SUBSEP)
+          for (i = 1; i <= n; i++) if (parts[i] != "") print parts[i]
+          delete anchor_ins[k]
+        }
       }
-      END { for (i = 1; i <= nadd; i++) print added[i] }
+      END {
+        for (k in anchor_ins) {
+          n = split(anchor_ins[k], parts, SUBSEP)
+          for (i = 1; i <= n; i++) if (parts[i] != "") print parts[i]
+        }
+        for (i = 1; i <= nadd; i++) print added[i]
+      }
     ' "$rej" "$stage3" > "${stage3}.tmp" && mv "${stage3}.tmp" "$stage3"
     rm -f "$rej"
   fi
