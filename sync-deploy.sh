@@ -555,146 +555,63 @@ neutralize_configmap_keys() {
   ' "$target" "$theirs" > "$theirs.tmp" && mv "$theirs.tmp" "$theirs"
 }
 
-# Post-process git merge-file --diff3 output: auto-resolve conflict blocks.
-#
-# Three resolution rules applied in order for each <<<<<<< block:
-#
-#   Rule 1 — equal-count key-value: ours_n == theirs_n and every line-pair
-#     shares a structural key (YAML/XML/properties).  make_val rewrites each
-#     ours line with the theirs value.
-#
-#   Rule 2 — union merge (both added from empty base): base section is empty
-#     but ours and theirs both contributed lines.  Emit ours then theirs;
-#     neither side modified existing content, they only added new lines.
-#
-#   Rule 3 — deletion pass: ours line is an exact copy of a base line whose
-#     key is absent in theirs (theirs deleted it, ours left it unchanged).
-#     Auto-delete those lines from ours; keep ours lines that diverged.
-#
-# Exits 0 if all blocks were resolved; exits 1 if any remain.
-_resolve_merge_conflicts() {
-  local tgt_abs="$1"
+# Inject a conflict-marker block for every diff hunk between tgt_abs and theirs.
+# Unchanged lines pass through; each hunk becomes <<<<<<< / ======= / >>>>>>> blocks.
+_inject_diff_conflicts() {
+  local tgt_abs="$1" theirs="$2" label_ours="$3" label_theirs="$4"
   local tmp
-  tmp=$(mktemp "$WORK_DIR/.rcm_XXXXXX")
+  tmp=$(mktemp "$WORK_DIR/.idc_XXXXXX")
 
-  awk '
-  BEGIN { had_conflict=0; st=0 }   # st: 0=normal 1=ours 2=base 3=theirs
-
-  function lkey(line,    s,i,c,n) {
-    s=line; gsub(/^[[:space:]]+/,"",s); n=length(s)
-    if (n>1 && substr(s,1,1)=="<" && index("/!?",substr(s,2,1))==0) {
-      for (i=2;i<=n;i++) { c=substr(s,i,1); if (c==">"||c==" "||c=="\t"||c=="/") break }
-      return substr(s,1,i-1)
-    }
-    for (i=1;i<=n;i++) {
-      if (substr(s,i,1)==":") { c=substr(s,i+1,1); if (c==" "||c=="\t"||c=="") return substr(s,1,i) }
-    }
-    for (i=1;i<=n;i++) if (substr(s,i,1)=="=") return substr(s,1,i)
-    return s
+  diff -U 0 "$tgt_abs" "$theirs" | awk \
+    -v tgt="$tgt_abs" \
+    -v lo="$label_ours" \
+    -v lt="$label_theirs" '
+  BEGIN {
+    n = 0
+    while ((getline line < tgt) > 0) lines[++n] = line
+    pos = 0; del_n = 0; add_n = 0
   }
-
-  function make_val(tgt_l, del_l, add_l,    ind,ts,ds,as_,i,c,p,q,nv,tp,tcl) {
-    ind=""; ts=tgt_l
-    while (length(ts) && (substr(ts,1,1)==" "||substr(ts,1,1)=="\t")) { ind=ind substr(ts,1,1); ts=substr(ts,2) }
-    ds=del_l; gsub(/^[[:space:]]+/,"",ds)
-    as_=add_l; gsub(/^[[:space:]]+/,"",as_)
-
-    p=0; for (i=1;i<=length(ds);i++) { if (substr(ds,i,1)==":") { c=substr(ds,i+1,1); if (c==" "||c=="\t"||c=="") {p=i;break} } }
-    q=0; for (i=1;i<=length(as_);i++) { if (substr(as_,i,1)==":") { c=substr(as_,i+1,1); if (c==" "||c=="\t"||c=="") {q=i;break} } }
-    if (p>0 && q>0 && substr(ds,1,p)==substr(as_,1,q)) {
-      nv=substr(as_,q+1); gsub(/^[[:space:]]+/,"",nv); return ind substr(ds,1,p) " " nv
-    }
-
-    if (substr(ds,1,1)=="<" && index(ds,"</")>0 && substr(as_,1,1)=="<") {
-      p=index(as_,">"); q=index(as_,"</")
-      if (p>0 && q>0) {
-        nv=substr(as_,p+1,q-p-1)
-        tp=index(ts,">"); tcl=index(ts,"</")
-        if (tp>0 && tcl>0) return ind substr(ts,1,tp) nv substr(ts,tcl)
-        p=index(ds,">"); q=index(ds,"</")
-        if (p>0 && q>0) return ind substr(ds,1,p) nv substr(ds,q)
-      }
-    }
-
-    p=index(ds,"="); q=index(as_,"=")
-    if (p>0 && q>0 && substr(ds,1,p)==substr(as_,1,q)) return ind substr(ds,1,p) substr(as_,q+1)
-
-    return ""
+  /^(---|\+\+\+)/ { next }
+  /^@@/ {
+    if (del_n + add_n > 0) _flush()
+    s = $0; sub(/^@@ -/, "", s)
+    split(s, a, " "); split(a[1], b, ",")
+    old_start = b[1]+0
+    old_count = (length(b) > 1) ? b[2]+0 : 1
+    upto = (old_count > 0) ? old_start - 1 : old_start
+    while (pos < upto) { pos++; print lines[pos] }
+    del_n = 0; add_n = 0
+    next
   }
-
-  /^<<<<<<< / { st=1; ours_n=0; base_n=0; theirs_n=0
-                split("",ours); split("",base_); split("",theirs)
-                conflict_header=$0; next }
-  substr($0,1,8)=="||||||| " { if (st==1) { st=2; next } }
-  /^=======$/ { if (st==1||st==2) { st=3; next } }
-  /^>>>>>>> / {
-    if (st==3) {
-      # Rule 1: equal count + matching keys
-      if (ours_n == theirs_n) {
-        resolved=1; split("",rlines)
-        for (i=1; i<=ours_n; i++) {
-          k=lkey(ours[i])
-          if (k=="" || k!=lkey(theirs[i])) { resolved=0; break }
-          nl=make_val(ours[i], ours[i], theirs[i])
-          if (nl=="") { resolved=0; break }
-          rlines[i]=nl
-        }
-        if (resolved) { for (i=1;i<=ours_n;i++) print rlines[i]; st=0; next }
-      }
-
-      # Rule 2: both sides added from empty base
-      if (base_n==0 && ours_n>0 && theirs_n>0) {
-        for (i=1;i<=ours_n;i++)   print ours[i]
-        for (i=1;i<=theirs_n;i++) print theirs[i]
-        st=0; next
-      }
-
-      # Rule 3: auto-delete ours lines that are unchanged from base and absent in theirs
-      if (base_n > 0) {
-        split("",tkeys)
-        for (i=1;i<=theirs_n;i++) { k=lkey(theirs[i]); if (k!="") tkeys[k]=1 }
-        deleted_any=0; kept=0; split("",filtered)
-        for (i=1;i<=ours_n;i++) {
-          in_base=0
-          for (j=1;j<=base_n;j++) if (ours[i]==base_[j]) { in_base=1; break }
-          k=lkey(ours[i])
-          if (in_base && k!="" && !(k in tkeys)) { deleted_any=1 }
-          else                                    { filtered[++kept]=ours[i] }
-        }
-        if (deleted_any) { for (i=1;i<=kept;i++) print filtered[i]; st=0; next }
-      }
-
-      # Unresolvable
-      had_conflict=1
-      print conflict_header
-      for (i=1;i<=ours_n;i++) print ours[i]
-      if (base_n>0) { print "|||||||"; for (i=1;i<=base_n;i++) print base_[i] }
-      print "======="
-      for (i=1;i<=theirs_n;i++) print theirs[i]
-      print $0
-      st=0; next
-    }
+  /^-/ { del_buf[++del_n] = substr($0, 2); next }
+  /^\+/ { add_buf[++add_n] = substr($0, 2); next }
+  END {
+    if (del_n + add_n > 0) _flush()
+    while (pos < n) { pos++; print lines[pos] }
   }
-  st==1 { ours[++ours_n]=$0; next }
-  st==2 { base_[++base_n]=$0; next }
-  st==3 { theirs[++theirs_n]=$0; next }
-  { print }
-  END { exit had_conflict }
-  ' "$tgt_abs" > "$tmp"
-  local awk_rc=$?
+  function _flush(    i) {
+    print "<<<<<<< " lo
+    for (i = 1; i <= del_n; i++) print del_buf[i]
+    print "======="
+    for (i = 1; i <= add_n; i++) print add_buf[i]
+    print ">>>>>>> " lt
+    pos += del_n; del_n = 0; add_n = 0
+    split("", del_buf); split("", add_buf)
+  }
+  ' > "$tmp"
+
   mv "$tmp" "$tgt_abs"
-  return $awk_rc
 }
 
 
-# 3-way merge file sync for modified files.
+# Inject a conflict marker for every diff hunk between target and source_B.
 #
 # Neutralises env-specific content (image tags, protected ConfigMap keys)
-# in both source_A and source_B so those lines never appear as changes.
-# Runs `git merge-file` to auto-apply all non-conflicting source A→B
-# deltas to the target, then tries key-value resolution on any conflicts.
+# so those lines never appear as diffs.  Unchanged lines pass through.
+# Stage 1 = Stage 2 = target original (LEFT panel: clean, no highlights).
+# Stage 3 = source_B (RIGHT panel: all differences highlighted).
 #
-# Returns: 0=clean apply, 1=unresolved conflict (stages set), 2=error
+# Returns: 0=already in sync (no diffs), 1=conflict markers written, 2=error
 patch_merge_file() {
   local orig_src="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
 
@@ -727,81 +644,41 @@ patch_merge_file() {
     return 0
   fi
 
-  # Neutralise env-specific content so it is absent from the generated patch:
-  #   image/tag lines       -> keep base values (won't appear in diff -> not patched)
-  #   protected ConfigMap keys -> keep target values in both base and theirs so
-  #     protected keys cancel out of the diff and patch context matches the target
-  restore_image_lines       "$theirs" "$base"
+  # Neutralise env-specific content so those lines are invisible to the diff:
+  #   image/tag lines          → replace with target values in both so they cancel
+  #   protected ConfigMap keys → replace with target values in both so they cancel
+  restore_image_lines       "$theirs" "$tgt_abs"
+  restore_image_lines       "$base"   "$tgt_abs"
   neutralize_configmap_keys "$theirs" "$tgt_abs"
   neutralize_configmap_keys "$base"   "$tgt_abs"
 
-  # Early exit when source_A and source_B are identical after neutralisation.
-  if diff -q "$base" "$theirs" > /dev/null 2>&1; then
+  # Nothing to do if source didn't change, or target already matches source_B.
+  if diff -q "$base" "$theirs" > /dev/null 2>&1 || \
+     diff -q "$tgt_abs" "$theirs" > /dev/null 2>&1; then
     rm -f "$base" "$theirs"
     return 0
   fi
 
-  # Save original target so we can restore it on conflict (clean LEFT panel).
+  # Save original target for stage registration.
   local ours_save
   ours_save=$(mktemp "$WORK_DIR/.pm_ours_save_XXXXXX")
   cp "$tgt_abs" "$ours_save"
 
-  # 3-way merge: auto-applies all non-conflicting A→B changes to the target.
-  # Returns 0 for clean merge, >0 for N conflicts written, <0 for error.
-  local merge_rc=0
-  git merge-file --diff3 -L "target (ours)" -L "base" -L "source (${TO_REF})" \
-    "$tgt_abs" "$base" "$theirs" 2>/dev/null || merge_rc=$?
+  # Write conflict markers for every diff hunk: target lines in ours section,
+  # source_B lines in theirs section.  Unchanged lines pass through unchanged.
+  _inject_diff_conflicts "$tgt_abs" "$theirs" \
+    "target (ours)" "source (${TO_REF})"
 
-  if [[ $merge_rc -eq 0 ]]; then
-    rm -f "$base" "$theirs" "$ours_save"
-    return 0
-  fi
+  log_warn "pm: diffs in $tgt_path — needs manual merge"
 
-  if [[ $merge_rc -lt 0 ]]; then
-    log_error "merge-file error on $tgt_path"
-    cp "$ours_save" "$tgt_abs"
-    rm -f "$base" "$theirs" "$ours_save"
-    return 2
-  fi
-
-  # merge_rc > 0: conflict markers written at the correct locations.
-  # Try key-value auto-resolution (equal-count blocks with matching keys).
-  log_info "pm: $merge_rc conflict(s) in $tgt_path — attempting key-value resolution"
-  local inj_rc=0
-  _resolve_merge_conflicts "$tgt_abs" || inj_rc=$?
-
-  if [[ $inj_rc -eq 0 ]]; then
-    log_info "pm: all conflict(s) resolved by key-value in $tgt_path"
-    rm -f "$base" "$theirs" "$ours_save"
-    return 0
-  fi
-
-  # Unresolved conflict.  Restore the original target so the working tree is
-  # clean (no conflict markers).  Set up three git index stages for IntelliJ:
-  #
-  # Stage 1 (BASE)  = source_A with substitutions
-  #                   Lets IntelliJ distinguish what source changed vs target.
-  # Stage 2 (OURS)  = original target before any patching
-  #                   LEFT panel = exactly what the user currently has.
-  # Stage 3 (THEIRS)= source_B with substitutions (image/configmap neutralised)
-  #                   RIGHT panel = the clean desired source state.
-  #
-  # IntelliJ 3-way merge semantics:
-  #   stage2 = stage3   → already in sync, auto-accepted (no click needed)
-  #   stage1 = stage2   → source changed this, target didn't → auto-take stage3
-  #   stage1 = stage3   → target customised this, source didn't → auto-keep stage2
-  #   all three differ  → true conflict → user must click to resolve
-  log_warn "pm: unresolved conflict(s) in $tgt_path — needs manual merge"
-
-  # Restore original target (discard conflict-marker output from git merge-file).
-  cp "$ours_save" "$tgt_abs"
-
-  local base_hash ours_hash theirs_hash
-  base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
+  # Register stages for IntelliJ 3-way merge dialog:
+  #   Stage 1 = Stage 2 = target original → left panel is clean (no highlights)
+  #   Stage 3 = source_B                  → right panel has all diffs highlighted
+  local ours_hash theirs_hash
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
   theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
   {
-    printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
+    printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
     printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
     printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
   } | git -C "$tgt_dir" update-index --index-info

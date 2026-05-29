@@ -1660,7 +1660,7 @@ has_not "$A/overlays/dev/kustomization.yaml"  "newTag: v2.0.0"               "so
 has_not "$A/overlays/dev/kustomization.yaml"  "newTag: v1.0.0"               "base newTag not copied either"
 has     "$A/overlays/dev/kustomization.yaml"  "name: image-a"                "image name substituted"
 has     "$A/overlays/dev/kustomization.yaml"  "app-a-configmap-v2.yaml"      "resources reference updated to v2"
-has_not "$A/overlays/dev/kustomization.yaml"  "app-a-configmap-v1.yaml"      "old v1 reference removed"
+has     "$A/overlays/dev/kustomization.yaml"  "app-a-configmap-v1.yaml"      "v1 reference in conflict ours section (click >> to accept v2)"
 has_not "$A/overlays/dev/kustomization.yaml"  "source-image"                 "no source-image in kustomization"
 
 # ── app-b: kustomization.yaml — first-time copy, source values used ──────────
@@ -1933,14 +1933,13 @@ bash "$SYNC_SCRIPT" \
 
 H="$WORK_DIR/app-h"
 
-# ── global key-search: properties file ───────────────────────────────────────
-# app.version is on line 1 (no context before).  The target has a different
-# value (2.5.0 ≠ 1.0.0), so patch rejects the hunk.  _inject_rej_conflicts
-# falls through to try_apply_global which scans the file and applies 1.1.0.
-section "app-h  global key-search (no context) — properties version updated"
-has     "$H/app.properties"  "app.version=1.1.0"  "version updated to 1.1.0 via global key-search"
-has     "$H/app.properties"  "app.name=app-h"     "app name preserved unchanged"
-has_not "$H/app.properties"  "app.version=2.5.0"  "old version 2.5.0 replaced"
+# ── properties file: version diff shown as conflict ──────────────────────────
+# app.version differs between target (2.5.0) and source_B (1.1.0).
+# Both values appear in the conflict block; developer clicks >> to apply 1.1.0.
+section "app-h  properties — version diff in conflict, both values visible"
+has     "$H/app.properties"  "app.version=1.1.0"  "source version 1.1.0 in conflict theirs section"
+has     "$H/app.properties"  "app.name=app-h"     "app name unchanged (no diff)"
+has     "$H/app.properties"  "app.version=2.5.0"  "target version 2.5.0 in conflict ours section"
 
 # ── container discrimination: pom.xml ────────────────────────────────────────
 # Source diff changes <version> inside <parent>.  Target has no <parent> block.
@@ -1951,14 +1950,13 @@ has_not "$H/app.properties"  "app.version=2.5.0"  "old version 2.5.0 replaced"
 section "app-h  container discrimination — project version preserved"
 has     "$H/pom.xml"  "<version>3.0.0</version>"  "project version 3.0.0 not overwritten by wrong-container match"
 has     "$H/pom.xml"  "<version>5.0.0</version>"  "dependency version 5.0.0 untouched"
-has_not "$H/pom.xml"  "<<<<<<<"                   "working tree clean — conflict stored in git stages"
+has     "$H/pom.xml"  "<<<<<<<"                   "working tree has conflict markers for every diff"
 
 # ── stage setup: correct LEFT / RIGHT panels for IntelliJ merge dialog ────────
-# Stage 1 = source_A (base): lets IntelliJ distinguish ours vs theirs changes.
-# Stage 2 = original target (ours/LEFT): clean file with no conflict markers.
-# Stage 3 = source_B with substitutions: RIGHT panel — the complete source file.
-# Working tree = original target (identical to stage 2, no garbage markers).
-section "app-h  stage setup — stage 1/2/3 = source_A / original-target / source_B"
+# Stage 1 = Stage 2 = target original (LEFT panel: clean target, no highlights).
+# Stage 3 = source_B with substitutions (RIGHT panel: all diffs highlighted).
+# Working tree = target with conflict markers at every diff location.
+section "app-h  stage setup — stage 1/2/3 = target / target / source_B"
 _stage1=$(git -C "$H" cat-file blob :1:pom.xml 2>/dev/null || true)
 _stage2=$(git -C "$H" cat-file blob :2:pom.xml 2>/dev/null || true)
 _stage3=$(git -C "$H" cat-file blob :3:pom.xml 2>/dev/null || true)
@@ -1966,13 +1964,18 @@ if [[ -z "$_stage1" || -z "$_stage2" || -z "$_stage3" ]]; then
   fail "one or more stages missing for pom.xml"
 else
   ok "all three stages registered for pom.xml"
-  # Stage 1 must be source_A: contains the <parent> block with version 1.0.0
+  # Stage 1 = target original: NO <parent> block (that's source-only), has 3.0.0
   if echo "$_stage1" | grep -qF "<parent>"; then
-    ok "stage 1 (base) is source_A — contains <parent> block"
+    fail "stage 1 should be target original (has no <parent> block)"
   else
-    fail "stage 1 should be source_A (contain <parent> block with 1.0.0)"
+    ok "stage 1 (base) is target original — no <parent> block"
   fi
-  # Stage 2 must be original target: NO <parent> block, preserves 3.0.0
+  if echo "$_stage1" | grep -qF "3.0.0"; then
+    ok "stage 1 preserves target-only project version 3.0.0"
+  else
+    fail "stage 1 should preserve target project version 3.0.0"
+  fi
+  # Stage 2 = target original (same as stage 1): LEFT panel is clean target
   if echo "$_stage2" | grep -qF "<parent>"; then
     fail "stage 2 should be original target (has no <parent> block)"
   else
@@ -1983,7 +1986,7 @@ else
   else
     fail "stage 2 should preserve target project version 3.0.0"
   fi
-  # Stage 3 must be source_B: contains <parent> block with updated version 1.1.0
+  # Stage 3 = source_B: contains <parent> block with updated version 1.1.0
   if echo "$_stage3" | grep -qF "1.1.0"; then
     ok "stage 3 (theirs) is source_B — contains updated version 1.1.0"
   else
@@ -2013,15 +2016,13 @@ bash "$SYNC_SCRIPT" \
 
 L="$WORK_DIR/app-l"
 
-# ── try_inject_by_key: conflict placed at correct key location ────────────────
-# del_count=1, add_count=2 (unequal counts) → try_apply/try_apply_global skip.
-# Context before (<context>original</context>) doesn't match target
-# (<context>customized</context>) → find_loc returns 0, best=0.
-# try_inject_by_key scans for <mode key → finds <mode>enterprise</mode> at the
-# correct line and calls do_inject there instead of appending to file end.
-section "app-l  try_inject_by_key — conflict in stages, working tree restored clean"
-has_not "$L/app.xml"  "<<<<<<<"                  "working tree clean — conflict stored in git stages"
-has     "$L/app.xml"  "<mode>enterprise</mode>"  "working tree preserves original target value"
+# ── conflict markers at every diff location ──────────────────────────────────
+# Every diff between target and source_B gets a conflict marker.
+# Target value (<mode>enterprise</mode>) is in ours section.
+# Source value (<mode>advanced</mode> + <plugin>) is in theirs section.
+section "app-l  diff conflicts in working tree, stages set for IntelliJ"
+has     "$L/app.xml"  "<<<<<<<"                  "working tree has conflict markers"
+has     "$L/app.xml"  "<mode>enterprise</mode>"  "target value in conflict ours section"
 _stg1_app=$(git -C "$L" cat-file blob :1:app.xml 2>/dev/null || true)
 _stg2_app=$(git -C "$L" cat-file blob :2:app.xml 2>/dev/null || true)
 _stg3_app=$(git -C "$L" cat-file blob :3:app.xml 2>/dev/null || true)
@@ -2047,12 +2048,11 @@ else
 fi
 unset _stg1_app _stg2_app _stg3_app
 
-# ── deletion auto-apply: try_apply_global exact_del path ─────────────────────
-# add_count=0: pure deletion hunk.  Context (<section-origin>) doesn't match
-# target (<section-diff>) so patch rejects it and find_loc returns 0.
-# try_apply_global with exact_del=1 finds the verbatim <item> line and deletes it.
-section "app-l  deletion auto-apply — <item> line removed cleanly when exact match found"
-has_not "$L/legacy.xml"  "<item>remove-this</item>"  "<item> line auto-deleted (no conflict needed)"
+# ── deletion shown as conflict ────────────────────────────────────────────────
+# Source deleted <item>remove-this</item>; target still has it.
+# Conflict marker wraps the deletion: target line in ours, empty in theirs.
+section "app-l  deletion — <item> in conflict ours section, developer clicks >>"
+has     "$L/legacy.xml"  "<item>remove-this</item>"  "<item> in conflict ours section (needs manual resolution)"
 has     "$L/legacy.xml"  "<section-diff>"             "surrounding target content preserved"
 
 # ─────────────────────────────────────────────────────────────────────────────
