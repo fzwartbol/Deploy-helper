@@ -911,9 +911,11 @@ patch_merge_file() {
 
   # Neutralise env-specific content so it is absent from the generated patch:
   #   image/tag lines       -> keep base values (won't appear in diff -> not patched)
-  #   protected ConfigMap keys -> keep target values
+  #   protected ConfigMap keys -> keep target values in both base and theirs so
+  #     protected keys cancel out of the diff and patch context matches the target
   restore_image_lines       "$theirs" "$base"
   neutralize_configmap_keys "$theirs" "$tgt_abs"
+  neutralize_configmap_keys "$base"   "$tgt_abs"
 
   # Generate the delta: only what genuinely changed A -> B (after neutralisation)
   local patch_file
@@ -925,6 +927,12 @@ patch_merge_file() {
     return 0
   fi
 
+  # Save original target before patching so we can show a clean LEFT panel
+  # in IntelliJ if a conflict occurs (stage 2 must be the unmodified target).
+  local ours_save
+  ours_save=$(mktemp "$WORK_DIR/.pm_ours_save_XXXXXX")
+  cp "$tgt_abs" "$ours_save"
+
   # Apply patch; fuzz=3 tolerates minor context drift between source and target.
   # --forward: skip hunks that are already applied (no interactive prompt).
   local rej_file patch_rc=0
@@ -935,19 +943,19 @@ patch_merge_file() {
   rm -f "$patch_file"
 
   if [[ $patch_rc -eq 0 ]]; then
-    rm -f "$base" "$theirs" "$rej_file"
+    rm -f "$base" "$theirs" "$rej_file" "$ours_save"
     return 0
   fi
 
   if [[ $patch_rc -gt 1 ]]; then
     log_error "patch error ($patch_rc) on $tgt_path"
-    rm -f "$base" "$theirs" "$rej_file"
+    rm -f "$base" "$theirs" "$rej_file" "$ours_save"
     return 2
   fi
 
   # patch_rc == 1 but rej file empty: all hunks were already applied — nothing to do
   if [[ ! -s "$rej_file" ]]; then
-    rm -f "$base" "$theirs" "$rej_file"
+    rm -f "$base" "$theirs" "$rej_file" "$ours_save"
     return 0
   fi
 
@@ -961,34 +969,34 @@ patch_merge_file() {
 
   if [[ $inj_rc -eq 0 ]]; then
     log_info "pm: all rejected hunk(s) resolved by key-value in $tgt_path"
-    rm -f "$base" "$theirs"
+    rm -f "$base" "$theirs" "$ours_save"
     return 0
   fi
 
-  # Conflict markers were written.  Set up git index stages so IntelliJ's
-  # merge dialog shows the correct content on each side:
+  # Unresolved conflict.  Restore the original target so the working tree is
+  # clean (no patch garbage, no # CONFLICT: comments, no partial markers).
+  # Set up three git index stages for IntelliJ's merge dialog:
   #
-  # Stage 1 (BASE)  = source_A with substitutions — lets IntelliJ understand
-  #                   what changed on the source side vs what the target changed.
-  # Stage 2 (OURS)  = ours_ver — patched target, conflict markers resolved to
-  #                   our (target) side.  LEFT panel = what we currently have.
-  # Stage 3 (THEIRS)= source_B with substitutions — the complete, clean source
-  #                   file at to_ref.  RIGHT panel = the desired end state.
-  #                   Image/configmap neutralisations already applied to $theirs.
+  # Stage 1 (BASE)  = source_A with substitutions
+  #                   Lets IntelliJ distinguish what source changed vs target.
+  # Stage 2 (OURS)  = original target before any patching
+  #                   LEFT panel = exactly what the user currently has.
+  # Stage 3 (THEIRS)= source_B with substitutions (image/configmap neutralised)
+  #                   RIGHT panel = the clean desired source state.
   #
-  # With stage1 ≠ stage2 ≠ stage3 at conflict locations IntelliJ presents them
-  # as true conflicts (user must click).  Lines already patched have stage2=stage3
-  # → no conflict, auto-accepted.  Lines source deleted where target kept source_A
-  # value have stage1=stage2, stage3 absent → IntelliJ auto-deletes. ✓
+  # IntelliJ 3-way merge semantics:
+  #   stage2 = stage3   → already in sync, auto-accepted (no click needed)
+  #   stage1 = stage2   → source changed this, target didn't → auto-take stage3
+  #   stage1 = stage3   → target customised this, source didn't → auto-keep stage2
+  #   all three differ  → true conflict → user must click to resolve
   log_warn "pm: unresolved conflict(s) in $tgt_path — needs manual merge"
-  local ours_ver
-  ours_ver=$(mktemp "$WORK_DIR/.pm_ours_ver_XXXXXX")
-  # ours_ver: remove ======= … >>>>>>> blocks, remove bare <<<<<<< lines
-  sed '/^=======/,/^>>>>>>>/d; /^<<<<<<</d' "$tgt_abs" > "$ours_ver"
+
+  # Restore original target (discard partial patch + _inject_rej_conflicts output)
+  cp "$ours_save" "$tgt_abs"
 
   local base_hash ours_hash theirs_hash
   base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
-  ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_ver")
+  ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
   theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
   {
     printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
@@ -996,7 +1004,7 @@ patch_merge_file() {
     printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
   } | git -C "$tgt_dir" update-index --index-info
 
-  rm -f "$base" "$theirs" "$ours_ver"
+  rm -f "$base" "$theirs" "$ours_save"
   return 1
 }
 

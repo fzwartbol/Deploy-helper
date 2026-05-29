@@ -1951,16 +1951,14 @@ has_not "$H/app.properties"  "app.version=2.5.0"  "old version 2.5.0 replaced"
 section "app-h  container discrimination — project version preserved"
 has     "$H/pom.xml"  "<version>3.0.0</version>"  "project version 3.0.0 not overwritten by wrong-container match"
 has     "$H/pom.xml"  "<version>5.0.0</version>"  "dependency version 5.0.0 untouched"
-has     "$H/pom.xml"  "<<<<<<<"                   "conflict markers written for unlocatable parent version"
+has_not "$H/pom.xml"  "<<<<<<<"                   "working tree clean — conflict stored in git stages"
 
 # ── stage setup: correct LEFT / RIGHT panels for IntelliJ merge dialog ────────
 # Stage 1 = source_A (base): lets IntelliJ distinguish ours vs theirs changes.
-# Stage 2 = ours_ver (patched target, ours side at conflicts): LEFT panel.
+# Stage 2 = original target (ours/LEFT): clean file with no conflict markers.
 # Stage 3 = source_B with substitutions: RIGHT panel — the complete source file.
-# This means: RIGHT shows the clean desired state; IntelliJ auto-accepts lines
-# where stage2=stage3 (already patched), and presents true conflicts where all
-# three differ (target customised a line that source also changed).
-section "app-h  stage setup — stage 1/2/3 = source_A / patched-target / source_B"
+# Working tree = original target (identical to stage 2, no garbage markers).
+section "app-h  stage setup — stage 1/2/3 = source_A / original-target / source_B"
 _stage1=$(git -C "$H" cat-file blob :1:pom.xml 2>/dev/null || true)
 _stage2=$(git -C "$H" cat-file blob :2:pom.xml 2>/dev/null || true)
 _stage3=$(git -C "$H" cat-file blob :3:pom.xml 2>/dev/null || true)
@@ -1974,11 +1972,11 @@ else
   else
     fail "stage 1 should be source_A (contain <parent> block with 1.0.0)"
   fi
-  # Stage 2 must be ours (patched target): NO <parent> block, preserves 3.0.0
+  # Stage 2 must be original target: NO <parent> block, preserves 3.0.0
   if echo "$_stage2" | grep -qF "<parent>"; then
-    fail "stage 2 should be ours (target has no <parent> block)"
+    fail "stage 2 should be original target (has no <parent> block)"
   else
-    ok "stage 2 (ours) is patched target — no <parent> block from source"
+    ok "stage 2 (ours) is original target — no <parent> block from source"
   fi
   if echo "$_stage2" | grep -qF "3.0.0"; then
     ok "stage 2 preserves target-only project version 3.0.0"
@@ -2021,21 +2019,33 @@ L="$WORK_DIR/app-l"
 # (<context>customized</context>) → find_loc returns 0, best=0.
 # try_inject_by_key scans for <mode key → finds <mode>enterprise</mode> at the
 # correct line and calls do_inject there instead of appending to file end.
-section "app-l  try_inject_by_key — conflict placed at <mode> line, not file end"
-has     "$L/app.xml"  "<<<<<<<"                      "conflict marker written for unequal-count hunk"
-has     "$L/app.xml"  "<mode>enterprise</mode>"      "ours side contains current target value"
-has     "$L/app.xml"  "<mode>advanced</mode>"         "theirs side contains desired new value"
-has     "$L/app.xml"  "<plugin>enabled</plugin>"      "theirs side contains new add-only line"
-# Verify conflict is NOT at end of file: </application> must appear AFTER >>>>>>>
-_app_xml=$(cat "$L/app.xml")
-_theirs_line=$(echo "$_app_xml" | grep -n ">>>>>>>" | tail -1 | cut -d: -f1)
-_close_line=$(echo  "$_app_xml" | grep -n "</application>" | tail -1 | cut -d: -f1)
-if [[ -n "$_theirs_line" && -n "$_close_line" && "$_close_line" -gt "$_theirs_line" ]]; then
-  ok "closing </application> tag appears after conflict block (conflict not at file end)"
+section "app-l  try_inject_by_key — conflict in stages, working tree restored clean"
+has_not "$L/app.xml"  "<<<<<<<"                  "working tree clean — conflict stored in git stages"
+has     "$L/app.xml"  "<mode>enterprise</mode>"  "working tree preserves original target value"
+_stg1_app=$(git -C "$L" cat-file blob :1:app.xml 2>/dev/null || true)
+_stg2_app=$(git -C "$L" cat-file blob :2:app.xml 2>/dev/null || true)
+_stg3_app=$(git -C "$L" cat-file blob :3:app.xml 2>/dev/null || true)
+if [[ -z "$_stg1_app" || -z "$_stg2_app" || -z "$_stg3_app" ]]; then
+  fail "one or more stages missing for app.xml"
 else
-  fail "conflict appears to be at file end — try_inject_by_key may not have fired"
+  ok "all three stages registered for app.xml"
+  if echo "$_stg2_app" | grep -qF "<mode>enterprise</mode>"; then
+    ok "stage 2 (ours) preserves original target value <mode>enterprise</mode>"
+  else
+    fail "stage 2 should preserve original target <mode>enterprise</mode>"
+  fi
+  if echo "$_stg3_app" | grep -qF "<mode>advanced</mode>"; then
+    ok "stage 3 (theirs) contains desired new value <mode>advanced</mode>"
+  else
+    fail "stage 3 should contain source_B value <mode>advanced</mode>"
+  fi
+  if echo "$_stg3_app" | grep -qF "<plugin>enabled</plugin>"; then
+    ok "stage 3 (theirs) contains new add-only line <plugin>enabled</plugin>"
+  else
+    fail "stage 3 should contain new line <plugin>enabled</plugin>"
+  fi
 fi
-unset _app_xml _theirs_line _close_line
+unset _stg1_app _stg2_app _stg3_app
 
 # ── deletion auto-apply: try_apply_global exact_del path ─────────────────────
 # add_count=0: pure deletion hunk.  Context (<section-origin>) doesn't match
