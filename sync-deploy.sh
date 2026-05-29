@@ -965,33 +965,38 @@ patch_merge_file() {
     return 0
   fi
 
-  # Conflict markers were written.  Derive ours/theirs versions from the
-  # marker file so that stage 2 and stage 3 differ ONLY at the conflict
-  # locations.  This means IntelliJ's merge dialog shows ONLY the rejected
-  # hunks as conflicts — every successfully patched line is identical in
-  # both panels and needs no user interaction.
+  # Conflict markers were written.  Set up git index stages so IntelliJ's
+  # merge dialog shows the correct content on each side:
   #
-  # Stage 1 = stage 2 = ours_ver  (patched result, ours side at conflicts)
-  # Stage 3              theirs_ver (patched result, theirs side at conflicts)
+  # Stage 1 (BASE)  = source_A with substitutions — lets IntelliJ understand
+  #                   what changed on the source side vs what the target changed.
+  # Stage 2 (OURS)  = ours_ver — patched target, conflict markers resolved to
+  #                   our (target) side.  LEFT panel = what we currently have.
+  # Stage 3 (THEIRS)= source_B with substitutions — the complete, clean source
+  #                   file at to_ref.  RIGHT panel = the desired end state.
+  #                   Image/configmap neutralisations already applied to $theirs.
+  #
+  # With stage1 ≠ stage2 ≠ stage3 at conflict locations IntelliJ presents them
+  # as true conflicts (user must click).  Lines already patched have stage2=stage3
+  # → no conflict, auto-accepted.  Lines source deleted where target kept source_A
+  # value have stage1=stage2, stage3 absent → IntelliJ auto-deletes. ✓
   log_warn "pm: unresolved conflict(s) in $tgt_path — needs manual merge"
-  local ours_ver theirs_ver
-  ours_ver=$(mktemp  "$WORK_DIR/.pm_ours_ver_XXXXXX")
-  theirs_ver=$(mktemp "$WORK_DIR/.pm_theirs_ver_XXXXXX")
-  # ours_ver:   remove ======= … >>>>>>> blocks, remove bare <<<<<<< lines
-  sed '/^=======/,/^>>>>>>>/d; /^<<<<<<</d'     "$tgt_abs" > "$ours_ver"
-  # theirs_ver: remove <<<<<<< … ======= blocks, remove bare >>>>>>> lines
-  sed '/^<<<<<<<[^<]/,/^=======/d; /^>>>>>>>/d' "$tgt_abs" > "$theirs_ver"
+  local ours_ver
+  ours_ver=$(mktemp "$WORK_DIR/.pm_ours_ver_XXXXXX")
+  # ours_ver: remove ======= … >>>>>>> blocks, remove bare <<<<<<< lines
+  sed '/^=======/,/^>>>>>>>/d; /^<<<<<<</d' "$tgt_abs" > "$ours_ver"
 
-  local ours_hash theirs_hash
+  local base_hash ours_hash theirs_hash
+  base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_ver")
-  theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs_ver")
+  theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
   {
-    printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
+    printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
     printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
     printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
   } | git -C "$tgt_dir" update-index --index-info
 
-  rm -f "$base" "$theirs" "$ours_ver" "$theirs_ver"
+  rm -f "$base" "$theirs" "$ours_ver"
   return 1
 }
 

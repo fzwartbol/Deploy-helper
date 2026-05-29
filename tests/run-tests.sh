@@ -1953,42 +1953,52 @@ has     "$H/pom.xml"  "<version>3.0.0</version>"  "project version 3.0.0 not ove
 has     "$H/pom.xml"  "<version>5.0.0</version>"  "dependency version 5.0.0 untouched"
 has     "$H/pom.xml"  "<<<<<<<"                   "conflict markers written for unlocatable parent version"
 
-# ── stage setup: stages 2 and 3 differ only at conflict locations ─────────────
-# The key UX fix: stages are derived from the conflict-marker file so that
-# IntelliJ's merge dialog shows ONLY the rejected-hunk regions as conflicts.
-# Successfully-patched lines must be identical in stage 2 and stage 3.
-section "app-h  stage setup — stage 2 and 3 differ only at conflict location"
+# ── stage setup: correct LEFT / RIGHT panels for IntelliJ merge dialog ────────
+# Stage 1 = source_A (base): lets IntelliJ distinguish ours vs theirs changes.
+# Stage 2 = ours_ver (patched target, ours side at conflicts): LEFT panel.
+# Stage 3 = source_B with substitutions: RIGHT panel — the complete source file.
+# This means: RIGHT shows the clean desired state; IntelliJ auto-accepts lines
+# where stage2=stage3 (already patched), and presents true conflicts where all
+# three differ (target customised a line that source also changed).
+section "app-h  stage setup — stage 1/2/3 = source_A / patched-target / source_B"
+_stage1=$(git -C "$H" cat-file blob :1:pom.xml 2>/dev/null || true)
 _stage2=$(git -C "$H" cat-file blob :2:pom.xml 2>/dev/null || true)
 _stage3=$(git -C "$H" cat-file blob :3:pom.xml 2>/dev/null || true)
-# Both stages must exist
-if [[ -z "$_stage2" || -z "$_stage3" ]]; then
-  fail "stage 2 or 3 missing for pom.xml"
+if [[ -z "$_stage1" || -z "$_stage2" || -z "$_stage3" ]]; then
+  fail "one or more stages missing for pom.xml"
 else
-  ok "stage 2 and stage 3 registered for pom.xml"
-  # Stage 2 must NOT contain the theirs version change (1.1.0) — it should have ours side
-  if echo "$_stage2" | grep -qF "1.1.0"; then
-    fail "stage 2 should not contain theirs version 1.1.0"
+  ok "all three stages registered for pom.xml"
+  # Stage 1 must be source_A: contains the <parent> block with version 1.0.0
+  if echo "$_stage1" | grep -qF "<parent>"; then
+    ok "stage 1 (base) is source_A — contains <parent> block"
   else
-    ok "stage 2 does not contain source version 1.1.0 (correct ours-side content)"
+    fail "stage 1 should be source_A (contain <parent> block with 1.0.0)"
   fi
-  # Stage 3 must contain the theirs version (1.1.0) from the source patch
+  # Stage 2 must be ours (patched target): NO <parent> block, preserves 3.0.0
+  if echo "$_stage2" | grep -qF "<parent>"; then
+    fail "stage 2 should be ours (target has no <parent> block)"
+  else
+    ok "stage 2 (ours) is patched target — no <parent> block from source"
+  fi
+  if echo "$_stage2" | grep -qF "3.0.0"; then
+    ok "stage 2 preserves target-only project version 3.0.0"
+  else
+    fail "stage 2 should preserve target project version 3.0.0"
+  fi
+  # Stage 3 must be source_B: contains <parent> block with updated version 1.1.0
   if echo "$_stage3" | grep -qF "1.1.0"; then
-    ok "stage 3 contains source version 1.1.0 (correct theirs-side content)"
+    ok "stage 3 (theirs) is source_B — contains updated version 1.1.0"
   else
-    fail "stage 3 should contain theirs version 1.1.0"
+    fail "stage 3 should be source_B (contain version 1.1.0)"
   fi
-  # Crucially: lines NOT at conflict locations must be identical in both stages
-  # The project <version>3.0.0</version> and dependency <version>5.0.0</version>
-  # should appear identically in both stages (no spurious whole-file conflict)
-  _s2_v3=$(echo "$_stage2" | grep -c "3.0.0" || true)
-  _s3_v3=$(echo "$_stage3" | grep -c "3.0.0" || true)
-  if [[ "$_s2_v3" == "$_s3_v3" && "$_s2_v3" -gt 0 ]]; then
-    ok "project version 3.0.0 identical in stage 2 and stage 3 (not a conflict)"
+  # Stage 3 must NOT contain 3.0.0 (that is target-only; source never had it)
+  if echo "$_stage3" | grep -qF "3.0.0"; then
+    fail "stage 3 should be source_B and must not contain target-only 3.0.0"
   else
-    fail "project version 3.0.0 differs between stages (spurious conflict)"
+    ok "stage 3 does not contain target-only version 3.0.0 (right panel = source_B)"
   fi
 fi
-unset _stage2 _stage3 _s2_v3 _s3_v3
+unset _stage1 _stage2 _stage3
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5th sync: app-l — try_inject_by_key and deletion auto-apply
