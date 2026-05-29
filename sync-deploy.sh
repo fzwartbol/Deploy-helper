@@ -645,9 +645,10 @@ patch_merge_file() {
 
   # Key-based fallback for rejected hunks.
   # Paired change (- KEY: old  +  KEY: new): find KEY in stage3, swap line.
-  # Pure addition (+ KEY: val with no matching -): insert AFTER the last context
-  # key seen before the addition in the hunk; fall back to appending at end only
-  # when no suitable key anchor exists (e.g. structural XML).
+  # Pure addition (+ KEY: val with no matching -): insert AFTER the last
+  # pre-context key that exists in target.  Scanning target keys first means
+  # we skip source-only context lines (e.g. LEGACY_KEY) that would otherwise
+  # become a dead anchor and push the addition to the end of the file.
   if [[ -f "$rej" ]]; then
     awk '
       function linekey(line,  k, s) {
@@ -663,10 +664,18 @@ patch_merge_file() {
           if (k && (k in dm)) {
             repl[k] = adds[i]; delete dm[k]
           } else {
+            # Prefer the last pre-context key that is present in target;
+            # fall back to any extractable key; fall back to appending at end.
             anchor = ""
             for (j = pre_n; j >= 1; j--) {
               ak = linekey(pre_ctx[j])
-              if (ak != "") { anchor = ak; break }
+              if (ak != "" && (ak in tgt_keys)) { anchor = ak; break }
+            }
+            if (anchor == "") {
+              for (j = pre_n; j >= 1; j--) {
+                ak = linekey(pre_ctx[j])
+                if (ak != "") { anchor = ak; break }
+              }
             }
             if (anchor != "")
               anchor_ins[anchor] = anchor_ins[anchor] SUBSEP adds[i]
@@ -676,8 +685,12 @@ patch_merge_file() {
         }
         di = ai = 0; pre_n = 0; saw_chg = 0
       }
-      BEGIN { di = ai = nadd = pre_n = saw_chg = 0 }
-      NR == FNR {
+      BEGIN { filenum = 0; di = ai = nadd = pre_n = saw_chg = 0 }
+      FNR == 1 { filenum++ }
+      filenum == 1 {
+        k = linekey($0); if (k != "") tgt_keys[k] = 1; next
+      }
+      filenum == 2 {
         if (/^--- |^\+\+\+ |^\\/) next
         if (/^@@ /)  { flush(); next }
         if (/^-/)    { dels[++di] = substr($0,2); saw_chg = 1; next }
@@ -685,8 +698,8 @@ patch_merge_file() {
         if (/^ / && !saw_chg) { pre_ctx[++pre_n] = substr($0,2) }
         next
       }
-      FNR == 1 && NR > 1 { flush() }
-      {
+      filenum == 3 && FNR == 1 { flush() }
+      filenum == 3 {
         k = linekey($0)
         if (k && (k in repl)) { print repl[k]; delete repl[k] }
         else print
@@ -703,7 +716,7 @@ patch_merge_file() {
         }
         for (i = 1; i <= nadd; i++) print added[i]
       }
-    ' "$rej" "$stage3" > "${stage3}.tmp" && mv "${stage3}.tmp" "$stage3"
+    ' "$tgt_abs" "$rej" "$stage3" > "${stage3}.tmp" && mv "${stage3}.tmp" "$stage3"
     rm -f "$rej"
   fi
   rm -f "$v1v2_diff"
