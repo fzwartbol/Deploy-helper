@@ -1960,11 +1960,12 @@ has     "$H/pom.xml"  "<version>5.0.0</version>"  "dependency version 5.0.0 unto
 has_not "$H/pom.xml"  "<<<<<<<"                   "working tree clean — conflict in git stages"
 
 # ── stage setup: correct LEFT / RIGHT panels for IntelliJ merge dialog ────────
-# Stage 1 = source_A (BASE): IntelliJ uses this to compute what changed where.
-#           Only lines that source actually changed (v1→v2) are highlighted.
-# Stage 2 = target original (LEFT): target customisations shown on left side.
-# Stage 3 = source_B (RIGHT): source end state; only v1→v2 lines are lit.
-section "app-h  stage setup — stage 1/2/3 = source_A / original-target / source_B"
+# Stage 1 = target (BASE): IntelliJ diffs both sides against target, so only
+#           source v1→v2 changes are highlighted — no noise from customisations.
+# Stage 2 = target (LEFT): clean starting point with no highlights.
+# Stage 3 = patched target (RIGHT): target + source v1→v2 changes; only those
+#           lines differ from stage 1, so only they are highlighted green.
+section "app-h  stage setup — stage 1/2/3 = target / target / patched-target"
 _stage1=$(git -C "$H" cat-file blob :1:pom.xml 2>/dev/null || true)
 _stage2=$(git -C "$H" cat-file blob :2:pom.xml 2>/dev/null || true)
 _stage3=$(git -C "$H" cat-file blob :3:pom.xml 2>/dev/null || true)
@@ -1972,13 +1973,18 @@ if [[ -z "$_stage1" || -z "$_stage2" || -z "$_stage3" ]]; then
   fail "one or more stages missing for pom.xml"
 else
   ok "all three stages registered for pom.xml"
-  # Stage 1 = source_A: contains the <parent> block with version 1.0.0
+  # Stage 1 = target (BASE): NO <parent> block, has project version 3.0.0
   if echo "$_stage1" | grep -qF "<parent>"; then
-    ok "stage 1 (base) is source_A — contains <parent> block"
+    fail "stage 1 should be target (no <parent> block)"
   else
-    fail "stage 1 should be source_A (contain <parent> block with 1.0.0)"
+    ok "stage 1 (base) is target — no <parent> block from source"
   fi
-  # Stage 2 = target original: NO <parent> block, preserves 3.0.0
+  if echo "$_stage1" | grep -qF "3.0.0"; then
+    ok "stage 1 (base) has target-only project version 3.0.0"
+  else
+    fail "stage 1 should be target (contain project version 3.0.0)"
+  fi
+  # Stage 2 = target: same as stage 1
   if echo "$_stage2" | grep -qF "<parent>"; then
     fail "stage 2 should be original target (has no <parent> block)"
   else
@@ -1989,17 +1995,18 @@ else
   else
     fail "stage 2 should preserve target project version 3.0.0"
   fi
-  # Stage 3 = source_B: contains <parent> block with updated version 1.1.0
+  # Stage 3 = patched target: source's updated 1.1.0 is present (will be
+  # highlighted green); target's own 3.0.0 is also preserved but unlit
+  # (stage 1 = target also has it, so IntelliJ sees no diff there).
   if echo "$_stage3" | grep -qF "1.1.0"; then
-    ok "stage 3 (theirs) is source_B — contains updated version 1.1.0"
+    ok "stage 3 (right panel) contains updated version 1.1.0 (highlighted green)"
   else
-    fail "stage 3 should be source_B (contain version 1.1.0)"
+    fail "stage 3 should contain updated version 1.1.0"
   fi
-  # Stage 3 must NOT contain 3.0.0 (that is target-only; source never had it)
   if echo "$_stage3" | grep -qF "3.0.0"; then
-    fail "stage 3 should be source_B and must not contain target-only 3.0.0"
+    ok "stage 3 preserves target-only version 3.0.0 (unlit — stage 1 matches)"
   else
-    ok "stage 3 does not contain target-only version 3.0.0 (right panel = source_B)"
+    fail "stage 3 should preserve target version 3.0.0"
   fi
 fi
 unset _stage1 _stage2 _stage3

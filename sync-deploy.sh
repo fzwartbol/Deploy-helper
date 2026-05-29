@@ -561,11 +561,13 @@ neutralize_configmap_keys() {
 # Neutralises env-specific content (image tags, protected ConfigMap keys) so
 # those lines are invisible to the diff.  Working tree stays as clean target.
 #
-# Stage 1 = source_A neutralised (BASE): IntelliJ highlights only lines that
-#           source actually changed (v1→v2) — not every diff vs the target.
-# Stage 2 = target original (LEFT): target's customisations shown on left side.
-# Stage 3 = source_B neutralised (RIGHT): source end state; only v1→v2 changes
-#           are highlighted green/blue.  Target-equal lines are unlit.
+# Stage 1 = target (BASE): IntelliJ computes diffs relative to target, so only
+#           lines that source actually changed (v1→v2) appear highlighted on the
+#           right.  Target customisations are identical on both sides — no noise.
+# Stage 2 = target (LEFT): left panel is the clean target; no highlights.
+# Stage 3 = patched target (RIGHT): target with source v1→v2 changes applied.
+#           Conflicts resolved by keeping theirs (source_B wins), so the right
+#           panel shows exactly what the source wants, highlighted green.
 #
 # Returns: 0=already in sync (no diffs), 1=stages set (needs manual merge)
 patch_merge_file() {
@@ -600,44 +602,62 @@ patch_merge_file() {
     return 0
   fi
 
-  # Neutralise env-specific content so those lines do not appear as source diffs:
-  #   image/tag lines       → restore theirs to base values so diff(base,theirs)=0
-  #   protected ConfigMap keys → replace with target values in both so they cancel
-  restore_image_lines       "$theirs" "$base"
+  # Neutralise env-specific content: use target values in both base and theirs
+  # so image/tag lines and protected ConfigMap keys cancel out in the diff.
+  restore_image_lines       "$theirs" "$tgt_abs"
+  restore_image_lines       "$base"   "$tgt_abs"
   neutralize_configmap_keys "$theirs" "$tgt_abs"
   neutralize_configmap_keys "$base"   "$tgt_abs"
 
-  # Nothing to do if source didn't change, or target already matches source_B.
-  if diff -q "$base" "$theirs" > /dev/null 2>&1 || \
-     diff -q "$tgt_abs" "$theirs" > /dev/null 2>&1; then
+  # Nothing to do if source v1→v2 introduced no changes (after neutralisation).
+  if diff -q "$base" "$theirs" > /dev/null 2>&1; then
     rm -f "$base" "$theirs"
     return 0
   fi
 
-  # Save original target for stage registration.
-  local ours_save
+  # Build stage3: target with source v1→v2 patch applied.
+  # Conflicts are resolved by keeping theirs (source_B values win).
+  local ours_save stage3
   ours_save=$(mktemp "$WORK_DIR/.pm_ours_save_XXXXXX")
+  stage3=$(mktemp    "$WORK_DIR/.pm_stage3_XXXXXX")
   cp "$tgt_abs" "$ours_save"
+  cp "$tgt_abs" "$stage3"
+
+  local mf_rc=0
+  git merge-file "$stage3" "$base" "$theirs" 2>/dev/null || mf_rc=$?
+  if [[ $mf_rc -gt 0 ]]; then
+    # Strip ours (target) conflict sections; keep theirs (source_B) values.
+    awk '
+      /^<<<<<<< /{skip=1;next}
+      /^=======$/{skip=0;next}
+      /^>>>>>>> /{next}
+      skip{next}
+      {print}
+    ' "$stage3" > "$stage3.tmp" && mv "$stage3.tmp" "$stage3"
+  fi
+
+  # Nothing to do if the patch leaves target unchanged.
+  if diff -q "$tgt_abs" "$stage3" > /dev/null 2>&1; then
+    rm -f "$base" "$theirs" "$ours_save" "$stage3"
+    return 0
+  fi
 
   log_warn "pm: diffs in $tgt_path — needs manual merge"
 
   # Register stages for IntelliJ 3-way merge dialog:
-  #   Stage 1 = source_A (BASE) → IntelliJ uses this to compute what changed.
-  #             Only source's v1→v2 lines are highlighted; target customisations
-  #             that are unrelated to the diff appear unlit on the right.
-  #   Stage 2 = target original (LEFT)
-  #   Stage 3 = source_B (RIGHT)
-  local base_hash ours_hash theirs_hash
-  base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
+  #   Stage 1 = target (BASE) → left panel is clean, no highlights anywhere
+  #   Stage 2 = target (LEFT) → user's starting point, identical to stage 1
+  #   Stage 3 = patched target (RIGHT) → only source v1→v2 changes highlighted
+  local ours_hash stage3_hash
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
-  theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
+  stage3_hash=$(git -C "$tgt_dir" hash-object -w "$stage3")
   {
-    printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
+    printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
     printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
-    printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
+    printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
   } | git -C "$tgt_dir" update-index --index-info
 
-  rm -f "$base" "$theirs" "$ours_save"
+  rm -f "$base" "$theirs" "$ours_save" "$stage3"
   return 1
 }
 
