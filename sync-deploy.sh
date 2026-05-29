@@ -615,28 +615,73 @@ patch_merge_file() {
     return 0
   fi
 
-  # Build stage3: target with source v1→v2 patch applied.
-  # Conflicts are resolved by keeping theirs (source_B values win).
-  local ours_save stage3
+  # Build stage3: target with ONLY v1→v2 changes applied.
+  #
+  # diff(base, theirs) contains solely lines source changed between tags — it
+  # never includes lines that are the same in both (pre-existing source content).
+  # Applying this diff to target keeps target's customisations untouched and
+  # highlights only the actual source changes in IntelliJ's right panel.
+  #
+  # For hunks whose context does not match target (context-mismatch), we fall
+  # back to key-based substitution (YAML/properties: KEY: old → KEY: new) and,
+  # for pure additions with no context anchor, append to end of stage3 so the
+  # user can still see the source change highlighted on the right.
+  local v1v2_diff ours_save stage3
+  v1v2_diff=$(mktemp "$WORK_DIR/.pm_v1v2_XXXXXX")
   ours_save=$(mktemp "$WORK_DIR/.pm_ours_save_XXXXXX")
   stage3=$(mktemp    "$WORK_DIR/.pm_stage3_XXXXXX")
   cp "$tgt_abs" "$ours_save"
   cp "$tgt_abs" "$stage3"
 
-  local mf_rc=0
-  git merge-file "$stage3" "$base" "$theirs" 2>/dev/null || mf_rc=$?
-  if [[ $mf_rc -gt 0 ]]; then
-    # Strip ours (target) conflict sections; keep theirs (source_B) values.
-    awk '
-      /^<<<<<<< /{skip=1;next}
-      /^=======$/{skip=0;next}
-      /^>>>>>>> /{next}
-      skip{next}
-      {print}
-    ' "$stage3" > "$stage3.tmp" && mv "$stage3.tmp" "$stage3"
-  fi
+  diff -U 3 "$base" "$theirs" > "$v1v2_diff" || true
 
-  # Nothing to do if the patch leaves target unchanged.
+  # Apply v1→v2 patch; --fuzz=3 tolerates minor context drift.
+  local rej="${stage3}.rej"
+  patch --fuzz=3 "$stage3" < "$v1v2_diff" 2>/dev/null || true
+  rm -f "${stage3}.orig"
+
+  # Key-based fallback for rejected hunks.
+  # Paired change (- KEY: old  +  KEY: new): find KEY in stage3, swap line.
+  # Pure addition (+ NEW_KEY: val with no matching -): append at end of stage3.
+  if [[ -f "$rej" ]]; then
+    awk '
+      function key(line,  k) {
+        k = line
+        sub(/[[:space:]]*[=:].*/, "", k)
+        gsub(/^[[:space:]]*/, "", k)
+        return (k != line && k != "") ? k : ""
+      }
+      function flush(  i, k, dm) {
+        split("", dm)
+        for (i = 1; i <= di; i++) { k = key(dels[i]); if (k) dm[k] = 1 }
+        for (i = 1; i <= ai; i++) {
+          k = key(adds[i])
+          if (k && (k in dm)) { repl[k] = adds[i]; delete dm[k] }
+          else                 { added[++nadd] = adds[i] }
+        }
+        di = ai = 0
+      }
+      BEGIN { di = 0; ai = 0; nadd = 0 }
+      NR == FNR {
+        if (/^--- |^\+\+\+ |^\\/)  { next }
+        if (/^@@ /)                { flush(); next }
+        if (/^-/)                  { dels[++di] = substr($0, 2); next }
+        if (/^\+/)                 { adds[++ai] = substr($0, 2); next }
+        next
+      }
+      FNR == 1 && NR > 1 { flush() }
+      {
+        k = key($0)
+        if (k && (k in repl)) { print repl[k]; delete repl[k]; next }
+        print
+      }
+      END { for (i = 1; i <= nadd; i++) print added[i] }
+    ' "$rej" "$stage3" > "${stage3}.tmp" && mv "${stage3}.tmp" "$stage3"
+    rm -f "$rej"
+  fi
+  rm -f "$v1v2_diff"
+
+  # Nothing to do if v1→v2 changes did not affect target.
   if diff -q "$tgt_abs" "$stage3" > /dev/null 2>&1; then
     rm -f "$base" "$theirs" "$ours_save" "$stage3"
     return 0
