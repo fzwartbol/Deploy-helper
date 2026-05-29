@@ -556,12 +556,16 @@ neutralize_configmap_keys() {
 }
 
 
-# Set stages so IntelliJ opens the 3-way merge tool showing source_B changes.
+# Set stages so IntelliJ opens the 3-way merge tool showing ONLY source changes.
 #
-# Neutralises env-specific content (image tags, protected ConfigMap keys)
-# so those lines never appear as diffs.  Working tree stays as clean target.
-# Stage 1 = Stage 2 = target original (LEFT panel: clean, no highlights).
-# Stage 3 = source_B (RIGHT panel: all diffs highlighted GREEN — theirs-only).
+# Neutralises env-specific content (image tags, protected ConfigMap keys) so
+# those lines are invisible to the diff.  Working tree stays as clean target.
+#
+# Stage 1 = source_A neutralised (BASE): IntelliJ highlights only lines that
+#           source actually changed (v1→v2) — not every diff vs the target.
+# Stage 2 = target original (LEFT): target's customisations shown on left side.
+# Stage 3 = source_B neutralised (RIGHT): source end state; only v1→v2 changes
+#           are highlighted green/blue.  Target-equal lines are unlit.
 #
 # Returns: 0=already in sync (no diffs), 1=stages set (needs manual merge)
 patch_merge_file() {
@@ -596,11 +600,10 @@ patch_merge_file() {
     return 0
   fi
 
-  # Neutralise env-specific content so those lines are invisible to the diff:
-  #   image/tag lines          → replace with target values in both so they cancel
+  # Neutralise env-specific content so those lines do not appear as source diffs:
+  #   image/tag lines       → restore theirs to base values so diff(base,theirs)=0
   #   protected ConfigMap keys → replace with target values in both so they cancel
-  restore_image_lines       "$theirs" "$tgt_abs"
-  restore_image_lines       "$base"   "$tgt_abs"
+  restore_image_lines       "$theirs" "$base"
   neutralize_configmap_keys "$theirs" "$tgt_abs"
   neutralize_configmap_keys "$base"   "$tgt_abs"
 
@@ -619,14 +622,17 @@ patch_merge_file() {
   log_warn "pm: diffs in $tgt_path — needs manual merge"
 
   # Register stages for IntelliJ 3-way merge dialog:
-  #   Stage 1 = Stage 2 = target original → left panel is clean (no highlights)
-  #   Stage 3 = source_B                  → right panel has all diffs GREEN
-  #                                          (theirs-only — left never changed)
-  local ours_hash theirs_hash
+  #   Stage 1 = source_A (BASE) → IntelliJ uses this to compute what changed.
+  #             Only source's v1→v2 lines are highlighted; target customisations
+  #             that are unrelated to the diff appear unlit on the right.
+  #   Stage 2 = target original (LEFT)
+  #   Stage 3 = source_B (RIGHT)
+  local base_hash ours_hash theirs_hash
+  base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
   theirs_hash=$(git -C "$tgt_dir" hash-object -w "$theirs")
   {
-    printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
+    printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
     printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
     printf '100644 %s 3\t%s\n' "$theirs_hash" "$tgt_path"
   } | git -C "$tgt_dir" update-index --index-info
