@@ -1965,7 +1965,7 @@ has_not "$H/pom.xml"  "<<<<<<<"                   "working tree clean — confli
 # Stage 2 = target (LEFT): clean starting point with no highlights.
 # Stage 3 = patched target (RIGHT): target + source v1→v2 changes; only those
 #           lines differ from stage 1, so only they are highlighted green.
-section "app-h  stage setup — stage 1/2/3 = target / target / patched-target"
+section "app-h  stage setup — stage 1/2/3 = target / target / source_B"
 _stage1=$(git -C "$H" cat-file blob :1:pom.xml 2>/dev/null || true)
 _stage2=$(git -C "$H" cat-file blob :2:pom.xml 2>/dev/null || true)
 _stage3=$(git -C "$H" cat-file blob :3:pom.xml 2>/dev/null || true)
@@ -1995,18 +1995,19 @@ else
   else
     fail "stage 2 should preserve target project version 3.0.0"
   fi
-  # Stage 3 = patched target: source's updated 1.1.0 is present (will be
-  # highlighted green); target's own 3.0.0 is also preserved but unlit
-  # (stage 1 = target also has it, so IntelliJ sees no diff there).
+  # Stage 3 = source_B (tag2 end state): has <parent> block with updated 1.1.0
+  # highlighted green (differs from stage1=target which has no <parent>).
+  # 3.0.0 is target-only XML with no extractable key — correctly absent from
+  # stage3; IntelliJ shows it as "deleted by right" so user can keep it.
   if echo "$_stage3" | grep -qF "1.1.0"; then
     ok "stage 3 (right panel) contains updated version 1.1.0 (highlighted green)"
   else
     fail "stage 3 should contain updated version 1.1.0"
   fi
-  if echo "$_stage3" | grep -qF "3.0.0"; then
-    ok "stage 3 preserves target-only version 3.0.0 (unlit — stage 1 matches)"
+  if echo "$_stage3" | grep -qF "<parent>"; then
+    ok "stage 3 is source_B — has <parent> block (source end-tag structure)"
   else
-    fail "stage 3 should preserve target version 3.0.0"
+    fail "stage 3 should be source_B and contain <parent> block"
   fi
 fi
 unset _stage1 _stage2 _stage3

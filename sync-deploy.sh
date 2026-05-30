@@ -565,9 +565,13 @@ neutralize_configmap_keys() {
 #           lines that source actually changed (v1→v2) appear highlighted on the
 #           right.  Target customisations are identical on both sides — no noise.
 # Stage 2 = target (LEFT): left panel is the clean target; no highlights.
-# Stage 3 = patched target (RIGHT): target with source v1→v2 changes applied.
-#           Conflicts resolved by keeping theirs (source_B wins), so the right
-#           panel shows exactly what the source wants, highlighted green.
+# Stage 3 = source_B (RIGHT): source at TO_REF in its own file order.
+#           Lines unchanged from source v1 substitute target's value so they
+#           look identical to stage 1 and are unlit.  Source-only unchanged
+#           lines (absent from target) are dropped entirely.  Target-only keys
+#           are re-inserted at their original target position.
+#           Only the lines source actually changed (v1→v2) differ from stage 1
+#           and are therefore highlighted green in IntelliJ's right panel.
 #
 # Returns: 0=already in sync (no diffs), 1=stages set (needs manual merge)
 patch_merge_file() {
@@ -615,115 +619,100 @@ patch_merge_file() {
     return 0
   fi
 
-  # Build stage3: target with ONLY v1→v2 changes applied.
+  # Build stage3: source_B (theirs) with ordering preserved, but with lines
+  # that source did NOT change (present in both base and theirs) substituted
+  # with target's value for that key so they match stage1 and are unlit.
+  # Source-only unchanged lines (key absent from target) are dropped entirely.
+  # Target-only keys (absent from source) are re-inserted at their original
+  # target position so they also remain unlit.
   #
-  # diff(base, theirs) contains solely lines source changed between tags — it
-  # never includes lines that are the same in both (pre-existing source content).
-  # Applying this diff to target keeps target's customisations untouched and
-  # highlights only the actual source changes in IntelliJ's right panel.
-  #
-  # For hunks whose context does not match target, we fall back to key-based
-  # substitution (YAML/properties KEY: old → KEY: new).  Pure additions with no
-  # paired deletion are inserted after their nearest preceding context key in
-  # target rather than appended at the end, so ordering is preserved.
-  local v1v2_diff ours_save stage3
-  v1v2_diff=$(mktemp "$WORK_DIR/.pm_v1v2_XXXXXX")
-  ours_save=$(mktemp "$WORK_DIR/.pm_ours_save_XXXXXX")
-  stage3=$(mktemp    "$WORK_DIR/.pm_stage3_XXXXXX")
-  cp "$tgt_abs" "$ours_save"
-  cp "$tgt_abs" "$stage3"
+  # Result: stage3 looks like source_B in file order; only the lines source
+  # actually changed between the two tags differ from stage1=target and are
+  # therefore highlighted green in IntelliJ's right panel.
+  local stage3
+  stage3=$(mktemp "$WORK_DIR/.pm_stage3_XXXXXX")
 
-  diff -U 3 "$base" "$theirs" > "$v1v2_diff" || true
+  awk '
+    function linekey(line,  k, s) {
+      s = line; gsub(/^[[:space:]]+/, "", s)
+      k = s; sub(/[[:space:]]*[=:].*/, "", k)
+      return (k != s && k != "") ? k : ""
+    }
+    BEGIN { filenum = 0 }
+    FNR == 1 { filenum++ }
 
-  # Apply v1→v2 patch with strict context matching (fuzz=0).  Any hunk whose
-  # context does not match target exactly goes to .rej for key-based fallback
-  # below.  Avoiding fuzz means patch never silently misplaces additions at the
-  # end of the file when context lines are absent from target.
-  local rej="${stage3}.rej"
-  patch --fuzz=0 "$stage3" < "$v1v2_diff" 2>/dev/null || true
-  rm -f "${stage3}.orig"
+    # ── File 1: target ──────────────────────────────────────────────────────
+    filenum == 1 {
+      tgt_n++; tgt_ord[tgt_n] = $0
+      k = linekey($0)
+      if (k != "") { tgt_keys[k] = 1; tgt_kline[k] = $0; tgt_kpos[k] = tgt_n }
+      next
+    }
 
-  # Key-based fallback for rejected hunks.
-  # Paired change (- KEY: old  +  KEY: new): find KEY in stage3, swap line.
-  # Pure addition (+ KEY: val with no matching -): insert AFTER the last
-  # pre-context key that exists in target.  Scanning target keys first means
-  # we skip source-only context lines (e.g. LEGACY_KEY) that would otherwise
-  # become a dead anchor and push the addition to the end of the file.
-  if [[ -f "$rej" ]]; then
-    awk '
-      function linekey(line,  k, s) {
-        s = line; gsub(/^[[:space:]]+/, "", s)
-        k = s; sub(/[[:space:]]*[=:].*/, "", k)
-        return (k != s && k != "") ? k : ""
+    # ── File 2: base ────────────────────────────────────────────────────────
+    filenum == 2 {
+      base_lines[$0] = 1
+      k = linekey($0); if (k != "") base_keys[k] = 1
+      next
+    }
+
+    # ── File 3: theirs — build stage3 array ─────────────────────────────────
+    filenum == 3 {
+      k = linekey($0)
+      if (!($0 in base_lines)) {
+        # v1→v2 change or pure addition → keep as-is (will be highlighted)
+        s3_arr[++s3n] = $0
+      } else if (k == "") {
+        # Structural line unchanged in source → keep as-is
+        s3_arr[++s3n] = $0
+      } else if (k in tgt_keys) {
+        # Pre-existing source key that target adopted → show target value
+        # (same as stage1, so IntelliJ will not highlight it)
+        s3_arr[++s3n] = tgt_kline[k]
       }
-      function flush(  i, k, dm) {
-        split("", dm)
-        for (i = 1; i <= di; i++) { k = linekey(dels[i]); if (k) dm[k] = 1 }
-        for (i = 1; i <= ai; i++) {
-          k = linekey(adds[i])
-          if (k && (k in dm)) {
-            repl[k] = adds[i]; delete dm[k]
-          } else {
-            # Prefer the last pre-context key that is present in target;
-            # fall back to any extractable key; fall back to appending at end.
-            anchor = ""
-            for (j = pre_n; j >= 1; j--) {
-              ak = linekey(pre_ctx[j])
-              if (ak != "" && (ak in tgt_keys)) { anchor = ak; break }
-            }
-            if (anchor == "") {
-              for (j = pre_n; j >= 1; j--) {
-                ak = linekey(pre_ctx[j])
-                if (ak != "") { anchor = ak; break }
-              }
-            }
-            if (anchor != "")
-              anchor_ins[anchor] = anchor_ins[anchor] SUBSEP adds[i]
-            else
-              added[++nadd] = adds[i]
-          }
+      # else: source-only unchanged key (LEGACY_KEY etc.) → drop silently
+      if (k != "") theirs_keys[k] = 1
+      next
+    }
+
+    END {
+      # Record stage3 key positions for target-only insertion
+      for (i = 1; i <= s3n; i++) {
+        k = linekey(s3_arr[i])
+        if (k != "") s3_kpos[k] = i
+      }
+
+      # Re-insert target-only lines (key not in base, not in theirs) at the
+      # position of their nearest preceding target key that is in stage3.
+      for (i = 1; i <= tgt_n; i++) {
+        L = tgt_ord[i]; k = linekey(L)
+        if (k == "" || (k in base_keys) || (k in theirs_keys)) continue
+        ins_after = 0
+        for (j = i - 1; j >= 1; j--) {
+          pk = linekey(tgt_ord[j])
+          if (pk != "" && (pk in s3_kpos)) { ins_after = s3_kpos[pk]; break }
         }
-        di = ai = 0; pre_n = 0; saw_chg = 0
+        ins_content[ins_after] = ins_content[ins_after] SUBSEP L
       }
-      BEGIN { filenum = 0; di = ai = nadd = pre_n = saw_chg = 0 }
-      FNR == 1 { filenum++ }
-      filenum == 1 {
-        k = linekey($0); if (k != "") tgt_keys[k] = 1; next
+
+      # Emit stage3 with target-only lines spliced in
+      if (0 in ins_content) {
+        n = split(ins_content[0], parts, SUBSEP)
+        for (j = 1; j <= n; j++) if (parts[j] != "") print parts[j]
       }
-      filenum == 2 {
-        if (/^--- |^\+\+\+ |^\\/) next
-        if (/^@@ /)  { flush(); next }
-        if (/^-/)    { dels[++di] = substr($0,2); saw_chg = 1; next }
-        if (/^\+/)   { adds[++ai] = substr($0,2); saw_chg = 1; next }
-        if (/^ / && !saw_chg) { pre_ctx[++pre_n] = substr($0,2) }
-        next
-      }
-      filenum == 3 && FNR == 1 { flush() }
-      filenum == 3 {
-        k = linekey($0)
-        if (k && (k in repl)) { print repl[k]; delete repl[k] }
-        else print
-        if (k && (k in anchor_ins)) {
-          n = split(anchor_ins[k], parts, SUBSEP)
-          for (i = 1; i <= n; i++) if (parts[i] != "") print parts[i]
-          delete anchor_ins[k]
+      for (i = 1; i <= s3n; i++) {
+        print s3_arr[i]
+        if (i in ins_content) {
+          n = split(ins_content[i], parts, SUBSEP)
+          for (j = 1; j <= n; j++) if (parts[j] != "") print parts[j]
         }
       }
-      END {
-        for (k in anchor_ins) {
-          n = split(anchor_ins[k], parts, SUBSEP)
-          for (i = 1; i <= n; i++) if (parts[i] != "") print parts[i]
-        }
-        for (i = 1; i <= nadd; i++) print added[i]
-      }
-    ' "$tgt_abs" "$rej" "$stage3" > "${stage3}.tmp" && mv "${stage3}.tmp" "$stage3"
-    rm -f "$rej"
-  fi
-  rm -f "$v1v2_diff"
+    }
+  ' "$tgt_abs" "$base" "$theirs" > "$stage3"
 
-  # Nothing to do if v1→v2 changes did not affect target.
+  # Nothing to do when stage3 equals target (all v1→v2 changes already adopted).
   if diff -q "$tgt_abs" "$stage3" > /dev/null 2>&1; then
-    rm -f "$base" "$theirs" "$ours_save" "$stage3"
+    rm -f "$base" "$theirs" "$stage3"
     return 0
   fi
 
@@ -732,9 +721,9 @@ patch_merge_file() {
   # Register stages for IntelliJ 3-way merge dialog:
   #   Stage 1 = target (BASE) → left panel is clean, no highlights anywhere
   #   Stage 2 = target (LEFT) → user's starting point, identical to stage 1
-  #   Stage 3 = patched target (RIGHT) → only source v1→v2 changes highlighted
+  #   Stage 3 = source_B (RIGHT) → only v1→v2 source changes highlighted green
   local ours_hash stage3_hash
-  ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
+  ours_hash=$(git   -C "$tgt_dir" hash-object -w "$tgt_abs")
   stage3_hash=$(git -C "$tgt_dir" hash-object -w "$stage3")
   {
     printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
@@ -742,7 +731,7 @@ patch_merge_file() {
     printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
   } | git -C "$tgt_dir" update-index --index-info
 
-  rm -f "$base" "$theirs" "$ours_save" "$stage3"
+  rm -f "$base" "$theirs" "$stage3"
   return 1
 }
 
