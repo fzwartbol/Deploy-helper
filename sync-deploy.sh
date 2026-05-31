@@ -619,12 +619,14 @@ patch_merge_file() {
     return 0
   fi
 
-  # Build stage3: source_B (theirs) with ordering preserved, but with lines
-  # that source did NOT change (present in both base and theirs) substituted
-  # with target's value for that key so they match stage1 and are unlit.
-  # Source-only unchanged lines (key absent from target) are dropped entirely.
-  # Target-only keys (absent from source) are re-inserted at their original
-  # target position so they also remain unlit.
+  # Build stage3: source_B (theirs) with ordering preserved, using
+  # occurrence-order matching for duplicate keys.  Files with repeated YAML
+  # keys (e.g. Kubernetes - name:/value: env-var blocks) are handled by
+  # tracking a per-positional-slot "consumed" marker rather than a global
+  # last-seen counter.  YAML list-item headers ("- ") that did not exist in
+  # source v1 start a "new block"; subsequent sub-keys in that block do not
+  # consume target slots and are kept as pure additions (highlighted).
+  # Target-only keyed lines (unconsumed slots) are re-inserted in order.
   #
   # Result: stage3 looks like source_B in file order; only the lines source
   # actually changed between the two tags differ from stage1=target and are
@@ -638,14 +640,23 @@ patch_merge_file() {
       k = s; sub(/[[:space:]]*[=:].*/, "", k)
       return (k != s && k != "") ? k : ""
     }
-    BEGIN { filenum = 0 }
-    FNR == 1 { filenum++ }
+    function is_list_header(line,  s) {
+      s = line; gsub(/^[[:space:]]+/, "", s)
+      return (substr(s, 1, 2) == "- ")
+    }
+    BEGIN { filenum = 0; block_from_base = 1 }
+    FNR == 1 { filenum++; block_from_base = 1 }
 
     # ── File 1: target ──────────────────────────────────────────────────────
     filenum == 1 {
-      tgt_n++; tgt_ord[tgt_n] = $0
+      tgt_n++
+      tgt_ord[tgt_n] = $0
       k = linekey($0)
-      if (k != "") { tgt_keys[k] = 1; tgt_kline[k] = $0; tgt_kpos[k] = tgt_n }
+      if (k != "") {
+        tgt_cnt[k]++
+        tgt_occ[k, tgt_cnt[k]] = $0
+        tgt_key_occ_num[tgt_n] = tgt_cnt[k]
+      }
       next
     }
 
@@ -658,41 +669,60 @@ patch_merge_file() {
 
     # ── File 3: theirs — build stage3 array ─────────────────────────────────
     filenum == 3 {
-      k = linekey($0)
-      if (!($0 in base_lines)) {
-        # v1→v2 change or pure addition → keep as-is (will be highlighted)
-        s3_arr[++s3n] = $0
-      } else if (k == "") {
-        # Structural line unchanged in source → keep as-is
-        s3_arr[++s3n] = $0
-      } else if (k in tgt_keys) {
-        # Pre-existing source key that target adopted → show target value
-        # (same as stage1, so IntelliJ will not highlight it)
-        s3_arr[++s3n] = tgt_kline[k]
+      # Track whether the current YAML list-item block originated from v1 (base)
+      # or is a pure v2 addition.  Non-header lines inherit the block state.
+      if (is_list_header($0)) {
+        block_from_base = ($0 in base_lines) ? 1 : 0
       }
-      # else: source-only unchanged key (LEGACY_KEY etc.) → drop silently
-      if (k != "") theirs_keys[k] = 1
+      k = linekey($0)
+      # Count positional occurrences only for base-origin blocks
+      if (k != "" && block_from_base) theirs_all_pos[k]++
+      pos = (k != "" && block_from_base) ? theirs_all_pos[k] : 0
+
+      if (!($0 in base_lines)) {
+        # v1→v2 change or pure addition — keep as-is (will be highlighted)
+        s3_arr[++s3n] = $0
+        # Consume the corresponding target slot for base-origin block changes
+        if (block_from_base && k != "" && pos > 0 && (k, pos) in tgt_occ)
+          consumed[k, pos] = 1
+      } else if (k == "") {
+        # Structural/keyless line unchanged in source — keep as-is
+        s3_arr[++s3n] = $0
+      } else if ((k, pos) in tgt_occ) {
+        # Unchanged keyed line: use the positionally-matching target occurrence
+        s3_arr[++s3n] = tgt_occ[k, pos]
+        consumed[k, pos] = 1
+      }
+      # else: source has more occurrences of k than target at this position — drop
       next
     }
 
     END {
-      # Record stage3 key positions for target-only insertion
+      # Build last-seen stage3 position per key (used as insertion anchors)
       for (i = 1; i <= s3n; i++) {
         k = linekey(s3_arr[i])
         if (k != "") s3_kpos[k] = i
       }
 
-      # Re-insert target-only lines (key not in base, not in theirs) at the
-      # position of their nearest preceding target key that is in stage3.
+      # Re-insert target-only keyed lines (those whose slot was never consumed).
+      # Use a sticky anchor so consecutive not-consumed lines stay grouped and
+      # are emitted in their original target order.
+      cur_ins_after = -1
       for (i = 1; i <= tgt_n; i++) {
         L = tgt_ord[i]; k = linekey(L)
-        if (k == "" || (k in base_keys) || (k in theirs_keys)) continue
-        ins_after = 0
-        for (j = i - 1; j >= 1; j--) {
-          pk = linekey(tgt_ord[j])
-          if (pk != "" && (pk in s3_kpos)) { ins_after = s3_kpos[pk]; break }
+        # Only handle keyed lines for target-only re-insertion
+        if (k == "") { cur_ins_after = -1; continue }
+        n = tgt_key_occ_num[i]
+        if ((k, n) in consumed) { cur_ins_after = -1; continue }
+        # This target slot was never consumed — it is target-only
+        if (cur_ins_after == -1) {
+          cur_ins_after = 0
+          for (j = i - 1; j >= 1; j--) {
+            pk = linekey(tgt_ord[j])
+            if (pk != "" && (pk in s3_kpos)) { cur_ins_after = s3_kpos[pk]; break }
+          }
         }
-        ins_content[ins_after] = ins_content[ins_after] SUBSEP L
+        ins_content[cur_ins_after] = ins_content[cur_ins_after] SUBSEP L
       }
 
       # Emit stage3 with target-only lines spliced in

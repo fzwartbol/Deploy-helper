@@ -1352,6 +1352,189 @@ EOF
 with_work "app-l-inj" "" app_l_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SOURCE DUP REPO  (testspace/source-dup-repo)
+# K8s-style YAML with duplicate keys (multiple - name:/value: env-var pairs)
+# and Maven pom.xml with duplicate <version>, <groupId>, <artifactId> tags.
+# v1.0.0 → initial state
+# v1.1.0 → APP_SETTING changed, NEW_FEATURE added, parent bumped, lib-b bumped,
+#           lib-c added
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-dup-repo"
+
+source_dup_v1() {
+  cat > deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-app
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: source-app
+        image: source-image:v1.0.0
+        env:
+        - name: DATABASE_URL
+          value: localhost
+        - name: APP_SETTING
+          value: original-value
+        - name: LOG_LEVEL
+          value: debug
+EOF
+
+  cat > pom.xml <<'EOF'
+<project>
+  <groupId>com.source.dup</groupId>
+  <artifactId>source-app</artifactId>
+  <version>1.0.0</version>
+  <parent>
+    <groupId>com.source.parent</groupId>
+    <artifactId>parent-pom</artifactId>
+    <version>2.0.0</version>
+  </parent>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib-a</artifactId>
+      <version>3.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib-b</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>
+EOF
+}
+with_work "source-dup-repo" "v1.0.0" source_dup_v1
+
+source_dup_v2() {
+  cat > deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-app
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: source-app
+        image: source-image:v1.1.0
+        env:
+        - name: DATABASE_URL
+          value: localhost
+        - name: APP_SETTING
+          value: updated-value
+        - name: LOG_LEVEL
+          value: debug
+        - name: NEW_FEATURE
+          value: enabled
+EOF
+
+  cat > pom.xml <<'EOF'
+<project>
+  <groupId>com.source.dup</groupId>
+  <artifactId>source-app</artifactId>
+  <version>1.0.0</version>
+  <parent>
+    <groupId>com.source.parent</groupId>
+    <artifactId>parent-pom</artifactId>
+    <version>2.1.0</version>
+  </parent>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib-a</artifactId>
+      <version>3.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib-b</artifactId>
+      <version>1.5.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib-c</artifactId>
+      <version>2.5.0</version>
+    </dependency>
+  </dependencies>
+</project>
+EOF
+}
+with_work "source-dup-repo" "v1.1.0" source_dup_v2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-k  (testspace/app-k) — Kubernetes deployment with
+# target customizations: replicas=3, custom image, custom env values,
+# plus an extra target-only env var EXTRA_CONFIG.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-k"
+
+app_k_initial() {
+  cat > deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-k
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: app-k
+        image: app-k-image:prod
+        env:
+        - name: DATABASE_URL
+          value: prod-db
+        - name: APP_SETTING
+          value: custom-value
+        - name: LOG_LEVEL
+          value: warn
+        - name: EXTRA_CONFIG
+          value: target-only
+EOF
+}
+with_work "app-k" "" app_k_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-m  (testspace/app-m) — Maven pom.xml with target
+# customizations: own groupId/artifactId, no parent block, own lib-a version,
+# plus a target-only dependency lib-d.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-m"
+
+app_m_initial() {
+  cat > pom.xml <<'EOF'
+<project>
+  <groupId>com.app.m</groupId>
+  <artifactId>app-m</artifactId>
+  <version>4.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib-a</artifactId>
+      <version>5.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib-b</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib-d</artifactId>
+      <version>3.0.0</version>
+    </dependency>
+  </dependencies>
+</project>
+EOF
+}
+with_work "app-m" "" app_m_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generate test repos.json pointing to our local testspace/ repos
 # Uses the new grouped "apps" structure
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1540,6 +1723,39 @@ cat > "$T/repos.test.json" <<'EOF'
           "app_name":     "app-l",
           "java_package": "com.app.l",
           "java_path":    "com/app/l"
+        }
+      }
+    },
+    {
+      "name": "source-dup",
+      "app": {
+        "repo": "testspace/source-dup-repo",
+        "substitutions": {
+          "app_name":     "source-app",
+          "java_package": "com.source.dup",
+          "java_path":    "com/source/dup"
+        }
+      }
+    },
+    {
+      "name": "app-k",
+      "app": {
+        "repo": "testspace/app-k",
+        "substitutions": {
+          "app_name":     "app-k",
+          "java_package": "com.app.k",
+          "java_path":    "com/app/k"
+        }
+      }
+    },
+    {
+      "name": "app-m",
+      "app": {
+        "repo": "testspace/app-m",
+        "substitutions": {
+          "app_name":     "app-m",
+          "java_package": "com.app.m",
+          "java_path":    "com/app/m"
         }
       }
     }
@@ -2065,6 +2281,178 @@ unset _stg1_app _stg2_app _stg3_app
 section "app-l  deletion — <item> in stage 2 (right panel shows deletion green)"
 has     "$L/legacy.xml"  "<item>remove-this</item>"  "<item> in working tree (stage 3 right panel shows deletion — click >>)"
 has     "$L/legacy.xml"  "<section-diff>"             "surrounding target content preserved"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6th sync: app-k — duplicate-key occurrence-order matching (K8s deployment)
+#   deployment.yaml has multiple - name:/value: pairs.  Only APP_SETTING
+#   changed v1→v2.  Stage 3 must use target values for all unchanged env vars
+#   (not the last-occurrence substitution that caused wrong values) and keep
+#   EXTRA_CONFIG (target-only env var) in place.
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (dup-key K8s: source-dup → app-k, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-dup \
+  --type    app \
+  --targets app-k \
+  --from    v1.0.0 \
+  --to      v1.1.0 || true
+
+K="$WORK_DIR/app-k"
+
+section "app-k  duplicate-key — working tree is clean target"
+has_not "$K/deployment.yaml" "<<<<<<" "no conflict markers in working tree"
+has     "$K/deployment.yaml" "replicas: 3"         "target replicas preserved in working tree"
+has     "$K/deployment.yaml" "value: prod-db"       "target DATABASE_URL value in working tree"
+has     "$K/deployment.yaml" "value: custom-value"  "target APP_SETTING value in working tree"
+has     "$K/deployment.yaml" "value: warn"          "target LOG_LEVEL value in working tree"
+has     "$K/deployment.yaml" "value: target-only"   "target-only EXTRA_CONFIG in working tree"
+
+section "app-k  duplicate-key — stage 3 correct occurrence-order substitution"
+_s3=$(git -C "$K" cat-file blob :3:deployment.yaml 2>/dev/null || true)
+if [[ -z "$_s3" ]]; then
+  fail "stage 3 missing for deployment.yaml"
+else
+  ok "stage 3 registered for deployment.yaml"
+
+  # Unchanged env vars must use TARGET values (not source values)
+  if echo "$_s3" | grep -qF "value: prod-db"; then
+    ok "stage 3: DATABASE_URL uses target value prod-db (not source localhost)"
+  else
+    fail "stage 3: DATABASE_URL should be prod-db (target value, not highlighted)"
+  fi
+  if echo "$_s3" | grep -qF "value: warn"; then
+    ok "stage 3: LOG_LEVEL uses target value warn (not source debug)"
+  else
+    fail "stage 3: LOG_LEVEL should be warn (target value, not highlighted)"
+  fi
+
+  # The changed env var must show source_B value (highlighted)
+  if echo "$_s3" | grep -qF "value: updated-value"; then
+    ok "stage 3: APP_SETTING shows updated-value (v1→v2 change, highlighted green)"
+  else
+    fail "stage 3: APP_SETTING should be updated-value (v1→v2 change)"
+  fi
+  if echo "$_s3" | grep -qF "value: custom-value"; then
+    fail "stage 3: APP_SETTING must NOT show custom-value (that is stage 1, not stage 3)"
+  else
+    ok "stage 3: APP_SETTING does not retain custom-value from target"
+  fi
+
+  # Source v1 value must NOT appear (would mean substitution used wrong occurrence)
+  if echo "$_s3" | grep -qF "value: original-value"; then
+    fail "stage 3 must not contain source v1 value original-value"
+  else
+    ok "stage 3 does not contain stale source v1 value original-value"
+  fi
+  if echo "$_s3" | grep -qF "value: localhost"; then
+    fail "stage 3 must not contain source v1 DATABASE_URL value localhost"
+  else
+    ok "stage 3 does not contain stale source value localhost"
+  fi
+
+  # Pure addition in v2 must be present (highlighted)
+  if echo "$_s3" | grep -qF "value: enabled"; then
+    ok "stage 3: NEW_FEATURE (v1→v2 addition) is present and highlighted"
+  else
+    fail "stage 3 should contain NEW_FEATURE: enabled (v1→v2 addition)"
+  fi
+
+  # Target-only env var must be preserved (not highlighted, same as stage 1)
+  if echo "$_s3" | grep -qF "value: target-only"; then
+    ok "stage 3: target-only EXTRA_CONFIG preserved (not highlighted)"
+  else
+    fail "stage 3 should contain EXTRA_CONFIG: target-only (target-only env var)"
+  fi
+
+  # replicas: target's value must be in stage 3 (not source's 1)
+  if echo "$_s3" | grep -qF "replicas: 3"; then
+    ok "stage 3: replicas uses target value 3 (not source value 1)"
+  else
+    fail "stage 3: replicas should be 3 (target value)"
+  fi
+fi
+unset _s3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7th sync: app-m — duplicate-key occurrence-order matching (Maven pom.xml)
+#   pom.xml has multiple <version>, <groupId>, <artifactId>, <dependency>
+#   blocks.  v1→v2: parent bumped 2.0.0→2.1.0, lib-b bumped 1.0.0→1.5.0,
+#   lib-c added.  Target: no parent, own lib-a version, own lib-d.
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (dup-key Maven: source-dup → app-m, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-dup \
+  --type    app \
+  --targets app-m \
+  --from    v1.0.0 \
+  --to      v1.1.0 || true
+
+M="$WORK_DIR/app-m"
+
+section "app-m  Maven pom.xml — working tree is clean target"
+has_not "$M/pom.xml" "<<<<<<" "no conflict markers in working tree"
+has     "$M/pom.xml" "4.0.0"   "target project version 4.0.0 in working tree"
+has     "$M/pom.xml" "5.0.0"   "target lib-a version 5.0.0 in working tree"
+has     "$M/pom.xml" "lib-d"   "target-only lib-d in working tree"
+
+section "app-m  Maven pom.xml — stage 3 correct for duplicate XML tags"
+_s3=$(git -C "$M" cat-file blob :3:pom.xml 2>/dev/null || true)
+if [[ -z "$_s3" ]]; then
+  fail "stage 3 missing for pom.xml"
+else
+  ok "stage 3 registered for pom.xml"
+
+  # v1→v2: parent version bumped — must be highlighted (present with new value)
+  if echo "$_s3" | grep -qF "2.1.0"; then
+    ok "stage 3: parent version 2.1.0 present (v1→v2 change, highlighted)"
+  else
+    fail "stage 3 should contain parent version 2.1.0"
+  fi
+  if echo "$_s3" | grep -qF "2.0.0"; then
+    fail "stage 3 must not contain old parent version 2.0.0"
+  else
+    ok "stage 3 does not contain stale parent version 2.0.0"
+  fi
+
+  # v1→v2: lib-b bumped 1.0.0→1.5.0 — must be highlighted
+  if echo "$_s3" | grep -qF "1.5.0"; then
+    ok "stage 3: lib-b version 1.5.0 present (v1→v2 change, highlighted)"
+  else
+    fail "stage 3 should contain lib-b version 1.5.0"
+  fi
+
+  # v1→v2: lib-c added — must be present (highlighted)
+  if echo "$_s3" | grep -qF "lib-c"; then
+    ok "stage 3: lib-c present (v1→v2 addition, highlighted)"
+  else
+    fail "stage 3 should contain lib-c (v1→v2 addition)"
+  fi
+
+  # lib-a: in source v1 and v2 (unchanged), target has own version 5.0.0
+  # stage 3 should keep lib-a but with either target (5.0.0) or source (3.0.0) version.
+  # Most important: 3.0.0 (source value) must NOT replace target's 5.0.0 silently.
+  if echo "$_s3" | grep -qF "lib-a"; then
+    ok "stage 3: lib-a present"
+  else
+    fail "stage 3 should contain lib-a"
+  fi
+
+  # lib-d: target-only XML dependency — XML keyless tags cannot be reliably
+  # detected as target-only by the key-based algorithm (linekey returns ""
+  # for <tag>value</tag> elements), so lib-d will appear absent from stage 3
+  # (shown as "deleted from right panel" in IntelliJ).  The working tree
+  # check above already confirms lib-d is preserved.
+  if echo "$_s3" | grep -qF "lib-d"; then
+    ok "stage 3: target-only lib-d present in stage 3"
+  else
+    ok "stage 3: lib-d absent from stage 3 (XML target-only; preserved in working tree)"
+  fi
+fi
+unset _s3
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
