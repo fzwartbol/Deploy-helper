@@ -642,6 +642,16 @@ patch_merge_file() {
         k = s; sub(/>.*/, "", k); sub(/^</, "", k)
         return k
       }
+      # XML closing tag alone on line: </tag> → key = "</tag>"
+      if (s ~ /^<\/[A-Za-z][A-Za-z0-9._-]*>$/) {
+        k = s; sub(/>$/, "", k); sub(/^<\//, "", k)
+        return "</" k ">"
+      }
+      # XML opening tag alone on line (no attrs): <tag> → key = "<tag>"
+      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*>$/) {
+        k = s; gsub(/[<>]/, "", k)
+        return "<" k ">"
+      }
       # YAML/properties: key: value or key=value
       k = s; sub(/[[:space:]]*[=:].*/, "", k)
       return (k != s && k != "") ? k : ""
@@ -692,8 +702,10 @@ patch_merge_file() {
         if (block_from_base && k != "" && pos > 0 && (k, pos) in tgt_occ)
           consumed[k, pos] = 1
       } else if (k == "") {
-        # Structural/keyless line unchanged in source — keep as-is
-        s3_arr[++s3n] = $0
+        # Keyless line unchanged in source: normalize whitespace-only lines to
+        # avoid diff noise when source and target use different blank-line forms.
+        _ws = $0; gsub(/[[:space:]]/, "", _ws)
+        s3_arr[++s3n] = (_ws == "") ? "" : $0
       } else if (pos > 0 && pos > base_cnt[k]) {
         # More occurrences in theirs than were in base v1 — new occurrence of
         # an existing key; emit as-is so it appears highlighted.
@@ -702,6 +714,10 @@ patch_merge_file() {
         # Unchanged keyed line: use the positionally-matching target occurrence
         s3_arr[++s3n] = tgt_occ[k, pos]
         consumed[k, pos] = 1
+      } else if (k ~ /^</) {
+        # XML structural tag: source has it but target does not.
+        # Keep source version so child-element context is preserved in stage3.
+        s3_arr[++s3n] = $0
       }
       # else: source has more occurrences of k than target at this position — drop
       next
