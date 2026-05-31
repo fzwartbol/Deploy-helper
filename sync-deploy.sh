@@ -637,6 +637,12 @@ patch_merge_file() {
   awk '
     function linekey(line,  k, s) {
       s = line; gsub(/^[[:space:]]+/, "", s)
+      # XML value element: <tag>content</tag> on one line → key = tag name
+      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*>[^<]*<\/[A-Za-z]/) {
+        k = s; sub(/>.*/, "", k); sub(/^</, "", k)
+        return k
+      }
+      # YAML/properties: key: value or key=value
       k = s; sub(/[[:space:]]*[=:].*/, "", k)
       return (k != s && k != "") ? k : ""
     }
@@ -687,6 +693,10 @@ patch_merge_file() {
           consumed[k, pos] = 1
       } else if (k == "") {
         # Structural/keyless line unchanged in source — keep as-is
+        s3_arr[++s3n] = $0
+      } else if (pos > 0 && pos > base_cnt[k]) {
+        # More occurrences in theirs than were in base v1 — new occurrence of
+        # an existing key; emit as-is so it appears highlighted.
         s3_arr[++s3n] = $0
       } else if ((k, pos) in tgt_occ) {
         # Unchanged keyed line: use the positionally-matching target occurrence
