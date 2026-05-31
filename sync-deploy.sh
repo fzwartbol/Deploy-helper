@@ -647,10 +647,10 @@ patch_merge_file() {
         k = s; sub(/>$/, "", k); sub(/^<\//, "", k)
         return "</" k ">"
       }
-      # XML opening tag alone on line (no attrs): <tag> → key = "<tag>"
-      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*>$/) {
-        k = s; gsub(/[<>]/, "", k)
-        return "<" k ">"
+      # XML opening/self-closing tag (with or without attrs): → key = "<tag>"
+      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[ >\/]/) {
+        k = s; sub(/[ >\/].*/, "", k); sub(/^</, "", k)
+        if (k ~ /^[A-Za-z][A-Za-z0-9._-]*$/) return "<" k ">"
       }
       # YAML/properties: key: value or key=value
       k = s; sub(/[[:space:]]*[=:].*/, "", k)
@@ -660,7 +660,7 @@ patch_merge_file() {
       s = line; gsub(/^[[:space:]]+/, "", s)
       return (substr(s, 1, 2) == "- ")
     }
-    BEGIN { filenum = 0; block_from_base = 1; tgt_last_k = ""; tgt_last_p = 0 }
+    BEGIN { filenum = 0; block_from_base = 1; tgt_last_k = ""; tgt_last_p = 0; tgt_had_keys = 0 }
     FNR == 1 { filenum++; block_from_base = 1 }
 
     # ── File 1: target ──────────────────────────────────────────────────────
@@ -673,11 +673,16 @@ patch_merge_file() {
         tgt_occ[k, tgt_cnt[k]] = $0
         tgt_key_occ_num[tgt_n] = tgt_cnt[k]
         tgt_last_k = k; tgt_last_p = tgt_cnt[k]
+        tgt_had_keys = 1
       } else {
         # Record each keyless line under its preceding keyed anchor so file-3
         # can decide whether target has one at that position.
         n = ++tgt_keyless_cnt[tgt_last_k, tgt_last_p]
         tgt_keyless_occ[tgt_last_k, tgt_last_p, n] = $0
+        # Content index used as fallback for comment lines whose anchor position
+        # in source differs from target (stripped content as key).
+        _kl_s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_s)
+        if (_kl_s != "") { c = ++tgt_kl_cc[_kl_s]; tgt_kl_cl[_kl_s, c] = $0 }
       }
       next
     }
@@ -713,13 +718,24 @@ patch_merge_file() {
         if (block_from_base && k != "" && pos > 0 && (k, pos) in tgt_occ)
           consumed[k, pos] = 1
       } else if (k == "") {
-        # Keyless line (blank/comment) unchanged in source.
-        # Anchor lookup: emit the corresponding target keyless line if present,
-        # skip if target has none at that position (avoids false highlights
-        # from source blank lines that are absent in target).
+        # Keyless line (blank/comment) unchanged in source. Three-tier lookup:
+        # 1) Anchor: emit target keyless line at same relative position.
+        # 2) Content fallback: find the same stripped content anywhere in target
+        #    keyless lines (handles comment lines displaced relative to anchors).
+        # 3) No-keys fallback: if target has no keyed lines at all (Jenkinsfiles,
+        #    shell scripts) fall back to source value, preserving old behaviour.
         n = ++theirs_keyless_n[theirs_last_k, theirs_last_p]
-        if ((theirs_last_k, theirs_last_p, n) in tgt_keyless_occ)
+        if ((theirs_last_k, theirs_last_p, n) in tgt_keyless_occ) {
           s3_arr[++s3n] = tgt_keyless_occ[theirs_last_k, theirs_last_p, n]
+        } else {
+          _kl_s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_s)
+          if (_kl_s != "" && (_kl_s in tgt_kl_cc)) {
+            _kl_u = ++tgt_kl_cu[_kl_s]
+            if ((_kl_s, _kl_u) in tgt_kl_cl) s3_arr[++s3n] = tgt_kl_cl[_kl_s, _kl_u]
+          } else if (!tgt_had_keys) {
+            s3_arr[++s3n] = $0
+          }
+        }
       } else if (pos > 0 && pos > base_cnt[k]) {
         # More occurrences in theirs than were in base v1 — new occurrence of
         # an existing key; emit as-is so it appears highlighted.
