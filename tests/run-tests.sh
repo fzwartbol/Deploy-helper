@@ -1535,6 +1535,59 @@ EOF
 with_work "app-m" "" app_m_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SOURCE DEL REPO  (testspace/source-del-repo)
+# Minimal YAML with env-var blocks — tests that a key deleted in v2 does NOT
+# appear in stage3 even when target still contains that key.
+# v1.0.0 → KEY_A + KEY_B
+# v1.1.0 → KEY_A value changed, KEY_B DELETED, KEY_C ADDED
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-del-repo"
+
+source_del_v1() {
+  cat > config.yaml <<'EOF'
+app:
+  env:
+  - name: KEY_A
+    value: val-a
+  - name: KEY_B
+    value: val-b
+EOF
+}
+with_work "source-del-repo" "v1.0.0" source_del_v1
+
+source_del_v2() {
+  cat > config.yaml <<'EOF'
+app:
+  env:
+  - name: KEY_A
+    value: val-a-new
+  - name: KEY_C
+    value: val-c
+EOF
+}
+with_work "source-del-repo" "v1.1.0" source_del_v2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-del  (testspace/app-del)
+# Has KEY_A (custom value), KEY_B (target still holds it), KEY_D (target-only)
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-del"
+
+app_del_initial() {
+  cat > config.yaml <<'EOF'
+app:
+  env:
+  - name: KEY_A
+    value: prod-a
+  - name: KEY_B
+    value: prod-b
+  - name: KEY_D
+    value: target-only
+EOF
+}
+with_work "app-del" "" app_del_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generate test repos.json pointing to our local testspace/ repos
 # Uses the new grouped "apps" structure
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1756,6 +1809,28 @@ cat > "$T/repos.test.json" <<'EOF'
           "app_name":     "app-m",
           "java_package": "com.app.m",
           "java_path":    "com/app/m"
+        }
+      }
+    },
+    {
+      "name": "source-del",
+      "app": {
+        "repo": "testspace/source-del-repo",
+        "substitutions": {
+          "app_name":     "source-del",
+          "java_package": "com.source.del",
+          "java_path":    "com/source/del"
+        }
+      }
+    },
+    {
+      "name": "app-del",
+      "app": {
+        "repo": "testspace/app-del",
+        "substitutions": {
+          "app_name":     "app-del",
+          "java_package": "com.app.del",
+          "java_path":    "com/app/del"
         }
       }
     }
@@ -2453,6 +2528,74 @@ else
   fi
 fi
 unset _s3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8th sync: app-del — deleted source key must NOT appear in stage3
+#   source v1.0.0→v1.1.0: KEY_A value changed, KEY_B deleted, KEY_C added.
+#   Target still has KEY_B and a target-only KEY_D.
+#   Stage3 must NOT contain KEY_B (it was deleted from source v2).
+#   Stage3 MUST contain KEY_C (new addition) and KEY_D (target-only).
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (deletion test: source-del → app-del, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-del \
+  --type    app \
+  --targets app-del \
+  --from    v1.0.0 \
+  --to      v1.1.0 || true
+
+DEL="$WORK_DIR/app-del"
+
+section "app-del  deletion — working tree is clean target"
+has_not "$DEL/config.yaml" "<<<<<<" "no conflict markers in working tree"
+has     "$DEL/config.yaml" "value: prod-a"       "target KEY_A value in working tree"
+has     "$DEL/config.yaml" "value: prod-b"       "target KEY_B value in working tree"
+has     "$DEL/config.yaml" "value: target-only"  "target-only KEY_D in working tree"
+
+section "app-del  deletion — stage3 correct (deleted key absent, target-only preserved)"
+_s3del=$(git -C "$DEL" cat-file blob :3:config.yaml 2>/dev/null || true)
+if [[ -z "$_s3del" ]]; then
+  fail "stage 3 missing for config.yaml"
+else
+  ok "stage 3 registered for config.yaml"
+
+  # KEY_B was in source v1 and target, but DELETED from source v2
+  # → must NOT appear in stage3 (right panel = source v2 end state)
+  if echo "$_s3del" | grep -qF "KEY_B"; then
+    fail "stage 3 must NOT contain KEY_B (deleted from source v2)"
+  else
+    ok "stage 3 does not contain KEY_B (correctly absent — deleted in source v2)"
+  fi
+  if echo "$_s3del" | grep -qF "prod-b"; then
+    fail "stage 3 must NOT contain prod-b (KEY_B value, deleted in source v2)"
+  else
+    ok "stage 3 does not contain KEY_B value prod-b"
+  fi
+
+  # KEY_A value changed v1→v2 (val-a → val-a-new) → must be highlighted
+  if echo "$_s3del" | grep -qF "val-a-new"; then
+    ok "stage 3: KEY_A shows val-a-new (v1→v2 change, highlighted)"
+  else
+    fail "stage 3 should contain KEY_A new value val-a-new"
+  fi
+
+  # KEY_C was added in source v2 → must appear (highlighted)
+  if echo "$_s3del" | grep -qF "KEY_C"; then
+    ok "stage 3: KEY_C present (v1→v2 addition, highlighted)"
+  else
+    fail "stage 3 should contain KEY_C (added in source v2)"
+  fi
+
+  # KEY_D is target-only → must be re-inserted in stage3
+  if echo "$_s3del" | grep -qF "KEY_D"; then
+    ok "stage 3: target-only KEY_D preserved (re-inserted, not highlighted)"
+  else
+    fail "stage 3 should contain KEY_D (target-only, must be re-inserted)"
+  fi
+fi
+unset _s3del
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary

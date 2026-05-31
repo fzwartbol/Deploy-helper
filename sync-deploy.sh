@@ -663,7 +663,7 @@ patch_merge_file() {
     # ── File 2: base ────────────────────────────────────────────────────────
     filenum == 2 {
       base_lines[$0] = 1
-      k = linekey($0); if (k != "") base_keys[k] = 1
+      k = linekey($0); if (k != "") { base_keys[k] = 1; base_cnt[k]++ }
       next
     }
 
@@ -714,7 +714,9 @@ patch_merge_file() {
         if (k == "") { cur_ins_after = -1; continue }
         n = tgt_key_occ_num[i]
         if ((k, n) in consumed) { cur_ins_after = -1; continue }
-        # This target slot was never consumed — it is target-only
+        # Slot corresponds to a source key deleted in v2 — skip it
+        if (n <= base_cnt[k]) { cur_ins_after = -1; continue }
+        # This target slot is truly target-only (target has more occurrences than source v1)
         if (cur_ins_after == -1) {
           cur_ins_after = 0
           for (j = i - 1; j >= 1; j--) {
