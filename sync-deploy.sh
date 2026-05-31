@@ -660,7 +660,7 @@ patch_merge_file() {
       s = line; gsub(/^[[:space:]]+/, "", s)
       return (substr(s, 1, 2) == "- ")
     }
-    BEGIN { filenum = 0; block_from_base = 1 }
+    BEGIN { filenum = 0; block_from_base = 1; tgt_last_k = ""; tgt_last_p = 0 }
     FNR == 1 { filenum++; block_from_base = 1 }
 
     # ── File 1: target ──────────────────────────────────────────────────────
@@ -672,6 +672,12 @@ patch_merge_file() {
         tgt_cnt[k]++
         tgt_occ[k, tgt_cnt[k]] = $0
         tgt_key_occ_num[tgt_n] = tgt_cnt[k]
+        tgt_last_k = k; tgt_last_p = tgt_cnt[k]
+      } else {
+        # Record each keyless line under its preceding keyed anchor so file-3
+        # can decide whether target has one at that position.
+        n = ++tgt_keyless_cnt[tgt_last_k, tgt_last_p]
+        tgt_keyless_occ[tgt_last_k, tgt_last_p, n] = $0
       }
       next
     }
@@ -691,8 +697,13 @@ patch_merge_file() {
         block_from_base = ($0 in base_lines) ? 1 : 0
       }
       k = linekey($0)
-      # Count positional occurrences only for base-origin blocks
-      if (k != "" && block_from_base) theirs_all_pos[k]++
+      # Count positional occurrences only for base-origin blocks; also update the
+      # keyless-matching anchor used to align blank/structural lines with target.
+      if (k != "" && block_from_base) {
+        theirs_all_pos[k]++
+        theirs_last_k = k; theirs_last_p = theirs_all_pos[k]
+        theirs_keyless_n[theirs_last_k, theirs_last_p] = 0
+      }
       pos = (k != "" && block_from_base) ? theirs_all_pos[k] : 0
 
       if (!($0 in base_lines)) {
@@ -702,10 +713,13 @@ patch_merge_file() {
         if (block_from_base && k != "" && pos > 0 && (k, pos) in tgt_occ)
           consumed[k, pos] = 1
       } else if (k == "") {
-        # Keyless line unchanged in source: normalize whitespace-only lines to
-        # avoid diff noise when source and target use different blank-line forms.
-        _ws = $0; gsub(/[[:space:]]/, "", _ws)
-        s3_arr[++s3n] = (_ws == "") ? "" : $0
+        # Keyless line (blank/comment) unchanged in source.
+        # Anchor lookup: emit the corresponding target keyless line if present,
+        # skip if target has none at that position (avoids false highlights
+        # from source blank lines that are absent in target).
+        n = ++theirs_keyless_n[theirs_last_k, theirs_last_p]
+        if ((theirs_last_k, theirs_last_p, n) in tgt_keyless_occ)
+          s3_arr[++s3n] = tgt_keyless_occ[theirs_last_k, theirs_last_p, n]
       } else if (pos > 0 && pos > base_cnt[k]) {
         # More occurrences in theirs than were in base v1 — new occurrence of
         # an existing key; emit as-is so it appears highlighted.
