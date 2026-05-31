@@ -647,6 +647,11 @@ patch_merge_file() {
         k = s; sub(/>$/, "", k); sub(/^<\//, "", k)
         return "</" k ">"
       }
+      # Self-closing tag with NO attributes: <tag/> or <tag /> → key = tagname
+      # (same key space as value elements so source/target forms interoperate)
+      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[[:space:]]*\/>$/) {
+        k = s; sub(/[[:space:]]*\/>$/, "", k); sub(/^</, "", k); return k
+      }
       # XML opening/self-closing tag (with or without attrs): → key = "<tag>"
       if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[ >\/]/) {
         k = s; sub(/[ >\/].*/, "", k); sub(/^</, "", k)
@@ -728,10 +733,17 @@ patch_merge_file() {
         # 3) No-keys fallback: if target has no keyed lines at all (Jenkinsfiles,
         #    shell scripts) fall back to source value, preserving old behaviour.
         n = ++theirs_keyless_n[theirs_last_k, theirs_last_p]
+        _kl_s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_s)
         if ((theirs_last_k, theirs_last_p, n) in tgt_keyless_occ) {
-          s3_arr[++s3n] = tgt_keyless_occ[theirs_last_k, theirs_last_p, n]
+          _kl_hit = tgt_keyless_occ[theirs_last_k, theirs_last_p, n]
+          _kl_hit_s = _kl_hit; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_hit_s)
+          if (_kl_s == _kl_hit_s) {
+            s3_arr[++s3n] = _kl_hit
+          } else if (_kl_s != "" && (_kl_s in tgt_kl_cc)) {
+            _kl_u = ++tgt_kl_cu[_kl_s]
+            if ((_kl_s, _kl_u) in tgt_kl_cl) s3_arr[++s3n] = tgt_kl_cl[_kl_s, _kl_u]
+          } else if (!tgt_had_keys) { s3_arr[++s3n] = $0 }
         } else {
-          _kl_s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_s)
           if (_kl_s != "" && (_kl_s in tgt_kl_cc)) {
             _kl_u = ++tgt_kl_cu[_kl_s]
             if ((_kl_s, _kl_u) in tgt_kl_cl) s3_arr[++s3n] = tgt_kl_cl[_kl_s, _kl_u]
@@ -746,7 +758,7 @@ patch_merge_file() {
       } else if ((k, pos) in tgt_occ) {
         _src_cv = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _src_cv)
         _tgt_cv = tgt_occ[k, pos]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _tgt_cv)
-        if (_src_cv == _tgt_cv || k ~ /^</) {
+        if (_src_cv == _tgt_cv || (k ~ /^</ && _src_cv == k)) {
           s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1
         } else if (_src_cv in tgt_cv_cnt) {
           _cu = ++tgt_cv_used[_src_cv]
@@ -754,7 +766,11 @@ patch_merge_file() {
             s3_arr[++s3n] = tgt_cv_arr[_src_cv, _cu]
             consumed[k, tgt_cv_tgt_pos[_src_cv, _cu]] = 1
             mismatch_skipped[k, pos] = 1
+          } else if (k ~ /^</ && _src_cv != k) {
+            s3_arr[++s3n] = $0; consumed[k, pos] = 1
           } else { s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1 }
+        } else if (k ~ /^</ && _src_cv != k) {
+          s3_arr[++s3n] = $0; consumed[k, pos] = 1
         } else { s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1 }
       } else if (k ~ /^</) {
         # XML structural tag: source has it but target does not.
