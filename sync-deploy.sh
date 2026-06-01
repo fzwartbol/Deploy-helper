@@ -658,8 +658,15 @@ patch_merge_file() {
         if (k ~ /^[A-Za-z][A-Za-z0-9._-]*$/) return "<" k ">"
       }
       # YAML/properties: key: value or key=value
+      # Require key to be a valid identifier (no spaces, parens, slashes, etc.)
+      # so that code lines in Groovy/shell files that happen to contain ':' or
+      # '=' are not misidentified as config keys.
+      # Also accept YAML list-item keys ("- identifier") used by env-var blocks.
       k = s; sub(/[[:space:]]*[=:].*/, "", k)
-      return (k != s && k != "") ? k : ""
+      if (k == s || k == "") return ""
+      if (k ~ /^[A-Za-z_][A-Za-z0-9._-]*$/) return k
+      if (k ~ /^-[[:space:]]+[A-Za-z_][A-Za-z0-9._-]*$/) return k
+      return ""
     }
     function is_list_header(line,  s) {
       s = line; gsub(/^[[:space:]]+/, "", s)

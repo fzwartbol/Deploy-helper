@@ -1633,6 +1633,91 @@ EOF
 with_work "app-prekey" "" app_prekey_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SOURCE JENKINSFILE REPO  (testspace/source-jenkins-repo)
+# Regression for linekey() false-positive on Groovy/shell code files:
+# lines like "choice(choices: [...])" and "// URL: https://..." contain ':' and
+# were being parsed as YAML keys, setting tgt_had_keys=1 and causing the keyed
+# matching logic to scramble keyless Jenkinsfile content in stage3.
+# v1.0.0: Jenkinsfile with choice() parameters and a cron comment block
+# v1.1.0: one cron comment line changed ("# Old comment:" → "# New comment:")
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-jenkins-repo"
+
+source_jenkins_v1() {
+  cat > Jenkinsfile <<'EOF'
+/**********************************************/
+pipeline {
+    agent { node { label 'master-node' } }
+
+    parameters {
+        choice(choices: ['build','deploy'], description: 'Selecteer optie: ', name: 'Optie')
+    }
+
+    triggers {
+        // Bekijk cron opties op: https://crontab.guru
+        parameterizedCron(env.BRANCH_NAME == 'develop' ? '''
+            # Old comment: run every wednesday
+            # 0 22 * * 3 % Optie=build;
+           ''' : '')
+    }
+}
+EOF
+}
+with_work "source-jenkins-repo" "v1.0.0" source_jenkins_v1
+
+source_jenkins_v2() {
+  cat > Jenkinsfile <<'EOF'
+/**********************************************/
+pipeline {
+    agent { node { label 'master-node' } }
+
+    parameters {
+        choice(choices: ['build','deploy'], description: 'Selecteer optie: ', name: 'Optie')
+    }
+
+    triggers {
+        // Bekijk cron opties op: https://crontab.guru
+        parameterizedCron(env.BRANCH_NAME == 'develop' ? '''
+            # New comment: run every thursday
+            # 0 22 * * 4 % Optie=build;
+           ''' : '')
+    }
+}
+EOF
+}
+with_work "source-jenkins-repo" "v1.1.0" source_jenkins_v2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-jenkins  (testspace/app-jenkins)
+# Same Jenkinsfile as source v1 (target has no customisations).
+# Stage3 must: preserve the header comment, preserve choice() lines unchanged,
+# and highlight only the two changed cron lines.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-jenkins"
+
+app_jenkins_initial() {
+  cat > Jenkinsfile <<'EOF'
+/**********************************************/
+pipeline {
+    agent { node { label 'master-node' } }
+
+    parameters {
+        choice(choices: ['build','deploy'], description: 'Selecteer optie: ', name: 'Optie')
+    }
+
+    triggers {
+        // Bekijk cron opties op: https://crontab.guru
+        parameterizedCron(env.BRANCH_NAME == 'develop' ? '''
+            # Old comment: run every wednesday
+            # 0 22 * * 3 % Optie=build;
+           ''' : '')
+    }
+}
+EOF
+}
+with_work "app-jenkins" "" app_jenkins_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generate test repos.json pointing to our local testspace/ repos
 # Uses the new grouped "apps" structure
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1898,6 +1983,28 @@ cat > "$T/repos.test.json" <<'EOF'
           "app_name":     "app-prekey",
           "java_package": "com.app.prekey",
           "java_path":    "com/app/prekey"
+        }
+      }
+    },
+    {
+      "name": "source-jenkins",
+      "app": {
+        "repo": "testspace/source-jenkins-repo",
+        "substitutions": {
+          "app_name":     "source-jenkins",
+          "java_package": "com.source.jenkins",
+          "java_path":    "com/source/jenkins"
+        }
+      }
+    },
+    {
+      "name": "app-jenkins",
+      "app": {
+        "repo": "testspace/app-jenkins",
+        "substitutions": {
+          "app_name":     "app-jenkins",
+          "java_package": "com.app.jenkins",
+          "java_path":    "com/app/jenkins"
         }
       }
     }
@@ -2708,6 +2815,66 @@ else
   fi
 fi
 unset _s3pk
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10th sync: app-jenkins — Jenkinsfile with Groovy/URL lines must not be
+#            misidentified as YAML keys (regression for linekey() false-positive)
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (Jenkinsfile test: source-jenkins → app-jenkins, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-jenkins \
+  --type    app \
+  --targets app-jenkins \
+  --from    v1.0.0 \
+  --to      v1.1.0 || true
+
+JK="$WORK_DIR/app-jenkins"
+
+section "app-jenkins  Jenkinsfile — stage3 preserves structural lines unchanged"
+_s3jk=$(git -C "$JK" cat-file blob :3:Jenkinsfile 2>/dev/null || true)
+if [[ -z "$_s3jk" ]]; then
+  fail "stage 3 missing for Jenkinsfile"
+else
+  ok "stage 3 registered for Jenkinsfile"
+
+  # Header comment must survive (was dropped when choice() set tgt_had_keys=1)
+  if echo "$_s3jk" | grep -qF "/*************"; then
+    ok "stage 3 preserves block-comment header (not dropped by false-key mismatch)"
+  else
+    fail "stage 3 must contain block-comment header '/**'"
+  fi
+
+  # choice() line unchanged in v1→v2 — must appear unmodified in stage3
+  if echo "$_s3jk" | grep -qF "choice(choices:"; then
+    ok "stage 3 preserves choice() line (Groovy ':' not treated as YAML key)"
+  else
+    fail "stage 3 must contain choice() line unchanged"
+  fi
+
+  # URL comment unchanged — must appear (was false-keyed by '://' before fix)
+  if echo "$_s3jk" | grep -qF "https://crontab.guru"; then
+    ok "stage 3 preserves URL comment (URL ':' not treated as YAML key)"
+  else
+    fail "stage 3 must contain URL comment unchanged"
+  fi
+
+  # Changed cron lines must be present (highlighted = source v2 values)
+  if echo "$_s3jk" | grep -qF "New comment:"; then
+    ok "stage 3 shows changed cron comment (highlighted)"
+  else
+    fail "stage 3 must show changed cron comment 'New comment:'"
+  fi
+
+  # Old cron comment must NOT be in stage3
+  if echo "$_s3jk" | grep -qF "Old comment:"; then
+    fail "stage 3 must NOT contain old cron comment (replaced in source v2)"
+  else
+    ok "stage 3 does not contain old cron comment (correctly replaced)"
+  fi
+fi
+unset _s3jk
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
