@@ -665,7 +665,7 @@ patch_merge_file() {
       s = line; gsub(/^[[:space:]]+/, "", s)
       return (substr(s, 1, 2) == "- ")
     }
-    BEGIN { filenum = 0; block_from_base = 1; tgt_last_k = ""; tgt_last_p = 0; tgt_had_keys = 0 }
+    BEGIN { filenum = 0; block_from_base = 1; tgt_last_k = ""; tgt_last_p = 0; tgt_had_keys = 0; theirs_last_k = ""; theirs_last_p = 0 }
     FNR == 1 { filenum++; block_from_base = 1 }
 
     # ── File 1: target ──────────────────────────────────────────────────────

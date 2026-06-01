@@ -1588,6 +1588,51 @@ EOF
 with_work "app-del" "" app_del_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SOURCE PREKEY REPO  (testspace/source-prekey-repo)
+# Regression for pre-key keyless anchor mismatch: theirs_last_p was uninitialized
+# ("") while tgt_last_p was 0, so comments BEFORE the first keyed line were
+# stored under anchor ("",0) but looked up under ("",""), causing them to be
+# dropped from stage3 and appear displaced.
+# v1.0.0: leading comment + <version.a> unchanged, <version.b> val
+# v1.1.0: same comment + <version.a> unchanged, <version.b> bumped
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-prekey-repo"
+
+source_prekey_v1() {
+  cat > versions.xml <<'EOF'
+<!-- managed versions -->
+<version.a>1.0.0</version.a>
+<version.b>2.0.0</version.b>
+EOF
+}
+with_work "source-prekey-repo" "v1.0.0" source_prekey_v1
+
+source_prekey_v2() {
+  cat > versions.xml <<'EOF'
+<!-- managed versions -->
+<version.a>1.0.0</version.a>
+<version.b>2.1.0</version.b>
+EOF
+}
+with_work "source-prekey-repo" "v1.1.0" source_prekey_v2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGET REPO: app-prekey  (testspace/app-prekey)
+# Same structure as source v1 — target has no customisations so the pre-key
+# comment must pass through unchanged and version.b must show as highlighted.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "app-prekey"
+
+app_prekey_initial() {
+  cat > versions.xml <<'EOF'
+<!-- managed versions -->
+<version.a>1.0.0</version.a>
+<version.b>2.0.0</version.b>
+EOF
+}
+with_work "app-prekey" "" app_prekey_initial
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generate test repos.json pointing to our local testspace/ repos
 # Uses the new grouped "apps" structure
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1831,6 +1876,28 @@ cat > "$T/repos.test.json" <<'EOF'
           "app_name":     "app-del",
           "java_package": "com.app.del",
           "java_path":    "com/app/del"
+        }
+      }
+    },
+    {
+      "name": "source-prekey",
+      "app": {
+        "repo": "testspace/source-prekey-repo",
+        "substitutions": {
+          "app_name":     "source-prekey",
+          "java_package": "com.source.prekey",
+          "java_path":    "com/source/prekey"
+        }
+      }
+    },
+    {
+      "name": "app-prekey",
+      "app": {
+        "repo": "testspace/app-prekey",
+        "substitutions": {
+          "app_name":     "app-prekey",
+          "java_package": "com.app.prekey",
+          "java_path":    "com/app/prekey"
         }
       }
     }
@@ -2596,6 +2663,51 @@ else
   fi
 fi
 unset _s3del
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9th sync: app-prekey — pre-key comment must survive in stage3
+#   Regression for theirs_last_p uninitialised bug: comments before the first
+#   keyed line were stored under anchor ("",0) but looked up under ("",""),
+#   causing them to be silently dropped from stage3.
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (pre-key comment test: source-prekey → app-prekey, v1.0.0 → v1.1.0)${NC}"
+
+bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-prekey \
+  --type    app \
+  --targets app-prekey \
+  --from    v1.0.0 \
+  --to      v1.1.0 || true
+
+PK="$WORK_DIR/app-prekey"
+
+section "app-prekey  pre-key comment — stage3 contains leading comment"
+_s3pk=$(git -C "$PK" cat-file blob :3:versions.xml 2>/dev/null || true)
+if [[ -z "$_s3pk" ]]; then
+  fail "stage 3 missing for versions.xml"
+else
+  ok "stage 3 registered for versions.xml"
+
+  if echo "$_s3pk" | grep -qF "<!-- managed versions -->"; then
+    ok "stage 3 contains pre-key comment (not dropped by anchor mismatch)"
+  else
+    fail "stage 3 must contain '<!-- managed versions -->' (pre-key comment)"
+  fi
+
+  if echo "$_s3pk" | grep -qF "<version.a>1.0.0</version.a>"; then
+    ok "stage 3: version.a unchanged — correctly not highlighted"
+  else
+    fail "stage 3 should contain version.a 1.0.0 (unchanged)"
+  fi
+
+  if echo "$_s3pk" | grep -qF "<version.b>2.1.0</version.b>"; then
+    ok "stage 3: version.b shows 2.1.0 (v1→v2 change, highlighted)"
+  else
+    fail "stage 3 should show version.b 2.1.0 (changed in source v2)"
+  fi
+fi
+unset _s3pk
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
