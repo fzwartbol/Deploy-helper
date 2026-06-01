@@ -739,17 +739,12 @@ patch_merge_file() {
           _kl_hit_s = _kl_hit; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_hit_s)
           if (_kl_s == _kl_hit_s) {
             s3_arr[++s3n] = _kl_hit
-          } else if (_kl_s != "" && (_kl_s in tgt_kl_cc)) {
-            _kl_u = ++tgt_kl_cu[_kl_s]
-            if ((_kl_s, _kl_u) in tgt_kl_cl) s3_arr[++s3n] = tgt_kl_cl[_kl_s, _kl_u]
           } else if (!tgt_had_keys) { s3_arr[++s3n] = $0 }
+          else { theirs_keyless_n[theirs_last_k, theirs_last_p]-- }
+        } else if (!tgt_had_keys) {
+          s3_arr[++s3n] = $0
         } else {
-          if (_kl_s != "" && (_kl_s in tgt_kl_cc)) {
-            _kl_u = ++tgt_kl_cu[_kl_s]
-            if ((_kl_s, _kl_u) in tgt_kl_cl) s3_arr[++s3n] = tgt_kl_cl[_kl_s, _kl_u]
-          } else if (!tgt_had_keys) {
-            s3_arr[++s3n] = $0
-          }
+          theirs_keyless_n[theirs_last_k, theirs_last_p]--
         }
       } else if (pos > 0 && pos > base_cnt[k]) {
         # More occurrences in theirs than were in base v1 — new occurrence of
