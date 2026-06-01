@@ -672,7 +672,7 @@ patch_merge_file() {
       s = line; gsub(/^[[:space:]]+/, "", s)
       return (substr(s, 1, 2) == "- ")
     }
-    BEGIN { filenum = 0; block_from_base = 1; tgt_last_k = ""; tgt_last_p = 0; tgt_had_keys = 0; theirs_last_k = ""; theirs_last_p = 0 }
+    BEGIN { filenum = 0; block_from_base = 1; tgt_last_k = ""; tgt_last_p = 0; tgt_had_keys = 0; theirs_last_k = ""; theirs_last_p = 0; tc_d = 0; bc_d = 0 }
     FNR == 1 { filenum++; block_from_base = 1 }
 
     # ── File 1: target ──────────────────────────────────────────────────────
@@ -681,11 +681,15 @@ patch_merge_file() {
       tgt_ord[tgt_n] = $0
       k = linekey($0)
       if (k != "") {
+        _ctx = (tc_d > 0) ? tc_s[tc_d] : ""
         tgt_cnt[k]++
         tgt_occ[k, tgt_cnt[k]] = $0
+        tgt_occ_ctx[k, tgt_cnt[k]] = _ctx
         tgt_key_occ_num[tgt_n] = tgt_cnt[k]
         tgt_last_k = k; tgt_last_p = tgt_cnt[k]
         tgt_had_keys = 1
+        if (k ~ /^<[^\/]/) { tc_c[k]++; tc_s[++tc_d] = k ":" tc_c[k] }
+        else if (k ~ /^<\//) { if (tc_d > 0) delete tc_s[tc_d--] }
       } else {
         # Record each keyless line under its preceding keyed anchor so file-3
         # can decide whether target has one at that position.
@@ -702,7 +706,15 @@ patch_merge_file() {
     # ── File 2: base ────────────────────────────────────────────────────────
     filenum == 2 {
       base_lines[$0] = 1
-      k = linekey($0); if (k != "") { base_keys[k] = 1; base_cnt[k]++ }
+      k = linekey($0)
+      _ctx = (bc_d > 0) ? bc_s[bc_d] : ""
+      if (k != "") {
+        base_keys[k] = 1
+        base_cnt[k]++
+        base_occ_ctx[k, base_cnt[k]] = _ctx
+        if (k ~ /^<[^\/]/) { bc_c[k]++; bc_s[++bc_d] = k ":" bc_c[k] }
+        else if (k ~ /^<\//) { if (bc_d > 0) delete bc_s[bc_d--] }
+      }
       _bv = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _bv); base_cv[_bv] = 1
       next
     }
@@ -727,8 +739,11 @@ patch_merge_file() {
       if (!($0 in base_lines)) {
         # v1→v2 change or pure addition — keep as-is (will be highlighted)
         s3_arr[++s3n] = $0
-        # Consume the corresponding target slot for base-origin block changes
-        if (block_from_base && k != "" && pos > 0 && (k, pos) in tgt_occ)
+        # Consume the corresponding target slot for base-origin block changes,
+        # but only when base and target share the same structural context for
+        # this positional slot (XML context tag:occurrence).
+        if (block_from_base && k != "" && pos > 0 && (k, pos) in tgt_occ &&
+            base_occ_ctx[k, pos] == tgt_occ_ctx[k, pos])
           consumed[k, pos] = 1
       } else if (k == "") {
         # Keyless line (blank/comment) unchanged in source. Three-tier lookup:
@@ -756,15 +771,18 @@ patch_merge_file() {
         # an existing key; emit as-is so it appears highlighted.
         s3_arr[++s3n] = $0
       } else if ((k, pos) in tgt_occ) {
-        # Source did not change this line — always use the target value at the same
-        # positional slot so no spurious highlight appears.  The previous approach
-        # content-matched across positions (mismatch_skipped), which consumed wrong
-        # slots and caused the skipped slot to be re-inserted by END, producing
-        # both reordering and duplication.
-        s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1
+        # Source did not change this line. Substitute target value only when
+        # base and target share the same structural context for this positional
+        # slot (XML context = "tag:occurrence"). A mismatch means target removed
+        # or added a block that shifted subsequent positions, so we keep the
+        # theirs value (which will be highlighted) to avoid wrong substitutions.
+        if (base_occ_ctx[k, pos] == tgt_occ_ctx[k, pos]) {
+          s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1
+        } else {
+          s3_arr[++s3n] = $0
+        }
       } else if (k ~ /^</) {
         # XML structural tag: source has it but target does not.
-        # Keep source version so child-element context is preserved in stage3.
         s3_arr[++s3n] = $0
       }
       # else: source has more occurrences of k than target at this position — drop
