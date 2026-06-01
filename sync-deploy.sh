@@ -820,6 +820,53 @@ patch_merge_file() {
     }
   ' "$tgt_abs" "$base" "$theirs" > "$stage3"
 
+  # ── Stage3 integrity check ───────────────────────────────────────────────────
+  # Invariant: for every key K, stage3 must not contain more occurrences than
+  # theirs_count[K] + max(0, tgt_count[K] - base_count[K]).
+  # The second term is the number of target-only additions (lines target added
+  # beyond base that must be re-inserted).  Exceeding this sum means the
+  # reconstruction duplicated a line — fall back to theirs so the user still
+  # sees highlighted diffs, just without the smart target-preservation.
+  local _s3_violations
+  _s3_violations=$(awk '
+    function linekey(line,  k, s) {
+      s = line; gsub(/^[[:space:]]+/, "", s)
+      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*>[^<]*<\/[A-Za-z]/) {
+        k = s; sub(/>.*/, "", k); sub(/^</, "", k); return k
+      }
+      if (s ~ /^<\/[A-Za-z][A-Za-z0-9._-]*>$/) {
+        k = s; sub(/>$/, "", k); sub(/^<\//, "", k); return "</" k ">"
+      }
+      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[[:space:]]*\/>$/) {
+        k = s; sub(/[[:space:]]*\/>$/, "", k); sub(/^</, "", k); return k
+      }
+      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[ >\/]/) {
+        k = s; sub(/[ >\/].*/, "", k); sub(/^</, "", k)
+        if (k ~ /^[A-Za-z][A-Za-z0-9._-]*$/) return "<" k ">"
+      }
+      k = s; sub(/[[:space:]]*[=:].*/, "", k)
+      return (k != s && k != "") ? k : ""
+    }
+    FNR == 1 { filenum++ }
+    filenum == 1 { k = linekey($0); if (k != "") tgt_cnt[k]++;    next }
+    filenum == 2 { k = linekey($0); if (k != "") base_cnt[k]++;   next }
+    filenum == 3 { k = linekey($0); if (k != "") theirs_cnt[k]++; next }
+    filenum == 4 {
+      k = linekey($0); if (k == "") next
+      s3_cnt[k]++
+      tgt_only = (tgt_cnt[k] > base_cnt[k]) ? (tgt_cnt[k] - base_cnt[k]) : 0
+      expected = theirs_cnt[k] + tgt_only
+      if (s3_cnt[k] > expected) { print "DUPLICATE key=" k; violations++ }
+    }
+    END { exit (violations > 0) }
+  ' "$tgt_abs" "$base" "$theirs" "$stage3" 2>/dev/null)
+
+  if [[ -n "$_s3_violations" ]]; then
+    log_warn "pm: stage3 integrity check failed for $tgt_path ($_s3_violations) — falling back to theirs"
+    cp "$theirs" "$stage3"
+  fi
+  unset _s3_violations
+
   # Nothing to do when stage3 equals target (all v1→v2 changes already adopted).
   if diff -q "$tgt_abs" "$stage3" > /dev/null 2>&1; then
     rm -f "$base" "$theirs" "$stage3"
