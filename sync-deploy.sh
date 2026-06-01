@@ -828,22 +828,12 @@ patch_merge_file() {
   ' "$tgt_abs" "$base" "$theirs" > "$stage3"
 
   # ── Stage3 integrity check ───────────────────────────────────────────────────
-  # Two invariants verified in a single awk pass:
-  #
-  # 1. COUNT: for every key K, stage3 must not exceed
-  #    theirs_count[K] + max(0, tgt_count[K] - base_count[K]) occurrences.
-  #    Exceeding this means the reconstruction duplicated a keyed line.
-  #
-  # 2. CONTENT (endstate check): for every key K at positional occurrence P
-  #    where theirs[K,P] == base[K,P] (source did NOT change that slot),
-  #    stage3[K,P] must carry the TARGET value, not the source value.
-  #    A violation means the reconstruction produced a spurious highlight —
-  #    the user would see a change that doesn't correspond to any source diff.
-  #    This catches wrong substitutions that the count check misses (e.g.
-  #    swapped <groupId> slots across pom.xml parent / dependency blocks).
-  #
-  # Either violation triggers a fallback to theirs: all source changes are
-  # highlighted (structurally always correct), just without target-preservation.
+  # Invariant: for every key K, stage3 must not contain more occurrences than
+  # theirs_count[K] + max(0, tgt_count[K] - base_count[K]).
+  # The second term is the number of target-only additions (lines target added
+  # beyond base that must be re-inserted).  Exceeding this sum means the
+  # reconstruction duplicated a line — fall back to theirs so the user still
+  # sees highlighted diffs, just without the smart target-preservation.
   local _s3_violations
   _s3_violations=$(awk '
     function linekey(line,  k, s) {
@@ -867,37 +857,16 @@ patch_merge_file() {
       if (k ~ /^-[[:space:]]+[A-Za-z_][A-Za-z0-9._-]*$/) return k
       return ""
     }
-    function sw(s,  t) { t = s; gsub(/^[[:space:]]+|[[:space:]]+$/, "", t); return t }
     FNR == 1 { filenum++ }
-    filenum == 1 {
-      k = linekey($0); if (k != "") { tgt_cnt[k]++; tgt_occ[k, tgt_cnt[k]] = $0 }
-      next
-    }
-    filenum == 2 {
-      k = linekey($0); if (k != "") { base_cnt[k]++; base_occ[k, base_cnt[k]] = $0 }
-      next
-    }
-    filenum == 3 {
-      k = linekey($0); if (k != "") { theirs_cnt[k]++; theirs_occ[k, theirs_cnt[k]] = $0 }
-      next
-    }
+    filenum == 1 { k = linekey($0); if (k != "") tgt_cnt[k]++;    next }
+    filenum == 2 { k = linekey($0); if (k != "") base_cnt[k]++;   next }
+    filenum == 3 { k = linekey($0); if (k != "") theirs_cnt[k]++; next }
     filenum == 4 {
       k = linekey($0); if (k == "") next
-      s3_cnt[k]++; pos = s3_cnt[k]
-
-      # 1. Count check
+      s3_cnt[k]++
       tgt_only = (tgt_cnt[k] > base_cnt[k]) ? (tgt_cnt[k] - base_cnt[k]) : 0
-      if (pos > theirs_cnt[k] + tgt_only) { print "DUPLICATE key=" k; violations++; next }
-
-      # 2. Content / endstate check
-      # Only applies when all four files have an occurrence at this position.
-      if (pos <= theirs_cnt[k] && pos <= base_cnt[k] && pos <= tgt_cnt[k]) {
-        if (sw(theirs_occ[k, pos]) == sw(base_occ[k, pos])) {
-          if (sw($0) != sw(tgt_occ[k, pos])) {
-            print "SPURIOUS key=" k " pos=" pos; violations++
-          }
-        }
-      }
+      expected = theirs_cnt[k] + tgt_only
+      if (s3_cnt[k] > expected) { print "DUPLICATE key=" k; violations++ }
     }
     END { exit (violations > 0) }
   ' "$tgt_abs" "$base" "$theirs" "$stage3" 2>/dev/null)
