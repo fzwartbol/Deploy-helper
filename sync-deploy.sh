@@ -686,8 +686,6 @@ patch_merge_file() {
         tgt_key_occ_num[tgt_n] = tgt_cnt[k]
         tgt_last_k = k; tgt_last_p = tgt_cnt[k]
         tgt_had_keys = 1
-        _cv = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _cv)
-        c2 = ++tgt_cv_cnt[_cv]; tgt_cv_arr[_cv, c2] = $0; tgt_cv_tgt_pos[_cv, c2] = tgt_cnt[k]
       } else {
         # Record each keyless line under its preceding keyed anchor so file-3
         # can decide whether target has one at that position.
@@ -758,22 +756,12 @@ patch_merge_file() {
         # an existing key; emit as-is so it appears highlighted.
         s3_arr[++s3n] = $0
       } else if ((k, pos) in tgt_occ) {
-        _src_cv = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _src_cv)
-        _tgt_cv = tgt_occ[k, pos]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _tgt_cv)
-        if (_src_cv == _tgt_cv || (k ~ /^</ && _src_cv == k)) {
-          s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1
-        } else if (_src_cv in tgt_cv_cnt) {
-          _cu = ++tgt_cv_used[_src_cv]
-          if ((_src_cv, _cu) in tgt_cv_arr) {
-            s3_arr[++s3n] = tgt_cv_arr[_src_cv, _cu]
-            consumed[k, tgt_cv_tgt_pos[_src_cv, _cu]] = 1
-            mismatch_skipped[k, pos] = 1
-          } else if (k ~ /^</ && _src_cv != k) {
-            s3_arr[++s3n] = $0; consumed[k, pos] = 1
-          } else { s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1 }
-        } else if (k ~ /^</ && _src_cv != k) {
-          s3_arr[++s3n] = $0; consumed[k, pos] = 1
-        } else { s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1 }
+        # Source did not change this line — always use the target value at the same
+        # positional slot so no spurious highlight appears.  The previous approach
+        # content-matched across positions (mismatch_skipped), which consumed wrong
+        # slots and caused the skipped slot to be re-inserted by END, producing
+        # both reordering and duplication.
+        s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1
       } else if (k ~ /^</) {
         # XML structural tag: source has it but target does not.
         # Keep source version so child-element context is preserved in stage3.
@@ -800,7 +788,7 @@ patch_merge_file() {
         if (k == "") { cur_ins_after = -1; continue }
         n = tgt_key_occ_num[i]
         if ((k, n) in consumed) { cur_ins_after = -1; continue }
-        if (n <= base_cnt[k] && !((k, n) in mismatch_skipped)) { cur_ins_after = -1; continue }
+        if (n <= base_cnt[k]) { cur_ins_after = -1; continue }
         # This target slot is truly target-only (target has more occurrences than source v1)
         if (cur_ins_after == -1) {
           cur_ins_after = 0
