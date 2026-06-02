@@ -908,8 +908,10 @@ patch_merge_file() {
     ' "$tgt_abs" "$base" "$theirs" "$stage3" 2>/dev/null)
 
     if [[ -n "$_s3_violations" ]]; then
-      log_warn "pm: stage3 integrity check failed for $tgt_path ($_s3_violations) — falling back to theirs"
-      cp "$theirs" "$stage3"
+      log_warn "pm: stage3 integrity check failed for $tgt_path ($_s3_violations) — falling back to merge-file"
+      # Fall back to git merge-file: applies v1→v2 changes onto target so
+      # highlights = diff(stage3, target) = diff(v1,v2), not all-source-vs-target.
+      git merge-file -p --theirs "$tgt_abs" "$base" "$theirs" > "$stage3" || true
     fi
     unset _s3_violations
   fi
