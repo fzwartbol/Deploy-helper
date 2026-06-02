@@ -860,7 +860,9 @@ patch_merge_file() {
   local _unstructured=0
   if (( _kd_tot > 0 && _kd_key * 100 / _kd_tot < 30 )); then
     _unstructured=1
-    cp "$theirs" "$stage3"
+    # For code files (Groovy, shell, etc.) use git merge-file: applies v1→v2
+    # changes onto target, so highlights = diff(stage3, target) = diff(v1,v2).
+    git merge-file -p "$tgt_abs" "$base" "$theirs" > "$stage3" || true
   fi
 
   if [[ "$_unstructured" == "0" ]]; then
@@ -919,26 +921,17 @@ patch_merge_file() {
 
   log_warn "pm: diffs in $tgt_path — needs manual merge"
 
+  # stage1=stage2=target so IntelliJ center stays clean (no auto-merge).
+  # stage3 = blended (structured) or merge-file result (unstructured), so
+  # right-panel highlights = diff(stage3, target) = only v1→v2 source changes.
   local ours_hash stage3_hash
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$tgt_abs")
   stage3_hash=$(git -C "$tgt_dir" hash-object -w "$stage3")
-  if [[ "$_unstructured" == "1" ]]; then
-    # Unstructured (code/Groovy): stage1=base so right-panel highlights = diff(tag1,tag2)
-    local base_hash
-    base_hash=$(git -C "$tgt_dir" hash-object -w "$base")
-    {
-      printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
-      printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
-      printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
-    } | git -C "$tgt_dir" update-index --index-info
-  else
-    # Structured (XML/YAML): stage1=stage2=target so left panel is clean
-    {
-      printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
-      printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
-      printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
-    } | git -C "$tgt_dir" update-index --index-info
-  fi
+  {
+    printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
+    printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
+    printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
+  } | git -C "$tgt_dir" update-index --index-info
 
   rm -f "$base" "$theirs" "$stage3"
   return 1
@@ -1453,6 +1446,7 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
 
   (
     set -e
+    trap 'log_error "$TARGET_NAME: failed at line $LINENO: $BASH_COMMAND"' ERR
     TARGET_DIR="$WORK_DIR/$TARGET_NAME"
     clone_or_update "$TARGET_REPO" "$TARGET_DIR"
     git -C "$TARGET_DIR" checkout -B "$SYNC_BRANCH"
