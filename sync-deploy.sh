@@ -672,6 +672,15 @@ patch_merge_file() {
       s = line; gsub(/^[[:space:]]+/, "", s)
       return (substr(s, 1, 2) == "- ")
     }
+    # Find the first un-consumed target slot for key k whose structural context
+    # matches ctx.  Returns the slot index (1-based) or 0 if not found.
+    # For non-XML files all contexts are "" so this degrades to a simple
+    # first-available-slot search, preserving YAML/properties behaviour.
+    function find_tgt_slot(k, ctx,    p) {
+      for (p = 1; p <= tgt_cnt[k]; p++)
+        if (!((k, p) in consumed) && tgt_occ_ctx[k, p] == ctx) return p
+      return 0
+    }
     BEGIN { filenum = 0; block_from_base = 1; tgt_last_k = ""; tgt_last_p = 0; tgt_had_keys = 0; theirs_last_k = ""; theirs_last_p = 0; tc_d = 0; bc_d = 0 }
     FNR == 1 { filenum++; block_from_base = 1 }
 
@@ -739,12 +748,13 @@ patch_merge_file() {
       if (!($0 in base_lines)) {
         # v1→v2 change or pure addition — keep as-is (will be highlighted)
         s3_arr[++s3n] = $0
-        # Consume the corresponding target slot for base-origin block changes,
-        # but only when base and target share the same structural context for
-        # this positional slot (XML context tag:occurrence).
-        if (block_from_base && k != "" && pos > 0 && (k, pos) in tgt_occ &&
-            base_occ_ctx[k, pos] == tgt_occ_ctx[k, pos])
-          consumed[k, pos] = 1
+        # Consume the context-matched target slot so it is not re-emitted
+        # by the END block.  Use context-search rather than positional lookup
+        # so a removed block (e.g. <parent>) does not cause wrong slot reuse.
+        if (block_from_base && k != "" && pos > 0) {
+          _cpos = find_tgt_slot(k, base_occ_ctx[k, pos])
+          if (_cpos > 0) consumed[k, _cpos] = 1
+        }
       } else if (k == "") {
         # Keyless line (blank/comment) unchanged in source. Three-tier lookup:
         # 1) Anchor: emit target keyless line at same relative position.
@@ -770,20 +780,21 @@ patch_merge_file() {
         # More occurrences in theirs than were in base v1 — new occurrence of
         # an existing key; emit as-is so it appears highlighted.
         s3_arr[++s3n] = $0
-      } else if ((k, pos) in tgt_occ) {
-        # Source did not change this line. Substitute target value only when
-        # base and target share the same structural context for this positional
-        # slot (XML context = "tag:occurrence"). A mismatch means target removed
-        # or added a block that shifted subsequent positions, so we keep the
-        # theirs value (which will be highlighted) to avoid wrong substitutions.
-        if (base_occ_ctx[k, pos] == tgt_occ_ctx[k, pos]) {
-          s3_arr[++s3n] = tgt_occ[k, pos]; consumed[k, pos] = 1
+      } else if (pos > 0) {
+        # Source did not change this line. Search for the first un-consumed
+        # target slot with the same XML structural context as base at this
+        # position.  When target removed a block (e.g. <parent>), its child
+        # keys shift to lower positions, so a direct tgt_occ[k,pos] lookup
+        # would pick up a line from a completely different block.  Searching
+        # by context finds the right slot regardless of positional offset.
+        _spos = find_tgt_slot(k, base_occ_ctx[k, pos])
+        if (_spos > 0) {
+          s3_arr[++s3n] = tgt_occ[k, _spos]; consumed[k, _spos] = 1
         } else {
-          s3_arr[++s3n] = $0
+          # No matching target slot — source has this line but target does not.
+          # Keep theirs so the content appears highlighted in IntelliJ.
+          if (k ~ /^</ || tgt_had_keys) s3_arr[++s3n] = $0
         }
-      } else if (k ~ /^</) {
-        # XML structural tag: source has it but target does not.
-        s3_arr[++s3n] = $0
       }
       # else: source has more occurrences of k than target at this position — drop
       next

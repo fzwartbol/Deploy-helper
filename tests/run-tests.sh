@@ -2681,13 +2681,23 @@ else
     fail "stage 3 should contain lib-c (v1→v2 addition)"
   fi
 
-  # lib-a: in source v1 and v2 (unchanged), target has own version 5.0.0
-  # stage 3 should keep lib-a but with either target (5.0.0) or source (3.0.0) version.
-  # Most important: 3.0.0 (source value) must NOT replace target's 5.0.0 silently.
+  # lib-a: unchanged in source v1→v2, target has custom version 5.0.0.
+  # Stage 3 must use target's version (5.0.0, not highlighted) because the
+  # source never touched it.  The source's 3.0.0 must not appear.
   if echo "$_s3" | grep -qF "lib-a"; then
     ok "stage 3: lib-a present"
   else
     fail "stage 3 should contain lib-a"
+  fi
+  if echo "$_s3" | grep -qF "5.0.0"; then
+    ok "stage 3: lib-a keeps target version 5.0.0 (source-unchanged, not highlighted)"
+  else
+    fail "stage 3 should keep target lib-a version 5.0.0 (source did not change it)"
+  fi
+  if echo "$_s3" | grep -qF "3.0.0"; then
+    fail "stage 3 must not contain source lib-a version 3.0.0 (would be wrong highlight)"
+  else
+    ok "stage 3: source lib-a version 3.0.0 absent (correctly replaced by target 5.0.0)"
   fi
 
   # lib-d: target-only XML dependency — XML keyless tags cannot be reliably
