@@ -697,6 +697,7 @@ patch_merge_file() {
         tgt_key_occ_num[tgt_n] = tgt_cnt[k]
         tgt_last_k = k; tgt_last_p = tgt_cnt[k]
         tgt_had_keys = 1
+        tgt_key_n++
         if (k ~ /^<[^\/]/) { tc_c[k]++; tc_s[++tc_d] = k ":" tc_c[k] }
         else if (k ~ /^<\//) { if (tc_d > 0) delete tc_s[tc_d--] }
       } else {
@@ -756,25 +757,23 @@ patch_merge_file() {
           if (_cpos > 0) consumed[k, _cpos] = 1
         }
       } else if (k == "") {
-        # Keyless line (blank/comment) unchanged in source. Three-tier lookup:
-        # 1) Anchor: emit target keyless line at same relative position.
-        # 2) Content fallback: find the same stripped content anywhere in target
-        #    keyless lines (handles comment lines displaced relative to anchors).
-        # 3) No-keys fallback: if target has no keyed lines at all (Jenkinsfiles,
-        #    shell scripts) fall back to source value, preserving old behaviour.
+        # Keyless line (blank/comment/code) unchanged in source.
+        # If target has a line at the same anchor position with identical content,
+        # emit target (preserves target formatting). Otherwise emit theirs.
+        # Lines are NEVER dropped: unstructured files (Groovy, shell) must not
+        # lose content just because some variable assignments look like keys.
         n = ++theirs_keyless_n[theirs_last_k, theirs_last_p]
         _kl_s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_s)
         if ((theirs_last_k, theirs_last_p, n) in tgt_keyless_occ) {
           _kl_hit = tgt_keyless_occ[theirs_last_k, theirs_last_p, n]
           _kl_hit_s = _kl_hit; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_hit_s)
           if (_kl_s == _kl_hit_s) {
-            s3_arr[++s3n] = _kl_hit
-          } else if (!tgt_had_keys) { s3_arr[++s3n] = $0 }
-          else { theirs_keyless_n[theirs_last_k, theirs_last_p]-- }
-        } else if (!tgt_had_keys) {
-          s3_arr[++s3n] = $0
+            s3_arr[++s3n] = _kl_hit  # same content, use target version
+          } else {
+            s3_arr[++s3n] = $0       # content differs, use theirs
+          }
         } else {
-          theirs_keyless_n[theirs_last_k, theirs_last_p]--
+          s3_arr[++s3n] = $0         # no anchor slot, use theirs
         }
       } else if (pos > 0 && pos > base_cnt[k]) {
         # More occurrences in theirs than were in base v1 — new occurrence of
@@ -801,6 +800,10 @@ patch_merge_file() {
     }
 
     END {
+      # Output key density to stderr so bash can decide structured vs unstructured.
+      # Format: "key_lines total_lines"
+      print tgt_key_n " " tgt_n > "/dev/stderr"
+
       # Build last-seen stage3 position per key (used as insertion anchors)
       for (i = 1; i <= s3n; i++) {
         k = linekey(s3_arr[i])
@@ -842,57 +845,71 @@ patch_merge_file() {
         }
       }
     }
-  ' "$tgt_abs" "$base" "$theirs" > "$stage3"
+  ' "$tgt_abs" "$base" "$theirs" > "$stage3" 2>"${stage3}.kd"
 
-  # ── Stage3 integrity check ───────────────────────────────────────────────────
-  # Invariant: for every key K, stage3 must not contain more occurrences than
-  # theirs_count[K] + max(0, tgt_count[K] - base_count[K]).
-  # The second term is the number of target-only additions (lines target added
-  # beyond base that must be re-inserted).  Exceeding this sum means the
-  # reconstruction duplicated a line — fall back to theirs so the user still
-  # sees highlighted diffs, just without the smart target-preservation.
-  local _s3_violations
-  _s3_violations=$(awk '
-    function linekey(line,  k, s) {
-      s = line; gsub(/^[[:space:]]+/, "", s)
-      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*>[^<]*<\/[A-Za-z]/) {
-        k = s; sub(/>.*/, "", k); sub(/^</, "", k); return k
-      }
-      if (s ~ /^<\/[A-Za-z][A-Za-z0-9._-]*>$/) {
-        k = s; sub(/>$/, "", k); sub(/^<\//, "", k); return "</" k ">"
-      }
-      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[[:space:]]*\/>$/) {
-        k = s; sub(/[[:space:]]*\/>$/, "", k); sub(/^</, "", k); return k
-      }
-      if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[ >\/]/) {
-        k = s; sub(/[ >\/].*/, "", k); sub(/^</, "", k)
-        if (k ~ /^[A-Za-z][A-Za-z0-9._-]*$/) return "<" k ">"
-      }
-      k = s; sub(/[[:space:]]*[=:].*/, "", k)
-      if (k == s || k == "") return ""
-      if (k ~ /^[A-Za-z_][A-Za-z0-9._-]*$/) return k
-      if (k ~ /^-[[:space:]]+[A-Za-z_][A-Za-z0-9._-]*$/) return k
-      return ""
-    }
-    FNR == 1 { filenum++ }
-    filenum == 1 { k = linekey($0); if (k != "") tgt_cnt[k]++;    next }
-    filenum == 2 { k = linekey($0); if (k != "") base_cnt[k]++;   next }
-    filenum == 3 { k = linekey($0); if (k != "") theirs_cnt[k]++; next }
-    filenum == 4 {
-      k = linekey($0); if (k == "") next
-      s3_cnt[k]++
-      tgt_only = (tgt_cnt[k] > base_cnt[k]) ? (tgt_cnt[k] - base_cnt[k]) : 0
-      expected = theirs_cnt[k] + tgt_only
-      if (s3_cnt[k] > expected) { print "DUPLICATE key=" k; violations++ }
-    }
-    END { exit (violations > 0) }
-  ' "$tgt_abs" "$base" "$theirs" "$stage3" 2>/dev/null)
-
-  if [[ -n "$_s3_violations" ]]; then
-    log_warn "pm: stage3 integrity check failed for $tgt_path ($_s3_violations) — falling back to theirs"
+  # Read key-density output emitted to stderr by the awk (key_lines total_lines).
+  local _kd_key _kd_tot
+  read -r _kd_key _kd_tot < "${stage3}.kd" 2>/dev/null || true
+  rm -f "${stage3}.kd"
+  _kd_key=${_kd_key:-0}; _kd_tot=${_kd_tot:-1}
+  # A file is "unstructured" (code file: Groovy, shell, etc.) when fewer than
+  # 30% of its lines have config-style keys.  For these files the blending
+  # algorithm cannot correctly substitute target values, so we use theirs
+  # verbatim as stage3 and set stage1=base (not target) so that the IntelliJ
+  # right-panel highlights show exactly diff(tag1,tag2) — the source changes.
+  local _unstructured=0
+  if (( _kd_tot > 0 && _kd_key * 100 / _kd_tot < 30 )); then
+    _unstructured=1
     cp "$theirs" "$stage3"
   fi
-  unset _s3_violations
+
+  if [[ "$_unstructured" == "0" ]]; then
+    # ── Stage3 integrity check (structured files only) ────────────────────────
+    # Invariant: for every key K, stage3 must not contain more occurrences than
+    # theirs_count[K] + max(0, tgt_count[K] - base_count[K]).
+    local _s3_violations
+    _s3_violations=$(awk '
+      function linekey(line,  k, s) {
+        s = line; gsub(/^[[:space:]]+/, "", s)
+        if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*>[^<]*<\/[A-Za-z]/) {
+          k = s; sub(/>.*/, "", k); sub(/^</, "", k); return k
+        }
+        if (s ~ /^<\/[A-Za-z][A-Za-z0-9._-]*>$/) {
+          k = s; sub(/>$/, "", k); sub(/^<\//, "", k); return "</" k ">"
+        }
+        if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[[:space:]]*\/>$/) {
+          k = s; sub(/[[:space:]]*\/>$/, "", k); sub(/^</, "", k); return k
+        }
+        if (s ~ /^<[A-Za-z][A-Za-z0-9._-]*[ >\/]/) {
+          k = s; sub(/[ >\/].*/, "", k); sub(/^</, "", k)
+          if (k ~ /^[A-Za-z][A-Za-z0-9._-]*$/) return "<" k ">"
+        }
+        k = s; sub(/[[:space:]]*[=:].*/, "", k)
+        if (k == s || k == "") return ""
+        if (k ~ /^[A-Za-z_][A-Za-z0-9._-]*$/) return k
+        if (k ~ /^-[[:space:]]+[A-Za-z_][A-Za-z0-9._-]*$/) return k
+        return ""
+      }
+      FNR == 1 { filenum++ }
+      filenum == 1 { k = linekey($0); if (k != "") tgt_cnt[k]++;    next }
+      filenum == 2 { k = linekey($0); if (k != "") base_cnt[k]++;   next }
+      filenum == 3 { k = linekey($0); if (k != "") theirs_cnt[k]++; next }
+      filenum == 4 {
+        k = linekey($0); if (k == "") next
+        s3_cnt[k]++
+        tgt_only = (tgt_cnt[k] > base_cnt[k]) ? (tgt_cnt[k] - base_cnt[k]) : 0
+        expected = theirs_cnt[k] + tgt_only
+        if (s3_cnt[k] > expected) { print "DUPLICATE key=" k; violations++ }
+      }
+      END { exit (violations > 0) }
+    ' "$tgt_abs" "$base" "$theirs" "$stage3" 2>/dev/null)
+
+    if [[ -n "$_s3_violations" ]]; then
+      log_warn "pm: stage3 integrity check failed for $tgt_path ($_s3_violations) — falling back to theirs"
+      cp "$theirs" "$stage3"
+    fi
+    unset _s3_violations
+  fi
 
   # Nothing to do when stage3 equals target (all v1→v2 changes already adopted).
   if diff -q "$tgt_abs" "$stage3" > /dev/null 2>&1; then
@@ -902,18 +919,26 @@ patch_merge_file() {
 
   log_warn "pm: diffs in $tgt_path — needs manual merge"
 
-  # Register stages for IntelliJ 3-way merge dialog:
-  #   Stage 1 = target (BASE) → left panel is clean, no highlights anywhere
-  #   Stage 2 = target (LEFT) → user's starting point, identical to stage 1
-  #   Stage 3 = source_B (RIGHT) → only v1→v2 source changes highlighted green
   local ours_hash stage3_hash
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$tgt_abs")
   stage3_hash=$(git -C "$tgt_dir" hash-object -w "$stage3")
-  {
-    printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
-    printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
-    printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
-  } | git -C "$tgt_dir" update-index --index-info
+  if [[ "$_unstructured" == "1" ]]; then
+    # Unstructured (code/Groovy): stage1=base so right-panel highlights = diff(tag1,tag2)
+    local base_hash
+    base_hash=$(git -C "$tgt_dir" hash-object -w "$base")
+    {
+      printf '100644 %s 1\t%s\n' "$base_hash"   "$tgt_path"
+      printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
+      printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
+    } | git -C "$tgt_dir" update-index --index-info
+  else
+    # Structured (XML/YAML): stage1=stage2=target so left panel is clean
+    {
+      printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
+      printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
+      printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
+    } | git -C "$tgt_dir" update-index --index-info
+  fi
 
   rm -f "$base" "$theirs" "$stage3"
   return 1
