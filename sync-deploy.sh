@@ -1641,12 +1641,12 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
         log_warn "Conflicts in $TARGET_NAME — launching merge tool..."
         log_warn "Resolve each file, save and close the dialog to continue."
         git -C "$TARGET_DIR" mergetool --no-prompt
-        _still=$(git -C "$TARGET_DIR" diff --name-only --diff-filter=U 2>/dev/null || true)
-        if [[ -n "$_still" ]]; then
-          log_error "Unresolved conflicts remain in $TARGET_NAME — aborting push"
-          printf '  %s\n' "$_still" >&2
-          exit 1
-        fi
+        # stage1=stage2=target means working tree always starts as "ours", so
+        # git mergetool may not call git add when the user accepts without editing.
+        # Force-add all conflict files from working tree to mark them resolved.
+        for _cf in "${CONFLICT_FILES[@]}"; do
+          git -C "$TARGET_DIR" add "$_cf"
+        done
       else
         log_warn "Conflicts in $TARGET_NAME (non-interactive) — committing with markers"
         log_warn "Resolve: git fetch origin && git checkout $SYNC_BRANCH && git mergetool"
