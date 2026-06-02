@@ -1447,8 +1447,16 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
   (
     set -e
     trap 'log_error "$TARGET_NAME: failed at line $LINENO: $BASH_COMMAND"' ERR
+    # Prevent git from walking above WORK_DIR to find a repo (.git).
+    # Without this, if TARGET_DIR has no .git, git silently uses the tool
+    # repo (.git at SCRIPT_DIR) and all operations land on the wrong repo.
+    export GIT_CEILING_DIRECTORIES="$WORK_DIR"
     TARGET_DIR="$WORK_DIR/$TARGET_NAME"
     clone_or_update "$TARGET_REPO" "$TARGET_DIR"
+    if [[ ! -d "$TARGET_DIR/.git" ]]; then
+      log_error "$TARGET_NAME: $TARGET_DIR has no .git after clone — aborting"
+      exit 1
+    fi
     git -C "$TARGET_DIR" checkout -B "$SYNC_BRANCH"
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
