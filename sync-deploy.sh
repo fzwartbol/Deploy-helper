@@ -857,13 +857,14 @@ patch_merge_file() {
   # algorithm cannot correctly substitute target values, so we use theirs
   # verbatim as stage3 and set stage1=base (not target) so that the IntelliJ
   # right-panel highlights show exactly diff(tag1,tag2) — the source changes.
-  local _unstructured=0
+  local _unstructured=0 _use_v1_base=0
   if (( _kd_tot > 0 && _kd_key * 100 / _kd_tot < 30 )); then
     _unstructured=1
-    # For code files (Groovy, shell, etc.) use git merge-file: applies v1→v2
-    # changes onto target, so highlights = diff(stage3, target) = diff(v1,v2).
-    # --theirs resolves conflicts by taking v2, keeping the output marker-free.
-    git merge-file -p --theirs "$tgt_abs" "$base" "$theirs" > "$stage3" || true
+    _use_v1_base=1
+    # Unstructured file: use v2 verbatim as stage3 and v1 as stage1.
+    # diff(stage1=v1, stage3=v2) = only v1→v2 changes → right panel shows
+    # exactly what changed between tags, not all differences from target to v2.
+    cp "$theirs" "$stage3"
   fi
 
   if [[ "$_unstructured" == "0" ]]; then
@@ -908,10 +909,14 @@ patch_merge_file() {
     ' "$tgt_abs" "$base" "$theirs" "$stage3" 2>/dev/null)
 
     if [[ -n "$_s3_violations" ]]; then
-      log_warn "pm: stage3 integrity check failed for $tgt_path ($_s3_violations) — falling back to merge-file"
-      # Fall back to git merge-file: applies v1→v2 changes onto target so
-      # highlights = diff(stage3, target) = diff(v1,v2), not all-source-vs-target.
-      git merge-file -p --theirs "$tgt_abs" "$base" "$theirs" > "$stage3" || true
+      log_warn "pm: stage3 integrity check failed for $tgt_path ($_s3_violations) — using v2 as stage3"
+      # AWK blend failed; fall back to v2 verbatim + v1 as stage1 so that
+      # highlights = diff(stage1=v1, stage3=v2) = only v1→v2 changes.
+      # git merge-file --theirs is NOT used here: when both target and v2 have
+      # diverged heavily from v1, it resolves every conflict to v2 anyway,
+      # and diff(target, v2) shows all differences, not just v1→v2 changes.
+      _use_v1_base=1
+      cp "$theirs" "$stage3"
     fi
     unset _s3_violations
   fi
@@ -924,14 +929,21 @@ patch_merge_file() {
 
   log_warn "pm: diffs in $tgt_path — needs manual merge"
 
-  # stage1=stage2=target so IntelliJ center stays clean (no auto-merge).
-  # stage3 = blended (structured) or merge-file result (unstructured), so
-  # right-panel highlights = diff(stage3, target) = only v1→v2 source changes.
-  local ours_hash stage3_hash
+  # stage2 = target (left panel) always; working tree = target (center start).
+  # stage3 = AWK blend (structured) or v2 verbatim (unstructured/fallback).
+  # stage1 determines what IntelliJ uses as BASE for right-panel highlights:
+  #   AWK success: stage1=target  → highlights = diff(target, blend)   = v1→v2 changes
+  #   Fallback:    stage1=v1      → highlights = diff(v1,    v2)       = v1→v2 changes
+  local ours_hash stage3_hash base1_hash
   ours_hash=$(git   -C "$tgt_dir" hash-object -w "$tgt_abs")
   stage3_hash=$(git -C "$tgt_dir" hash-object -w "$stage3")
+  if (( _use_v1_base )); then
+    base1_hash=$(git -C "$tgt_dir" hash-object -w "$base")
+  else
+    base1_hash="$ours_hash"
+  fi
   {
-    printf '100644 %s 1\t%s\n' "$ours_hash"   "$tgt_path"
+    printf '100644 %s 1\t%s\n' "$base1_hash"  "$tgt_path"
     printf '100644 %s 2\t%s\n' "$ours_hash"   "$tgt_path"
     printf '100644 %s 3\t%s\n' "$stage3_hash" "$tgt_path"
   } | git -C "$tgt_dir" update-index --index-info
