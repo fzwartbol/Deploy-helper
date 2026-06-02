@@ -862,7 +862,8 @@ patch_merge_file() {
     _unstructured=1
     # For code files (Groovy, shell, etc.) use git merge-file: applies v1→v2
     # changes onto target, so highlights = diff(stage3, target) = diff(v1,v2).
-    git merge-file -p "$tgt_abs" "$base" "$theirs" > "$stage3" || true
+    # --theirs resolves conflicts by taking v2, keeping the output marker-free.
+    git merge-file -p --theirs "$tgt_abs" "$base" "$theirs" > "$stage3" || true
   fi
 
   if [[ "$_unstructured" == "0" ]]; then
