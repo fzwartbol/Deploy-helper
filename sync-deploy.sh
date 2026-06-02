@@ -1460,6 +1460,18 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
       log_error "$TARGET_NAME: $TARGET_DIR has no .git after clone — aborting"
       exit 1
     fi
+
+    # Resume: if the sync branch is already committed remotely, skip re-applying.
+    # This lets the script be re-run after a partial failure without redoing work.
+    if git -C "$TARGET_DIR" rev-parse --verify "origin/$SYNC_BRANCH" &>/dev/null; then
+      _ahead=$(git -C "$TARGET_DIR" rev-list --count \
+        "origin/$BASE_BRANCH..origin/$SYNC_BRANCH" 2>/dev/null || echo 0)
+      if (( _ahead > 0 )); then
+        log_info "$TARGET_NAME: sync branch already committed remotely — skipping"
+        exit 0
+      fi
+    fi
+
     git -C "$TARGET_DIR" checkout -B "$SYNC_BRANCH"
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
@@ -1658,8 +1670,19 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
 
     git -C "$TARGET_DIR" commit -m "$(printf \
       'chore(sync): deploy changes from %s\n\nSource: %s\nRef:    %s → %s\nRun:    %s' \
-      "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")"
-    git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH"
+      "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")" || {
+      _unmerged=$(git -C "$TARGET_DIR" diff --name-only --diff-filter=U 2>/dev/null || true)
+      log_warn "$TARGET_NAME: commit failed — fix manually then re-run to continue:"
+      log_warn "  cd $TARGET_DIR"
+      [[ -n "$_unmerged" ]] && log_warn "  git add $(printf '%s ' "$_unmerged")"
+      log_warn "  git commit && git push -u origin $SYNC_BRANCH"
+      exit 0
+    }
+    git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH" || {
+      log_warn "$TARGET_NAME: push failed — fix manually then re-run to continue:"
+      log_warn "  cd $TARGET_DIR && git push -u origin $SYNC_BRANCH"
+      exit 0
+    }
 
     # ── Build PR body ─────────────────────────────────────────────────────────
     SEALED_SECTION=""
