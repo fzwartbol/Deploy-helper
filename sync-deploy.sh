@@ -1008,8 +1008,43 @@ PROTECTED_CM_KEYS=$(_cf_protected_keys)
 
 [[ "$APP_COUNT" -gt 0 ]] || { log_error "No apps found in $CONFIG_FILE"; exit 1; }
 
-# Clean work dir at the start of every run for a reproducible state
-rm -rf "$WORK_DIR"
+# ── Resume / start-new prompt ─────────────────────────────────────────────────
+_resuming=false
+if [[ -f "$WORK_DIR/.session" ]] && $_INTERACTIVE; then
+  _ss_src=""; _ss_branch=""; _ss_from=""; _ss_to=""; _ss_mode=""; _ss_type=""; _ss_targets=""
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      SOURCE_NAME)    _ss_src="$_v" ;;
+      SOURCE_BRANCH)  _ss_branch="$_v" ;;
+      FROM_REF)       _ss_from="$_v" ;;
+      TO_REF)         _ss_to="$_v" ;;
+      SYNC_MODE)      _ss_mode="$_v" ;;
+      SYNC_TYPE)      _ss_type="$_v" ;;
+      FILTER_TARGETS) _ss_targets="$_v" ;;
+    esac
+  done < "$WORK_DIR/.session"
+  echo ""
+  echo "==> Previous session found:"
+  printf "    Source  : %s  (branch: %s)\n" "$_ss_src" "$_ss_branch"
+  printf "    Range   : %s → %s\n" "$_ss_from" "$_ss_to"
+  printf "    Mode    : %s (%s)\n" "$_ss_mode" "$_ss_type"
+  printf "    Targets : %s\n" "$_ss_targets"
+  echo ""
+  printf 'Continue previous session? [Y/n]: '
+  read -r _pick 2>/dev/null || _pick=""
+  if [[ -z "$_pick" || "${_pick,,}" == "y" ]]; then
+    _resuming=true
+    # shellcheck source=/dev/null
+    source "$WORK_DIR/.session"
+    # Mark refs as explicit so step-3 picker is skipped
+    FROM_EXPLICIT=true
+    TO_EXPLICIT=true
+  fi
+  unset _pick _ss_src _ss_branch _ss_from _ss_to _ss_mode _ss_type _ss_targets _k _v
+fi
+if ! $_resuming; then
+  rm -rf "$WORK_DIR"
+fi
 mkdir -p "$WORK_DIR"
 
 # ── Interactive step 0: select sync type ─────────────────────────────────────
@@ -1243,7 +1278,7 @@ if ! $FROM_EXPLICIT || ! $TO_EXPLICIT; then
 fi
 
 # ── Interactive step 4: target repos ─────────────────────────────────────────
-if [[ "$FILTER_TARGETS" == "all" ]]; then
+if [[ "$FILTER_TARGETS" == "all" ]] && ! $_resuming; then
   _tgt_names=(); _tgt_repos=()
   for ((_i=0; _i<_ACOUNT; _i++)); do
     [[ "${_ANAMES[$_i]}" == "$SOURCE_NAME" ]] && continue
@@ -1292,6 +1327,12 @@ unset _ANAMES _AREPOS _i
 
 # ── Compute branch name ───────────────────────────────────────────────────────
 SYNC_BRANCH="sync/${SYNC_TYPE}-${SYNC_MODE}-from-$(_sanitize_ref "$FROM_REF")-to-$(_sanitize_ref "$TO_REF")"
+
+# Save session so a re-run can offer to resume where this one left off
+printf 'SYNC_TYPE=%s\nSOURCE_NAME=%s\nSOURCE_BRANCH=%s\nFROM_REF=%s\nTO_REF=%s\nSYNC_MODE=%s\nFILTER_TARGETS=%s\nSYNC_BRANCH=%s\n' \
+  "$SYNC_TYPE" "$SOURCE_NAME" "$SOURCE_BRANCH" "$FROM_REF" "$TO_REF" \
+  "$SYNC_MODE" "$FILTER_TARGETS" "$SYNC_BRANCH" \
+  > "$WORK_DIR/.session"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Sync engine — no interactive code below this line
@@ -1753,4 +1794,6 @@ done
 log_section "Done"
 [[ ${#PASS[@]} -gt 0 ]] && log_info  "Succeeded (${#PASS[@]}): ${PASS[*]}"
 [[ ${#FAIL[@]} -gt 0 ]] && log_error "Failed    (${#FAIL[@]}): ${FAIL[*]}"
+# Remove session file on clean completion — next run starts fresh
+[[ ${#FAIL[@]} -eq 0 ]] && rm -f "$WORK_DIR/.session"
 [[ ${#FAIL[@]} -eq 0 ]]
