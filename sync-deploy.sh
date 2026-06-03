@@ -768,22 +768,31 @@ patch_merge_file() {
         }
       } else if (k == "") {
         # Keyless line (blank/comment/code) unchanged in source.
-        # If target has a line at the same anchor position with identical content,
-        # emit target (preserves target formatting). Otherwise emit theirs.
-        # Lines are NEVER dropped: unstructured files (Groovy, shell) must not
-        # lose content just because some variable assignments look like keys.
+        # Always prefer the target version so tab/space and CRLF/LF differences
+        # in source files do not cause otherwise-unchanged comments to appear
+        # highlighted in IntelliJ.  Fall back to theirs only when no target
+        # equivalent can be found via anchor or stripped-content match.
         n = ++theirs_keyless_n[theirs_last_k, theirs_last_p]
         _kl_s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_s)
         if ((theirs_last_k, theirs_last_p, n) in tgt_keyless_occ) {
           _kl_hit = tgt_keyless_occ[theirs_last_k, theirs_last_p, n]
           _kl_hit_s = _kl_hit; gsub(/^[[:space:]]+|[[:space:]]+$/, "", _kl_hit_s)
           if (_kl_s == _kl_hit_s) {
-            s3_arr[++s3n] = _kl_hit  # same content, use target version
+            # Same content (ignoring whitespace): use target version — fixes tab/space/CRLF diffs
+            s3_arr[++s3n] = _kl_hit
+          } else if (_kl_s != "") {
+            # Anchor matched a different line; fall back to content-based match
+            _kl_u = ++tgt_kl_use_n[_kl_s]
+            s3_arr[++s3n] = (_kl_u <= tgt_kl_cc[_kl_s]) ? tgt_kl_cl[_kl_s, _kl_u] : $0
           } else {
-            s3_arr[++s3n] = $0       # content differs, use theirs
+            s3_arr[++s3n] = $0
           }
+        } else if (_kl_s != "") {
+          # Content-based fallback: find next unused target line with same stripped text
+          _kl_u = ++tgt_kl_use_n[_kl_s]
+          s3_arr[++s3n] = (_kl_u <= tgt_kl_cc[_kl_s]) ? tgt_kl_cl[_kl_s, _kl_u] : $0
         } else {
-          s3_arr[++s3n] = $0         # no anchor slot, use theirs
+          s3_arr[++s3n] = $0
         }
       } else if (pos > 0 && pos > base_cnt[k]) {
         # More occurrences in theirs than were in base v1 — new occurrence of
@@ -1863,4 +1872,5 @@ log_section "Done"
 [[ ${#FAIL[@]} -gt 0 ]] && log_error "Failed    (${#FAIL[@]}): ${FAIL[*]}"
 # .session is intentionally kept so the next run offers to resume.
 # Choosing "N" at the resume prompt wipes .work and starts fresh.
-[[ ${#FAIL[@]} -eq 0 ]]
+# Use &&/|| so the test result does not trigger the ERR trap when there are failures.
+[[ ${#FAIL[@]} -eq 0 ]] && exit 0 || exit 1
