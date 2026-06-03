@@ -1706,18 +1706,19 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
         log_warn "Conflicts in $TARGET_NAME — launching merge tool..."
         log_warn "Resolve each file, save and close the dialog to continue."
         git -C "$TARGET_DIR" mergetool --no-prompt
-        # stage1=stage2=target means working tree always starts as "ours", so
-        # git mergetool may not call git add when the user accepts without editing.
-        # Force-add all conflict files from working tree to mark them resolved.
+        # git add is a no-op when working tree = stage2 (ours) because git
+        # treats it as "already staged".  force-remove clears all stage entries
+        # first so git add can write a clean stage-0 entry.
         for _cf in "${CONFLICT_FILES[@]}"; do
+          git -C "$TARGET_DIR" update-index --force-remove "$_cf"
           git -C "$TARGET_DIR" add "$_cf"
         done
       else
-        log_warn "Conflicts in $TARGET_NAME (non-interactive) — committing with markers"
-        log_warn "Resolve: git fetch origin && git checkout $SYNC_BRANCH && git mergetool"
-        for _cf in "${CONFLICT_FILES[@]}"; do
-          git -C "$TARGET_DIR" add "$_cf"
-        done
+        # Non-interactive: leave stages 1/2/3 as-is so mergetool can be run
+        # manually later.  Commit will fail due to unresolved entries; we catch
+        # that below and exit 0 so the script continues to the next target.
+        log_warn "Conflicts in $TARGET_NAME (non-interactive) — needs manual resolution"
+        log_warn "Resolve: cd $WORK_DIR/$TARGET_NAME && git mergetool && git commit && git push -u origin $SYNC_BRANCH"
       fi
     fi
 
@@ -1725,16 +1726,21 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
       'chore(sync): deploy changes from %s\n\nSource: %s\nRef:    %s → %s\nRun:    %s' \
       "${SOURCE_REPO##*/}" "$SOURCE_REPO" "$FROM_REF" "$TO_REF" "$TIMESTAMP")" || {
       _unmerged=$(git -C "$TARGET_DIR" diff --name-only --diff-filter=U 2>/dev/null || true)
-      log_warn "$TARGET_NAME: commit failed — fix manually then re-run to continue:"
-      log_warn "  cd $TARGET_DIR"
-      [[ -n "$_unmerged" ]] && log_warn "  git add $(printf '%s ' "$_unmerged")"
-      log_warn "  git commit && git push -u origin $SYNC_BRANCH"
-      exit 0
+      if [[ -n "$_unmerged" ]]; then
+        log_warn "$TARGET_NAME: commit failed — unresolved conflicts. Fix manually:"
+        log_warn "  cd $TARGET_DIR"
+        log_warn "  git add $(printf '%s ' "$_unmerged")"
+        log_warn "  git commit && git push -u origin $SYNC_BRANCH"
+        if $_INTERACTIVE; then exit 1; else exit 0; fi
+      else
+        log_info "$TARGET_NAME: no effective changes after conflict resolution — skipping"
+        exit 0
+      fi
     }
     git -C "$TARGET_DIR" push -u origin "$SYNC_BRANCH" || {
       log_warn "$TARGET_NAME: push failed — fix manually then re-run to continue:"
       log_warn "  cd $TARGET_DIR && git push -u origin $SYNC_BRANCH"
-      exit 0
+      exit 1
     }
 
     # ── Build PR body ─────────────────────────────────────────────────────────
@@ -1794,6 +1800,6 @@ done
 log_section "Done"
 [[ ${#PASS[@]} -gt 0 ]] && log_info  "Succeeded (${#PASS[@]}): ${PASS[*]}"
 [[ ${#FAIL[@]} -gt 0 ]] && log_error "Failed    (${#FAIL[@]}): ${FAIL[*]}"
-# Remove session file on clean completion — next run starts fresh
-[[ ${#FAIL[@]} -eq 0 ]] && rm -f "$WORK_DIR/.session"
+# .session is intentionally kept so the next run offers to resume.
+# Choosing "N" at the resume prompt wipes .work and starts fresh.
 [[ ${#FAIL[@]} -eq 0 ]]
