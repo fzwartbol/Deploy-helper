@@ -618,6 +618,11 @@ patch_merge_file() {
     rm -f "$base" "$theirs"
     return 0
   fi
+  # Skip files where v1→v2 diff is whitespace/indentation only (no content change)
+  if diff -w -q "$base" "$theirs" > /dev/null 2>&1; then
+    rm -f "$base" "$theirs"
+    return 0
+  fi
 
   # Build stage3: source_B (theirs) with ordering preserved, using
   # occurrence-order matching for duplicate keys.  Files with repeated YAML
@@ -694,6 +699,7 @@ patch_merge_file() {
         tgt_cnt[k]++
         tgt_occ[k, tgt_cnt[k]] = $0
         tgt_occ_ctx[k, tgt_cnt[k]] = _ctx
+        tgt_slot_i[k, tgt_cnt[k]] = tgt_n
         tgt_key_occ_num[tgt_n] = tgt_cnt[k]
         tgt_last_k = k; tgt_last_p = tgt_cnt[k]
         tgt_had_keys = 1
@@ -752,9 +758,13 @@ patch_merge_file() {
         # Consume the context-matched target slot so it is not re-emitted
         # by the END block.  Use context-search rather than positional lookup
         # so a removed block (e.g. <parent>) does not cause wrong slot reuse.
+        # Record target position so END can emit in target order.
         if (block_from_base && k != "" && pos > 0) {
           _cpos = find_tgt_slot(k, base_occ_ctx[k, pos])
-          if (_cpos > 0) consumed[k, _cpos] = 1
+          if (_cpos > 0) {
+            consumed[k, _cpos] = 1
+            s3_tp[s3n] = tgt_slot_i[k, _cpos]
+          }
         }
       } else if (k == "") {
         # Keyless line (blank/comment/code) unchanged in source.
@@ -789,6 +799,7 @@ patch_merge_file() {
         _spos = find_tgt_slot(k, base_occ_ctx[k, pos])
         if (_spos > 0) {
           s3_arr[++s3n] = tgt_occ[k, _spos]; consumed[k, _spos] = 1
+          s3_tp[s3n] = tgt_slot_i[k, _spos]
         } else {
           # No matching target slot — source has this line but target does not.
           # Keep theirs so the content appears highlighted in IntelliJ.
@@ -804,24 +815,33 @@ patch_merge_file() {
       # Format: "key_lines total_lines"
       print tgt_key_n " " tgt_n > "/dev/stderr"
 
-      # Build last-seen stage3 position per key (used as insertion anchors)
-      for (i = 1; i <= s3n; i++) {
-        k = linekey(s3_arr[i])
-        if (k != "") s3_kpos[k] = i
+      # Emit stage3 in TARGET order so unchanged keys appear at their target
+      # positions and do not generate phantom conflicts in IntelliJ.
+      # s3_tp[j] = target line index for s3 element j (0 = free element).
+      # Free elements (new v2 additions, keyless lines) are anchored after the
+      # last fixed element that preceded them in theirs-iteration order.
+
+      # Map target position → s3 index for elements with known target positions
+      for (j = 1; j <= s3n; j++) {
+        if (s3_tp[j] > 0) tgt_to_s3j[s3_tp[j]] = j
       }
 
-      # Re-insert target-only keyed lines (those whose slot was never consumed).
-      # Use a sticky anchor so consecutive not-consumed lines stay grouped and
-      # are emitted in their original target order.
+      # Build last-seen target-position per key (insertion anchor for target-only lines)
+      for (j = 1; j <= s3n; j++) {
+        if (s3_tp[j] > 0) {
+          k = linekey(s3_arr[j])
+          if (k != "") s3_kpos[k] = s3_tp[j]
+        }
+      }
+
+      # Re-insert target-only keyed lines (target has more occurrences than source v1)
       cur_ins_after = -1
       for (i = 1; i <= tgt_n; i++) {
         L = tgt_ord[i]; k = linekey(L)
-        # Only handle keyed lines for target-only re-insertion
         if (k == "") { cur_ins_after = -1; continue }
         n = tgt_key_occ_num[i]
         if ((k, n) in consumed) { cur_ins_after = -1; continue }
         if (n <= base_cnt[k]) { cur_ins_after = -1; continue }
-        # This target slot is truly target-only (target has more occurrences than source v1)
         if (cur_ins_after == -1) {
           cur_ins_after = 0
           for (j = i - 1; j >= 1; j--) {
@@ -832,15 +852,35 @@ patch_merge_file() {
         ins_content[cur_ins_after] = ins_content[cur_ins_after] SUBSEP L
       }
 
-      # Emit stage3 with target-only lines spliced in
+      # Group free s3 elements by their anchor (last target position seen before them)
+      last_tp = 0
+      for (j = 1; j <= s3n; j++) {
+        if (s3_tp[j] > 0) {
+          last_tp = s3_tp[j]
+        } else {
+          free_arr[last_tp] = free_arr[last_tp] SUBSEP s3_arr[j]
+        }
+      }
+
+      # Emit: free elements before position 1, then target-only insertions before 1
+      if (0 in free_arr) {
+        n = split(free_arr[0], parts, SUBSEP)
+        for (j = 1; j <= n; j++) if (parts[j] != "") print parts[j]
+      }
       if (0 in ins_content) {
         n = split(ins_content[0], parts, SUBSEP)
         for (j = 1; j <= n; j++) if (parts[j] != "") print parts[j]
       }
-      for (i = 1; i <= s3n; i++) {
-        print s3_arr[i]
-        if (i in ins_content) {
-          n = split(ins_content[i], parts, SUBSEP)
+
+      # Main target-order loop
+      for (ti = 1; ti <= tgt_n; ti++) {
+        if (ti in tgt_to_s3j) print s3_arr[tgt_to_s3j[ti]]
+        if (ti in free_arr) {
+          n = split(free_arr[ti], parts, SUBSEP)
+          for (j = 1; j <= n; j++) if (parts[j] != "") print parts[j]
+        }
+        if (ti in ins_content) {
+          n = split(ins_content[ti], parts, SUBSEP)
           for (j = 1; j <= n; j++) if (parts[j] != "") print parts[j]
         }
       }
@@ -923,6 +963,11 @@ patch_merge_file() {
 
   # Nothing to do when stage3 equals target (all v1→v2 changes already adopted).
   if diff -q "$tgt_abs" "$stage3" > /dev/null 2>&1; then
+    rm -f "$base" "$theirs" "$stage3"
+    return 0
+  fi
+  # Stage3 differs from target in whitespace only — nothing meaningful to merge
+  if diff -w -q "$tgt_abs" "$stage3" > /dev/null 2>&1; then
     rm -f "$base" "$theirs" "$stage3"
     return 0
   fi
@@ -1534,6 +1579,7 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
     SEALED_NOTES=()
     IMAGE_NOTES=()
     CONFLICT_FILES=()
+    _skip_all_new=false
 
     if [[ "$_effective_mode" == "copy" ]]; then
       sync_copy_mode
@@ -1676,13 +1722,28 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
               HAS_CHANGES=true
 
             else
-              if copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"; then
-                if has_image_lines "$TARGET_DIR/$tgt_file"; then
-                  IMAGE_NOTES+=("- \`[ADDED]\` \`$tgt_file\` — new file; image tags copied from source (review if needed)")
-                fi
-                git -C "$TARGET_DIR" add "$tgt_file"
-                HAS_CHANGES=true
+              _add_new_file=true
+              if $_INTERACTIVE && ! $_skip_all_new; then
+                printf '\n==> New file: %s\nInclude in this target? [Y/n/S(kip all new)]: ' "$tgt_file"
+                read -r _nf_pick 2>/dev/null || _nf_pick="y"
+                case "${_nf_pick,,}" in
+                  n) _add_new_file=false ;;
+                  s) _add_new_file=false; _skip_all_new=true ;;
+                esac
+                unset _nf_pick
               fi
+              if $_add_new_file; then
+                if copy_and_apply "$src_file" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT"; then
+                  if has_image_lines "$TARGET_DIR/$tgt_file"; then
+                    IMAGE_NOTES+=("- \`[ADDED]\` \`$tgt_file\` — new file; image tags copied from source (review if needed)")
+                  fi
+                  git -C "$TARGET_DIR" add "$tgt_file"
+                  HAS_CHANGES=true
+                fi
+              else
+                log_info "A  $tgt_file — skipped by user"
+              fi
+              unset _add_new_file
             fi
             ;;
 
