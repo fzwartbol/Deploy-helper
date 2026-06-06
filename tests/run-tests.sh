@@ -2425,12 +2425,11 @@ has     "$H/pom.xml"  "<version>5.0.0</version>"  "dependency version 5.0.0 unto
 has_not "$H/pom.xml"  "<<<<<<<"                   "working tree clean — conflict in git stages"
 
 # ── stage setup: correct LEFT / RIGHT panels for IntelliJ merge dialog ────────
-# Stage 1 = target (BASE): IntelliJ diffs both sides against target, so only
-#           source v1→v2 changes are highlighted — no noise from customisations.
-# Stage 2 = target (LEFT): clean starting point with no highlights.
-# Stage 3 = patched target (RIGHT): target + source v1→v2 changes; only those
-#           lines differ from stage 1, so only they are highlighted green.
-section "app-h  stage setup — stage 1/2/3 = target / target / source_B"
+# Stage 1 = v1+subs (BASE): IntelliJ diffs right panel against stage1, so only
+#           v1→v2 source changes are highlighted — not target customisations.
+# Stage 2 = target (LEFT): clean starting point.
+# Stage 3 = v2+subs (RIGHT): source tag 2; v1→v2 changes highlighted green.
+section "app-h  stage setup — stage 1/2/3 = v1 / target / v2"
 _stage1=$(git -C "$H" cat-file blob :1:pom.xml 2>/dev/null || true)
 _stage2=$(git -C "$H" cat-file blob :2:pom.xml 2>/dev/null || true)
 _stage3=$(git -C "$H" cat-file blob :3:pom.xml 2>/dev/null || true)
@@ -2438,41 +2437,40 @@ if [[ -z "$_stage1" || -z "$_stage2" || -z "$_stage3" ]]; then
   fail "one or more stages missing for pom.xml"
 else
   ok "all three stages registered for pom.xml"
-  # Stage 1 = target (BASE): NO <parent> block, has project version 3.0.0
+  # Stage 1 = source v1+subs: HAS <parent> block, version 1.0.0
   if echo "$_stage1" | grep -qF "<parent>"; then
-    fail "stage 1 should be target (no <parent> block)"
+    ok "stage 1 (base=v1) has <parent> block from source v1"
   else
-    ok "stage 1 (base) is target — no <parent> block from source"
+    fail "stage 1 (base=v1) should contain <parent> block (source v1 has it)"
   fi
-  if echo "$_stage1" | grep -qF "3.0.0"; then
-    ok "stage 1 (base) has target-only project version 3.0.0"
+  if echo "$_stage1" | grep -qF "1.0.0"; then
+    ok "stage 1 (base=v1) has source v1 version 1.0.0"
   else
-    fail "stage 1 should be target (contain project version 3.0.0)"
+    fail "stage 1 (base=v1) should contain source v1 version 1.0.0"
   fi
-  # Stage 2 = target: same as stage 1
+  # Stage 2 = target: NO <parent> block, project version 3.0.0
   if echo "$_stage2" | grep -qF "<parent>"; then
     fail "stage 2 should be original target (has no <parent> block)"
   else
-    ok "stage 2 (ours) is original target — no <parent> block from source"
+    ok "stage 2 (ours) is original target — no <parent> block"
   fi
   if echo "$_stage2" | grep -qF "3.0.0"; then
     ok "stage 2 preserves target-only project version 3.0.0"
   else
     fail "stage 2 should preserve target project version 3.0.0"
   fi
-  # Stage 3 = source_B (tag2 end state): has <parent> block with updated 1.1.0
-  # highlighted green (differs from stage1=target which has no <parent>).
-  # 3.0.0 is target-only XML with no extractable key — correctly absent from
-  # stage3; IntelliJ shows it as "deleted by right" so user can keep it.
+  # Stage 3 = source v2+subs: has <parent> block, version 1.1.0 (highlighted
+  # because stage1 had 1.0.0).  Target's 3.0.0 is absent — shown as
+  # "deleted from right" in IntelliJ; user keeps it from the center panel.
   if echo "$_stage3" | grep -qF "1.1.0"; then
-    ok "stage 3 (right panel) contains updated version 1.1.0 (highlighted green)"
+    ok "stage 3 (right=v2) contains updated version 1.1.0 (highlighted green)"
   else
     fail "stage 3 should contain updated version 1.1.0"
   fi
   if echo "$_stage3" | grep -qF "<parent>"; then
-    ok "stage 3 is source_B — has <parent> block (source end-tag structure)"
+    ok "stage 3 is source v2 — has <parent> block"
   else
-    fail "stage 3 should be source_B and contain <parent> block"
+    fail "stage 3 should be source v2 and contain <parent> block"
   fi
 fi
 unset _stage1 _stage2 _stage3
@@ -2558,23 +2556,24 @@ has     "$K/deployment.yaml" "value: custom-value"  "target APP_SETTING value in
 has     "$K/deployment.yaml" "value: warn"          "target LOG_LEVEL value in working tree"
 has     "$K/deployment.yaml" "value: target-only"   "target-only EXTRA_CONFIG in working tree"
 
-section "app-k  duplicate-key — stage 3 correct occurrence-order substitution"
+section "app-k  duplicate-key — stage 3 is v2 verbatim with precise highlights"
 _s3=$(git -C "$K" cat-file blob :3:deployment.yaml 2>/dev/null || true)
 if [[ -z "$_s3" ]]; then
   fail "stage 3 missing for deployment.yaml"
 else
   ok "stage 3 registered for deployment.yaml"
 
-  # Unchanged env vars must use TARGET values (not source values)
-  if echo "$_s3" | grep -qF "value: prod-db"; then
-    ok "stage 3: DATABASE_URL uses target value prod-db (not source localhost)"
+  # Unchanged env vars appear with source (v2) values — not highlighted because
+  # stage1=v1 also has these values; target customisations visible in left panel.
+  if echo "$_s3" | grep -qF "value: localhost"; then
+    ok "stage 3: DATABASE_URL has source value localhost (not highlighted — target customised to prod-db)"
   else
-    fail "stage 3: DATABASE_URL should be prod-db (target value, not highlighted)"
+    fail "stage 3: DATABASE_URL should be source value localhost"
   fi
-  if echo "$_s3" | grep -qF "value: warn"; then
-    ok "stage 3: LOG_LEVEL uses target value warn (not source debug)"
+  if echo "$_s3" | grep -qF "value: debug"; then
+    ok "stage 3: LOG_LEVEL has source value debug (not highlighted — target customised to warn)"
   else
-    fail "stage 3: LOG_LEVEL should be warn (target value, not highlighted)"
+    fail "stage 3: LOG_LEVEL should be source value debug"
   fi
 
   # The changed env var must show source_B value (highlighted)
@@ -2584,21 +2583,16 @@ else
     fail "stage 3: APP_SETTING should be updated-value (v1→v2 change)"
   fi
   if echo "$_s3" | grep -qF "value: custom-value"; then
-    fail "stage 3: APP_SETTING must NOT show custom-value (that is stage 1, not stage 3)"
+    fail "stage 3: APP_SETTING must NOT show custom-value (that is stage 2, not stage 3)"
   else
     ok "stage 3: APP_SETTING does not retain custom-value from target"
   fi
 
-  # Source v1 value must NOT appear (would mean substitution used wrong occurrence)
+  # Source v1 value (original-value) must NOT appear — v2 changed APP_SETTING
   if echo "$_s3" | grep -qF "value: original-value"; then
     fail "stage 3 must not contain source v1 value original-value"
   else
     ok "stage 3 does not contain stale source v1 value original-value"
-  fi
-  if echo "$_s3" | grep -qF "value: localhost"; then
-    fail "stage 3 must not contain source v1 DATABASE_URL value localhost"
-  else
-    ok "stage 3 does not contain stale source value localhost"
   fi
 
   # Pure addition in v2 must be present (highlighted)
@@ -2608,18 +2602,19 @@ else
     fail "stage 3 should contain NEW_FEATURE: enabled (v1→v2 addition)"
   fi
 
-  # Target-only env var must be preserved (not highlighted, same as stage 1)
+  # Target-only env var is absent from stage3 (v2 does not have it).
+  # IntelliJ shows it as "deleted from right" — user keeps it from center panel.
   if echo "$_s3" | grep -qF "value: target-only"; then
-    ok "stage 3: target-only EXTRA_CONFIG preserved (not highlighted)"
+    fail "stage 3 must NOT contain EXTRA_CONFIG: target-only (target-only, absent from v2)"
   else
-    fail "stage 3 should contain EXTRA_CONFIG: target-only (target-only env var)"
+    ok "stage 3: target-only EXTRA_CONFIG absent (not in source v2 — shown as deleted-from-right)"
   fi
 
-  # replicas: target's value must be in stage 3 (not source's 1)
-  if echo "$_s3" | grep -qF "replicas: 3"; then
-    ok "stage 3: replicas uses target value 3 (not source value 1)"
+  # replicas: source value 1 is in stage3 (not highlighted — target customised to 3)
+  if echo "$_s3" | grep -qF "replicas: 1"; then
+    ok "stage 3: replicas has source value 1 (not highlighted — target customised to 3)"
   else
-    fail "stage 3: replicas should be 3 (target value)"
+    fail "stage 3: replicas should be source value 1"
   fi
 fi
 unset _s3
@@ -2648,7 +2643,7 @@ has     "$M/pom.xml" "4.0.0"   "target project version 4.0.0 in working tree"
 has     "$M/pom.xml" "5.0.0"   "target lib-a version 5.0.0 in working tree"
 has     "$M/pom.xml" "lib-d"   "target-only lib-d in working tree"
 
-section "app-m  Maven pom.xml — stage 3 correct for duplicate XML tags"
+section "app-m  Maven pom.xml — stage 3 is source v2 with precise v1→v2 highlights"
 _s3=$(git -C "$M" cat-file blob :3:pom.xml 2>/dev/null || true)
 if [[ -z "$_s3" ]]; then
   fail "stage 3 missing for pom.xml"
@@ -2682,22 +2677,22 @@ else
   fi
 
   # lib-a: unchanged in source v1→v2, target has custom version 5.0.0.
-  # Stage 3 must use target's version (5.0.0, not highlighted) because the
-  # source never touched it.  The source's 3.0.0 must not appear.
+  # Stage 3 has source value 3.0.0 — not highlighted because stage1=v1 also has 3.0.0.
+  # Target's 5.0.0 is visible in the left panel; user keeps it from the center panel.
   if echo "$_s3" | grep -qF "lib-a"; then
     ok "stage 3: lib-a present"
   else
     fail "stage 3 should contain lib-a"
   fi
-  if echo "$_s3" | grep -qF "5.0.0"; then
-    ok "stage 3: lib-a keeps target version 5.0.0 (source-unchanged, not highlighted)"
-  else
-    fail "stage 3 should keep target lib-a version 5.0.0 (source did not change it)"
-  fi
   if echo "$_s3" | grep -qF "3.0.0"; then
-    fail "stage 3 must not contain source lib-a version 3.0.0 (would be wrong highlight)"
+    ok "stage 3: lib-a has source version 3.0.0 (not highlighted — target customised to 5.0.0)"
   else
-    ok "stage 3: source lib-a version 3.0.0 absent (correctly replaced by target 5.0.0)"
+    fail "stage 3 should contain source lib-a version 3.0.0"
+  fi
+  if echo "$_s3" | grep -qF "5.0.0"; then
+    fail "stage 3 must not contain target lib-a version 5.0.0 (stage 3 is source v2)"
+  else
+    ok "stage 3: target lib-a version 5.0.0 absent (stage 3 shows source v2 values)"
   fi
 
   # lib-d: target-only XML dependency — XML keyless tags cannot be reliably
@@ -2772,11 +2767,12 @@ else
     fail "stage 3 should contain KEY_C (added in source v2)"
   fi
 
-  # KEY_D is target-only → must be re-inserted in stage3
+  # KEY_D is target-only — absent from source v2, so absent from stage3.
+  # IntelliJ shows it as "deleted from right"; user keeps it from the center panel.
   if echo "$_s3del" | grep -qF "KEY_D"; then
-    ok "stage 3: target-only KEY_D preserved (re-inserted, not highlighted)"
+    fail "stage 3 must NOT contain KEY_D (target-only, absent from source v2)"
   else
-    fail "stage 3 should contain KEY_D (target-only, must be re-inserted)"
+    ok "stage 3: target-only KEY_D absent from stage 3 (shown as deleted-from-right in IntelliJ)"
   fi
 fi
 unset _s3del
