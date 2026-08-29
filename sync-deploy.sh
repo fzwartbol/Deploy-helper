@@ -40,8 +40,7 @@ fi
 #   remain, the PR gets a blocking task so it cannot be merged until resolved.
 
 set -euo pipefail
-# ERR trap installed as a function so it can be toggled off around the per-target
-# subshell (whose failure is expected and handled) without duplicating the text.
+# ERR trap as a function so it can be toggled off around the per-target subshell.
 _fatal_trap()       { printf "[FATAL] aborted at line %s (exit %s): %s\n" "$1" "$2" "$3" >&2; }
 _install_err_trap() { trap 'rc=$?; _fatal_trap "$LINENO" "$rc" "$BASH_COMMAND"' ERR; }
 _install_err_trap
@@ -271,13 +270,7 @@ _cf_protected_keys() {
   ' "$CONFIG_FILE"
 }
 
-# ── conflict-resolution policy config ─────────────────────────────────────────
-# A top-level "resolution" object sets a single global policy for divergent keys
-# (a key the source changed between the two refs where the target has a different
-# value):
-#   "default": "manual" (leave <<<<<<< markers, the default) | "ours" | "theirs"
-# ours keeps the target value on a conflict; theirs takes the source value.  In
-# all cases the source changes that do NOT conflict are still applied.
+# Global conflict-resolution policy from resolution.default: manual|ours|theirs.
 _cf_resolution_default() {
   awk '
     /"resolution"[[:space:]]*:/ { inres=1 }
@@ -645,9 +638,8 @@ three_way_merge_file() {
   # Save ours before merge so we can register it as stage 2 on conflict
   cp "$tgt_abs" "$ours_save"
 
-  # Conflict-resolution policy (global): manual leaves <<< markers; ours keeps
-  # the target value on a conflict; theirs takes the source value.  In every
-  # case git still applies the source changes that do NOT conflict.
+  # Policy: ours/theirs resolve conflicts to that side; manual leaves markers.
+  # Non-conflicting source changes are applied in all cases.
   local _mf_flag=""
   case "${RES_DEFAULT:-manual}" in
     ours)   _mf_flag="--ours" ;;
@@ -661,10 +653,7 @@ three_way_merge_file() {
     -L "source (${TO_REF})" \
     "$tgt_abs" "$base" "$theirs" || rc=$?
 
-  # git merge-file exit status:
-  #   0        → clean merge (no conflicts, or all resolved by --ours/--theirs)
-  #   1..127   → merged with conflict markers; the value is the CONFLICT COUNT
-  #   255 (-1) → internal error (e.g. unreadable input)
+  # merge-file: 0=clean, 1..127=conflict count, 255=error.
   if [[ $rc -gt 127 ]]; then
     log_error "git merge-file error ($rc): $tgt_path"
     rm -f "$base" "$theirs" "$ours_save"
@@ -672,8 +661,7 @@ three_way_merge_file() {
   fi
 
   if [[ $rc -ge 1 ]]; then
-    # Conflict markers remain — register git index stages 1/2/3 so
-    # "git mergetool" can open the file.
+    # Register index stages 1/2/3 so "git mergetool" can open the file.
     local base_hash ours_hash theirs_hash
     base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
     ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
@@ -686,17 +674,13 @@ three_way_merge_file() {
   fi
 
   rm -f "$base" "$theirs" "$ours_save"
-
-  # return 1 only when conflict markers remain; a clean/auto-resolved file is
-  # committable and the caller git-adds it.
-  if [[ $rc -ge 1 ]]; then return 1; fi
+  [[ $rc -ge 1 ]] && return 1
   return 0
 }
 
 # ── Bitbucket PR creation ─────────────────────────────────────────────────────
-# Add an unresolved (blocking) task to a Bitbucket PR.  On repos that require
-# all PR tasks to be resolved before merge, this hard-blocks the merge until a
-# human resolves the conflict markers.  Best-effort: failures are warned, not fatal.
+# Add an unresolved (blocking) task to a PR; blocks merge where repos require
+# tasks resolved. Best-effort — a failure warns, it does not fail the sync.
 _bb_add_pr_task() {
   local repo_slug="$1" pr_id="$2" text="$3"
   local api_user="${BITBUCKET_USER:-}" api_token="${BITBUCKET_TOKEN:-}"
@@ -745,15 +729,13 @@ create_bitbucket_pr() {
   body_json=$(sed '$d' <<< "$response")
 
   if [[ "$http_code" == "201" ]]; then
-    # When the sync left conflict markers, add a blocking task so the PR cannot
-    # be merged (on repos that require resolved tasks) until a human fixes it.
-    if [[ -n "$conflict_task" ]]; then
-      _bb_add_pr_task "$repo_slug" "$(_pr_id "$body_json")" "$conflict_task"
-    fi
+    [[ -n "$conflict_task" ]] && _bb_add_pr_task "$repo_slug" "$(_pr_id "$body_json")" "$conflict_task"
     _pr_html_url "$body_json"
   elif grep -q "already exists" <<< "$body_json" 2>/dev/null; then
     log_warn "PR already open for branch $branch on $repo — skipping"
-    [[ -n "$conflict_task" ]] && log_warn "  NOTE: this PR still has conflict markers — resolve before merging"
+    if [[ -n "$conflict_task" ]]; then
+      log_warn "  NOTE: this PR still has conflict markers — resolve before merging"
+    fi
   else
     log_error "Bitbucket API $http_code: $(_pr_error_msg "$body_json")"
     return 1
@@ -1232,13 +1214,10 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
     _effective_mode="diff"
   fi
 
-  # Run the per-target work in a STANDALONE subshell (not in an &&/|| or
-  # if-condition).  In a "tested" subshell bash suppresses the inner `set -e`,
-  # so a failed clone or a rejected `git push` would be swallowed and the target
-  # wrongly reported as succeeded.  As a standalone command the inner `set -e`
-  # stays active.  We drop the outer errexit AND the ERR trap around it so an
-  # expected target failure neither aborts the whole run nor prints a spurious
-  # "[FATAL]" line; both are restored immediately afterward.
+  # Per-target work runs in a STANDALONE subshell so its inner `set -e` stays
+  # active (bash suppresses it in a subshell that is &&/||/if-tested, which would
+  # swallow a failed clone or push). Drop outer errexit + ERR trap around it so a
+  # target failure neither aborts the run nor prints a spurious [FATAL]; restore after.
   set +e
   trap - ERR
   (
@@ -1442,10 +1421,9 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
         log_warn "Conflicts in $TARGET_NAME (non-interactive) — committing with markers"
         log_warn "Resolve later: git fetch origin && git checkout $SYNC_BRANCH, edit the marked files, then commit"
         for _cf in "${CONFLICT_FILES[@]}"; do
-          # The working-tree file carries git-merge-file conflict markers and has
-          # index stages 1/2/3 registered.  `git add` alone leaves those higher
-          # stages in place, so `git commit` refuses with "unmerged files".
-          # Drop all stages, then re-add the marker file as a normal stage-0 blob.
+          # `git add` alone leaves the registered stages 1/2/3 in place (commit
+          # then refuses "unmerged files"); force-remove them, then re-add the
+          # marker file as a plain stage-0 blob.
           git -C "$TARGET_DIR" update-index --force-remove "$_cf"
           git -C "$TARGET_DIR" add "$_cf"
         done
@@ -1503,16 +1481,14 @@ ${_changed_md}${SEALED_SECTION}${IMAGE_SECTION}${CONFLICT_SECTION}
 ---
 *Auto-generated by sync-deploy.sh — review before merging.*"
 
-    # When conflicts remain, pass a task string so the PR gets a blocking task.
     CONFLICT_TASK=""
     if [[ "$_effective_mode" == "diff" && ${#CONFLICT_FILES[@]} -gt 0 ]]; then
       CONFLICT_TASK="Resolve conflict markers before merging (auto-synced). Files: ${CONFLICT_FILES[*]}"
     fi
     PR_URL=$(create_bitbucket_pr "$TARGET_REPO" "$SYNC_BRANCH" \
       "${PR_TITLE_PREFIX}sync from ${SOURCE_REPO##*/} (${TO_REF})" "$PR_BODY" "$CONFLICT_TASK")
-    # Use `if`, not `&&`: as the final statement in this subshell a false test
-    # would become the subshell's exit status and (with `set -e` active) wrongly
-    # mark the target FAILED — e.g. whenever no PR was created (no credentials).
+    # `if`, not `&&`: as the subshell's last statement a false test would become
+    # its exit status and wrongly fail the target (e.g. when no PR was created).
     if [[ -n "${PR_URL:-}" ]]; then log_info "PR: $PR_URL"; fi
 
   )
@@ -1532,9 +1508,8 @@ log_section "Done"
 [[ ${#PASS[@]} -gt 0 ]] && log_info  "Succeeded (${#PASS[@]}): ${PASS[*]}"
 [[ ${#FAIL[@]} -gt 0 ]] && log_error "Failed    (${#FAIL[@]}): ${FAIL[*]}"
 
-# Exit code reflects whether any target failed.  Use an `if` (whose condition is
-# exempt from the ERR trap) plus an explicit exit so a normal "some targets
-# failed" outcome does not print a spurious "[FATAL] aborted" line.
+# `if` + explicit exit (not a bare test) so a failed-target run does not trip
+# the ERR trap with a spurious "[FATAL] aborted".
 if [[ ${#FAIL[@]} -eq 0 ]]; then
   exit 0
 else
