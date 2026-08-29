@@ -10,10 +10,8 @@
     "API_BASE_URL"
   ],
   "resolution": {
-    "_comment": "How to resolve a key the source changed between refs when the target has a different value. default: manual|ours|theirs. keep_target/take_source are substring patterns matched against the conflicting line and its enclosing block (e.g. a dependency artifactId or a YAML key).",
-    "default": "manual",
-    "keep_target": [],
-    "take_source": []
+    "_comment": "Global policy for a key the source changed between refs when the target has a different value. manual = leave conflict markers (default); ours = keep the target value; theirs = take the source value. Non-conflicting source changes are always applied.",
+    "default": "manual"
   },
   "apps": [
     {

@@ -51,12 +51,25 @@ exists()  { [[ -f "$1" ]] && ok  "${2:-${1##"$WORK_DIR/"} exists}"  || fail "${2
 absent()  { [[ ! -f "$1" ]] && ok "${2:-${1##"$WORK_DIR/"} absent}" || fail "${2:-${1##"$WORK_DIR/"} absent}"; }
 
 # ── mock curl (Bitbucket PR API) ──────────────────────────────────────────────
+# Logs every Bitbucket API URL to $CURL_LOG so tests can assert which endpoints
+# were hit (PR creation vs. blocking-task creation).  Returns a PR object with an
+# id for the pullrequests endpoint and a created-task object for /tasks.
+export CURL_LOG="$T/curl.log"
+: > "$CURL_LOG"
 mkdir -p "$T/bin"
 cat > "$T/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
-if [[ "$*" == *"api.bitbucket.org"* ]]; then
-  echo '{"links":{"html":{"href":"https://bitbucket.org/test/pullrequests/1"}}}'
-  echo "201"
+_url=""
+for _a in "$@"; do case "$_a" in https://api.bitbucket.org/*) _url="$_a";; esac; done
+if [[ -n "$_url" ]]; then
+  echo "$_url" >> "$CURL_LOG"
+  if [[ "$_url" == *"/tasks" ]]; then
+    echo '{"id":99,"state":"UNRESOLVED"}'
+    echo "201"
+  else
+    echo '{"id":42,"links":{"html":{"href":"https://bitbucket.org/test/pullrequests/42"}}}'
+    echo "201"
+  fi
 else
   exec /usr/bin/curl "$@"
 fi
@@ -1312,12 +1325,11 @@ YAML
 with_work "app-nc-app" "" app_nc_initial
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POLICY REPOS  (source-pol / app-pol)  [per-key resolution overrides]
-#   pom.xml with three dependency versions + the project version, all bumped by
-#   the source v1->v2 and all customised differently in the target.  With a
-#   resolution policy of default=manual + keep_target=[lib-keep] +
-#   take_source=[lib-take], lib-keep resolves to the target value, lib-take to
-#   the source value, and lib-manual + project version stay as real conflicts.
+# POLICY REPOS  (source-pol / app-pol)  [global resolution knob]
+#   Larger NESTED pom.xml whose parent, project version, dependency and plugin
+#   versions and a profile flag are all bumped by the source v1->v2 and all
+#   customised differently in the target.  Used to exercise resolution=ours:
+#   every divergence resolves to the target value with no conflict markers.
 # ─────────────────────────────────────────────────────────────────────────────
 make_bare "source-pol-app"
 # Larger NESTED pom.xml generator.  Args (all version/value literals):
@@ -1415,9 +1427,7 @@ cat > "$T/repos.policy.json" <<'EOF'
 {
   "pr": { "base_branch": "main", "title_prefix": "chore(sync): " },
   "resolution": {
-    "default": "manual",
-    "keep_target": ["lib-keep", "plugin-keep"],
-    "take_source": ["lib-take", "plugin-take"]
+    "default": "ours"
   },
   "apps": [
     {
@@ -2002,6 +2012,7 @@ unset _branch_f
 # ─────────────────────────────────────────────────────────────────────────────
 echo -e "\n${BOLD}Running sync-deploy.sh  (multi-conflict: source-mc → app-mc,app-fail, v1.0.0 → v1.1.0)${NC}"
 
+: > "$CURL_LOG"   # reset so we can assert on API calls made by this run
 set +e
 _mc_out=$(bash "$SYNC_SCRIPT" \
   --config  "$T/repos.test.json" \
@@ -2054,7 +2065,17 @@ else
 fi
 [[ $_mc_rc -eq 1 ]] && ok "exit code 1 (a target failed)" \
   || fail "exit code should be 1 when a target fails (got $_mc_rc)"
-unset _mc_out _mc_rc
+
+section "multi-conflict  conflicted PR gets a blocking task (do-not-merge)"
+_pr_calls=$(grep -cE '/pullrequests$' "$CURL_LOG" || true)
+_task_calls=$(grep -cE '/pullrequests/[0-9]+/tasks$' "$CURL_LOG" || true)
+[[ "$_pr_calls" -eq 1 ]] && ok "one PR created (app-mc; app-fail never got that far)" \
+  || fail "expected exactly 1 PR creation call, got $_pr_calls"
+[[ "$_task_calls" -eq 1 ]] && ok "conflicted PR received exactly one blocking task" \
+  || fail "expected exactly 1 blocking-task call for the conflicted PR, got $_task_calls"
+grep -qF "added blocking PR task" <<< "$_mc_out" && ok "run logs that a blocking task was added" \
+  || fail "run should log the blocking-task addition"
+unset _mc_out _mc_rc _pr_calls _task_calls
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO: successful target with NO Bitbucket credentials (empty PR_URL)
@@ -2100,13 +2121,14 @@ fi
 unset _nc_out _nc_rc _nc_head
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCENARIO: per-key resolution policy (large-ish pom.xml)
-#   default=manual, keep_target=[lib-keep], take_source=[lib-take].
-#   lib-keep divergence -> target value; lib-take divergence -> source value;
-#   lib-manual + project version -> remain real conflicts (markers).
+# SCENARIO: global resolution policy = "ours" (nested pom.xml)
+#   Every divergent key (source changed it, target differs) resolves to the
+#   TARGET value; non-conflicting source changes still apply.  Result is a clean
+#   file (no markers) → a normal PR with NO blocking task.
 # ─────────────────────────────────────────────────────────────────────────────
-echo -e "\n${BOLD}Running sync-deploy.sh  (resolution policy: source-pol → app-pol)${NC}"
+echo -e "\n${BOLD}Running sync-deploy.sh  (resolution=ours: source-pol → app-pol)${NC}"
 
+: > "$CURL_LOG"
 set +e
 _pol_out=$(bash "$SYNC_SCRIPT" \
   --config  "$T/repos.policy.json" \
@@ -2121,10 +2143,10 @@ set -e
 POL="$WORK_DIR/app-pol"
 _pol_head=$(git -C "$POL" cat-file blob "HEAD:pom.xml" 2>/dev/null || true)
 
-section "policy  app-pol (nested pom) — clean applies & silent target-keeps"
-grep -qF "<version>3.2.0</version>" <<< "$_pol_head" && ok "parent version bumped cleanly to 3.2.0 (target had base value)" \
+section "policy=ours  app-pol (nested pom) — clean applies & silent keeps"
+grep -qF "<version>3.2.0</version>" <<< "$_pol_head" && ok "parent version applied source 3.2.0 cleanly (target had base value)" \
   || fail "parent version should apply source 3.2.0 cleanly"
-grep -qF "6.6.6" <<< "$_pol_head" && ok "lib-untouched keeps target 6.6.6 (source never changed it — no conflict)" \
+grep -qF "6.6.6" <<< "$_pol_head" && ok "lib-untouched keeps target 6.6.6 (source never changed it)" \
   || fail "lib-untouched should keep target 6.6.6"
 if grep -qF "1.0.0" <<< "$_pol_head"; then
   fail "base value 1.0.0 must not leak (lib-clean should have applied source 2.0.0)"
@@ -2132,35 +2154,27 @@ else
   ok "no base value 1.0.0 leaked; lib-clean applied source cleanly"
 fi
 
-section "policy  app-pol (nested pom) — per-key overrides auto-resolve"
-grep -qF "9.9.9" <<< "$_pol_head" && ok "lib-keep kept TARGET 9.9.9 (keep_target)" \
-  || fail "lib-keep should keep target 9.9.9"
-grep -qF "3.3.3" <<< "$_pol_head" && ok "plugin-keep kept TARGET 3.3.3 (keep_target, nested in build/plugins)" \
-  || fail "plugin-keep should keep target 3.3.3"
-if grep -qF "8.8.8" <<< "$_pol_head"; then fail "lib-take 8.8.8 should be overwritten (take_source)"; \
-  else ok "lib-take took SOURCE (target 8.8.8 gone)"; fi
-if grep -qF "4.4.4" <<< "$_pol_head"; then fail "plugin-take 4.4.4 should be overwritten (take_source)"; \
-  else ok "plugin-take took SOURCE (target 4.4.4 gone)"; fi
-
-section "policy  app-pol (nested pom) — un-policied divergences stay conflicts"
-grep -qF "7.7.7"   <<< "$_pol_head" && ok "lib-manual target 7.7.7 preserved in a real conflict" || fail "lib-manual 7.7.7 should remain"
-grep -qF "5.0.0"   <<< "$_pol_head" && ok "project version target 5.0.0 preserved in a real conflict" || fail "project version 5.0.0 should remain"
-grep -qF "custom"  <<< "$_pol_head" && ok "profile feature.flag target 'custom' preserved (nested in profiles)" || fail "feature.flag 'custom' should remain"
-
-section "policy  app-pol (nested pom) — resolved/unresolved counts"
-_auto_keep=$(grep -cF "kept TARGET" <<< "$_pol_out" || true)
-_auto_take=$(grep -cF "took SOURCE" <<< "$_pol_out" || true)
-_manual_cnt=$(grep -cF "<<<<<<<" <<< "$_pol_head" || true)
-echo -e "  ${CYAN}auto-resolved kept-target=$_auto_keep  took-source=$_auto_take  |  manual conflicts remaining=$_manual_cnt${NC}"
-[[ "$_auto_keep" -eq 2 ]] && ok "exactly 2 keep-target auto-resolutions (lib-keep, plugin-keep)" \
-  || fail "expected 2 keep-target auto-resolutions, got $_auto_keep"
-[[ "$_auto_take" -eq 2 ]] && ok "exactly 2 take-source auto-resolutions (lib-take, plugin-take)" \
-  || fail "expected 2 take-source auto-resolutions, got $_auto_take"
-[[ "$_manual_cnt" -eq 3 ]] && ok "exactly 3 conflicts left for manual review (project ver, lib-manual, feature.flag)" \
-  || fail "expected 3 remaining manual conflicts, got $_manual_cnt"
-[[ $_pol_rc -eq 0 ]] && ok "run exit 0 (app-pol committed and pushed with markers)" \
+section "policy=ours  app-pol (nested pom) — every divergence resolved to TARGET"
+for _v in 9.9.9 8.8.8 7.7.7 5.0.0 3.3.3 4.4.4 custom; do
+  grep -qF "$_v" <<< "$_pol_head" && ok "target value $_v kept (divergence resolved to ours)" \
+    || fail "target value $_v should be kept under policy=ours"
+done
+unset _v
+if grep -qF "<<<<<<<" <<< "$_pol_head"; then
+  fail "policy=ours must leave NO conflict markers"
+else
+  ok "no conflict markers — file fully resolved to target values"
+fi
+[[ $_pol_rc -eq 0 ]] && ok "run exit 0 (app-pol committed and pushed cleanly)" \
   || fail "run should exit 0 (got $_pol_rc)"
-unset _pol_out _pol_rc _pol_head _auto_keep _auto_take _manual_cnt
+
+section "policy=ours  app-pol — clean PR, no blocking task"
+_pol_pr=$(grep -cE '/pullrequests$' "$CURL_LOG" || true)
+_pol_task=$(grep -cE '/pullrequests/[0-9]+/tasks$' "$CURL_LOG" || true)
+[[ "$_pol_pr" -ge 1 ]] && ok "a PR was created" || fail "expected a PR creation call, got $_pol_pr"
+[[ "$_pol_task" -eq 0 ]] && ok "no blocking task (nothing left unresolved)" \
+  || fail "clean auto-resolved PR must not get a blocking task, got $_pol_task"
+unset _pol_out _pol_rc _pol_head _pol_pr _pol_task
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
