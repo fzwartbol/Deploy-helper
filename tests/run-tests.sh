@@ -1421,6 +1421,44 @@ make_bare "app-pol-app"
 app_pol_initial() { _np_pom app-pol 3.1.0 5.0.0 9.9.9 8.8.8 7.7.7 1.0.0 6.6.6 3.3.3 4.4.4 custom > pom.xml; }
 with_work "app-pol-app" "" app_pol_initial
 
+# ── PILOT REPOS: one source, two clean targets (run-mode pilot) ───────────────
+make_bare "source-pilot-app"
+source_pilot_v1() { printf 'name: svc\nversion: 1\nkeep: yes\n' > config.yaml; }
+with_work "source-pilot-app" "v1.0.0" source_pilot_v1
+source_pilot_v2() { printf 'name: svc\nversion: 2\nkeep: yes\n' > config.yaml; }
+with_work "source-pilot-app" "v1.1.0" source_pilot_v2
+_pilot_tgt() { printf 'name: svc\nversion: 1\nkeep: yes\n' > config.yaml; }   # == base → clean merge
+make_bare "app-pi1-app"; with_work "app-pi1-app" "" _pilot_tgt
+make_bare "app-pi2-app"; with_work "app-pi2-app" "" _pilot_tgt
+cat > "$T/repos.pilot.json" <<'EOF'
+{
+  "pr": { "base_branch": "main", "title_prefix": "chore(sync): " },
+  "apps": [
+    {
+      "name": "source-pilot",
+      "app": {
+        "repo": "testspace/source-pilot-app",
+        "substitutions": { "app_name": "svc" }
+      }
+    },
+    {
+      "name": "app-pi1",
+      "app": {
+        "repo": "testspace/app-pi1-app",
+        "substitutions": { "app_name": "svc" }
+      }
+    },
+    {
+      "name": "app-pi2",
+      "app": {
+        "repo": "testspace/app-pi2-app",
+        "substitutions": { "app_name": "svc" }
+      }
+    }
+  ]
+}
+EOF
+
 # Config with a resolution policy for the policy scenario (kept separate so it
 # does not affect the main repos.test.json scenarios).
 cat > "$T/repos.policy.json" <<'EOF'
@@ -2175,6 +2213,42 @@ _pol_task=$(grep -cE '/pullrequests/[0-9]+/tasks$' "$CURL_LOG" || true)
 [[ "$_pol_task" -eq 0 ]] && ok "no blocking task (nothing left unresolved)" \
   || fail "clean auto-resolved PR must not get a blocking task, got $_pol_task"
 unset _pol_out _pol_rc _pol_head _pol_pr _pol_task
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO: run mode (batch vs pilot)
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (--run-mode pilot, non-interactive: source-pilot → app-pi1,app-pi2)${NC}"
+
+set +e
+_pil_out=$(bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.pilot.json" \
+  --source  source-pilot \
+  --type    app \
+  --targets app-pi1,app-pi2 \
+  --run-mode pilot \
+  --from    v1.0.0 \
+  --to      v1.1.0 2>&1)
+_pil_rc=$?
+set -e
+
+section "run-mode  pilot (non-interactive) processes every target (no pause)"
+[[ $_pil_rc -eq 0 ]] && ok "run exit 0" || fail "run should exit 0 (got $_pil_rc)"
+_pi1=$(git -C "$WORK_DIR/app-pi1" cat-file blob "HEAD:config.yaml" 2>/dev/null || true)
+_pi2=$(git -C "$WORK_DIR/app-pi2" cat-file blob "HEAD:config.yaml" 2>/dev/null || true)
+grep -qF "version: 2" <<< "$_pi1" && ok "app-pi1 processed (source v2 applied)" || fail "app-pi1 should have version: 2"
+grep -qF "version: 2" <<< "$_pi2" && ok "app-pi2 processed (source v2 applied — no pause blocked it)" || fail "app-pi2 should have version: 2"
+grep -qF "Succeeded (2)" <<< "$_pil_out" && ok "both targets reported succeeded" || fail "expected 2 succeeded targets"
+unset _pil_out _pil_rc _pi1 _pi2
+
+section "run-mode  invalid value is rejected"
+set +e
+_bad=$(bash "$SYNC_SCRIPT" --config "$T/repos.pilot.json" --source source-pilot --type app \
+  --targets app-pi1 --run-mode bogus --from v1.0.0 --to v1.1.0 2>&1)
+_bad_rc=$?
+set -e
+[[ $_bad_rc -ne 0 ]] && ok "invalid --run-mode exits non-zero" || fail "invalid --run-mode should fail"
+grep -qF "Invalid --run-mode" <<< "$_bad" && ok "invalid --run-mode prints a clear error" || fail "expected 'Invalid --run-mode' error"
+unset _bad _bad_rc
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary

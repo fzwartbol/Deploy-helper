@@ -74,6 +74,7 @@ Options:
   --source <name>    Source app name (from repos list)
   --type <type>      Section type to sync: deploy|app  (default: deploy)
   --mode <mode>      Sync mode: diff|copy               (default: diff)
+  --run-mode <m>     batch (all at once) | pilot (do first, review, then rest)
   --branch <name>    Source branch to check out  (default: base_branch from config)
   --from <ref>       Start ref — tag or commit  (default: HEAD~1)
   --to <ref>         End ref   — tag or commit  (default: HEAD)
@@ -105,27 +106,33 @@ FILTER_TARGETS="all"
 DRY_RUN=false
 SYNC_TYPE=""
 SYNC_MODE="diff"
+RUN_MODE=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --source)  SOURCE_NAME="$2"; shift 2 ;;
-    --type)    SYNC_TYPE="$2"; shift 2 ;;
-    --mode)    SYNC_MODE="$2"; shift 2 ;;
-    --branch)  SOURCE_BRANCH="$2"; shift 2 ;;
-    --from)    FROM_REF="$2"; FROM_EXPLICIT=true; shift 2 ;;
-    --to)      TO_REF="$2";   TO_EXPLICIT=true;   shift 2 ;;
-    --targets) FILTER_TARGETS="$2"; shift 2 ;;
-    --dry-run) DRY_RUN=true;  shift   ;;
-    --config)  CONFIG_FILE="$2"; shift 2 ;;
-    -h|--help) usage; exit 0  ;;
+    --source)   SOURCE_NAME="$2"; shift 2 ;;
+    --type)     SYNC_TYPE="$2"; shift 2 ;;
+    --mode)     SYNC_MODE="$2"; shift 2 ;;
+    --run-mode) RUN_MODE="$2"; shift 2 ;;
+    --branch)   SOURCE_BRANCH="$2"; shift 2 ;;
+    --from)     FROM_REF="$2"; FROM_EXPLICIT=true; shift 2 ;;
+    --to)       TO_REF="$2";   TO_EXPLICIT=true;   shift 2 ;;
+    --targets)  FILTER_TARGETS="$2"; shift 2 ;;
+    --dry-run)  DRY_RUN=true;  shift   ;;
+    --config)   CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help)  usage; exit 0  ;;
     *) log_error "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
 
-# Validate --mode and --type
+# Validate --mode, --run-mode and --type
 case "$SYNC_MODE" in
   diff|copy) ;;
   *) log_error "Invalid --mode '$SYNC_MODE'; must be diff or copy"; exit 1 ;;
+esac
+case "$RUN_MODE" in
+  ""|batch|pilot) ;;
+  *) log_error "Invalid --run-mode '$RUN_MODE'; must be batch or pilot"; exit 1 ;;
 esac
 if [[ -n "$SYNC_TYPE" ]]; then
   case "$SYNC_TYPE" in
@@ -751,6 +758,17 @@ is_target_included() {
   return 1
 }
 
+# Number of targets that will actually be processed this run.
+count_included_targets() {
+  local n=0 i nm
+  for ((i=0; i<APP_COUNT; i++)); do
+    nm=$(_cf_app_name "$i")
+    [[ -z "$(_cf_app_repo "$i" "$SYNC_TYPE")" ]] && continue
+    is_target_included "$nm" && n=$((n+1))
+  done
+  printf '%s' "$n"
+}
+
 # ── load static config values ─────────────────────────────────────────────────
 BASE_BRANCH=$(_cf_str base_branch);      BASE_BRANCH="${BASE_BRANCH:-main}"
 PR_TITLE_PREFIX=$(_cf_str title_prefix); PR_TITLE_PREFIX="${PR_TITLE_PREFIX:-chore(sync): }"
@@ -1021,10 +1039,10 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
     for ((_i=0; _i<_nt; _i++)); do
       printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_repos[$_i]}"
     done
-    printf '\nEnter numbers (space-separated), or ENTER for all: '
+    printf '\nSelect: ENTER or "a" = ALL, or numbers (space-separated) for a subset: '
     read -r _picks 2>/dev/null || _picks=""
 
-    if [[ -z "$_picks" ]]; then
+    if [[ -z "$_picks" || "$_picks" == "a" || "$_picks" == "all" ]]; then
       _sel=("${_tgt_names[@]}")
     else
       _sel=()
@@ -1044,6 +1062,21 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
   unset _tgt_names _tgt_repos _nt
 fi
 unset _ANAMES _AREPOS _i
+
+# ── Interactive step 5: run mode (batch vs pilot) ────────────────────────────
+if [[ -z "$RUN_MODE" ]] && $_INTERACTIVE && ! $DRY_RUN; then
+  if [[ "$(count_included_targets)" -gt 1 ]]; then
+    echo "--- Step 5: Run mode ---"
+    echo "  1) Batch  — process every selected target, then stop"
+    echo "  2) Pilot  — process the first, pause to review, then continue with the rest"
+    printf 'Enter [1-2, ENTER=1]: '
+    read -r _rm 2>/dev/null || _rm=""
+    case "$_rm" in 2) RUN_MODE=pilot ;; *) RUN_MODE=batch ;; esac
+    echo "-> $RUN_MODE"; echo ""
+    unset _rm
+  fi
+fi
+RUN_MODE="${RUN_MODE:-batch}"
 
 # ── Compute branch name ───────────────────────────────────────────────────────
 SYNC_BRANCH="sync/${SYNC_TYPE}-${SYNC_MODE}-from-$(_sanitize_ref "$FROM_REF")-to-$(_sanitize_ref "$TO_REF")"
@@ -1181,6 +1214,7 @@ sync_copy_mode() {
 # ── Process each target repo ──────────────────────────────────────────────────
 PASS=(); FAIL=()
 _tgt_num=0
+_total_tgt=$(count_included_targets)
 
 for ((_ti=0; _ti<APP_COUNT; _ti++)); do
   TARGET_NAME=$(_cf_app_name "$_ti")
@@ -1500,6 +1534,20 @@ ${_changed_md}${SEALED_SECTION}${IMAGE_SECTION}${CONFLICT_SECTION}
   else
     log_error "FAILED: $TARGET_NAME"
     FAIL+=("$TARGET_NAME")
+  fi
+
+  # Pilot: pause after the first target so it can be reviewed before the rest.
+  if [[ "$RUN_MODE" == "pilot" && $_tgt_num -eq 1 && $_total_tgt -gt 1 ]] && $_INTERACTIVE; then
+    log_section "Pilot done: $TARGET_NAME — review before continuing"
+    echo "  work tree : $WORK_DIR/$TARGET_NAME"
+    echo "  branch    : $SYNC_BRANCH  (pushed if credentials were set)"
+    printf 'Continue with the remaining %d target(s)? [Y/n]: ' "$((_total_tgt - 1))"
+    read -r _cont 2>/dev/null || _cont="y"
+    case "${_cont,,}" in
+      n|no|s|stop|q|quit) log_warn "Stopping after pilot at your request."; break ;;
+      *) RUN_MODE=batch ;;
+    esac
+    unset _cont
   fi
 done
 
