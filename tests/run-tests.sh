@@ -1311,6 +1311,133 @@ YAML
 }
 with_work "app-nc-app" "" app_nc_initial
 
+# ─────────────────────────────────────────────────────────────────────────────
+# POLICY REPOS  (source-pol / app-pol)  [per-key resolution overrides]
+#   pom.xml with three dependency versions + the project version, all bumped by
+#   the source v1->v2 and all customised differently in the target.  With a
+#   resolution policy of default=manual + keep_target=[lib-keep] +
+#   take_source=[lib-take], lib-keep resolves to the target value, lib-take to
+#   the source value, and lib-manual + project version stay as real conflicts.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-pol-app"
+# Larger NESTED pom.xml generator.  Args (all version/value literals):
+#   1 name  2 parentver  3 appver  4 keep  5 take  6 manual  7 clean
+#   8 untouched  9 pkeep  10 ptake  11 flag
+_np_pom() {
+  cat <<YAML
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>$2</version>
+  </parent>
+  <groupId>com.$1.app</groupId>
+  <artifactId>$1-service</artifactId>
+  <version>$3</version>
+  <properties>
+    <java.version>17</java.version>
+    <maven.compiler.release>17</maven.compiler.release>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.ext</groupId>
+        <artifactId>lib-keep</artifactId>
+        <version>$4</version>
+      </dependency>
+      <dependency>
+        <groupId>com.ext</groupId>
+        <artifactId>lib-take</artifactId>
+        <version>$5</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.ext</groupId>
+      <artifactId>lib-manual</artifactId>
+      <version>$6</version>
+    </dependency>
+    <dependency>
+      <groupId>com.ext</groupId>
+      <artifactId>lib-clean</artifactId>
+      <version>$7</version>
+    </dependency>
+    <dependency>
+      <groupId>com.ext</groupId>
+      <artifactId>lib-untouched</artifactId>
+      <version>$8</version>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>com.plug</groupId>
+        <artifactId>plugin-keep</artifactId>
+        <version>$9</version>
+      </plugin>
+      <plugin>
+        <groupId>com.plug</groupId>
+        <artifactId>plugin-take</artifactId>
+        <version>${10}</version>
+      </plugin>
+    </plugins>
+  </build>
+  <profiles>
+    <profile>
+      <id>prod</id>
+      <properties>
+        <feature.flag>${11}</feature.flag>
+      </properties>
+    </profile>
+  </profiles>
+</project>
+YAML
+}
+# base v1 / source v2 differ in: parent, project version, all lib versions,
+# both plugin versions, and the profile flag.  lib-untouched is unchanged.
+source_pol_v1() { _np_pom source-pol 3.1.0 1.0.0 1.0.0 1.0.0 1.0.0 1.0.0 3.0.0 1.0.0 1.0.0 true  > pom.xml; }
+with_work "source-pol-app" "v1.0.0" source_pol_v1
+source_pol_v2() { _np_pom source-pol 3.2.0 1.1.0 2.0.0 2.0.0 2.0.0 2.0.0 3.0.0 1.5.0 1.5.0 false > pom.xml; }
+with_work "source-pol-app" "v1.1.0" source_pol_v2
+
+# Target customised parent stays, but project version + several deps/plugins +
+# flag are pinned to its own values; lib-clean matches base (clean apply);
+# lib-untouched is a target-only pin the source never changed.
+make_bare "app-pol-app"
+app_pol_initial() { _np_pom app-pol 3.1.0 5.0.0 9.9.9 8.8.8 7.7.7 1.0.0 6.6.6 3.3.3 4.4.4 custom > pom.xml; }
+with_work "app-pol-app" "" app_pol_initial
+
+# Config with a resolution policy for the policy scenario (kept separate so it
+# does not affect the main repos.test.json scenarios).
+cat > "$T/repos.policy.json" <<'EOF'
+{
+  "pr": { "base_branch": "main", "title_prefix": "chore(sync): " },
+  "resolution": {
+    "default": "manual",
+    "keep_target": ["lib-keep", "plugin-keep"],
+    "take_source": ["lib-take", "plugin-take"]
+  },
+  "apps": [
+    {
+      "name": "source-pol",
+      "app": {
+        "repo": "testspace/source-pol-app",
+        "substitutions": { "app_name": "source-pol" }
+      }
+    },
+    {
+      "name": "app-pol",
+      "app": {
+        "repo": "testspace/app-pol-app",
+        "substitutions": { "app_name": "app-pol" }
+      }
+    }
+  ]
+}
+EOF
+
 cat > "$T/repos.test.json" <<'EOF'
 {
   "pr": {
@@ -1971,6 +2098,69 @@ else
   ok "clean merge committed without conflict markers"
 fi
 unset _nc_out _nc_rc _nc_head
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO: per-key resolution policy (large-ish pom.xml)
+#   default=manual, keep_target=[lib-keep], take_source=[lib-take].
+#   lib-keep divergence -> target value; lib-take divergence -> source value;
+#   lib-manual + project version -> remain real conflicts (markers).
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (resolution policy: source-pol → app-pol)${NC}"
+
+set +e
+_pol_out=$(bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.policy.json" \
+  --source  source-pol \
+  --type    app \
+  --targets app-pol \
+  --from    v1.0.0 \
+  --to      v1.1.0 2>&1)
+_pol_rc=$?
+set -e
+
+POL="$WORK_DIR/app-pol"
+_pol_head=$(git -C "$POL" cat-file blob "HEAD:pom.xml" 2>/dev/null || true)
+
+section "policy  app-pol (nested pom) — clean applies & silent target-keeps"
+grep -qF "<version>3.2.0</version>" <<< "$_pol_head" && ok "parent version bumped cleanly to 3.2.0 (target had base value)" \
+  || fail "parent version should apply source 3.2.0 cleanly"
+grep -qF "6.6.6" <<< "$_pol_head" && ok "lib-untouched keeps target 6.6.6 (source never changed it — no conflict)" \
+  || fail "lib-untouched should keep target 6.6.6"
+if grep -qF "1.0.0" <<< "$_pol_head"; then
+  fail "base value 1.0.0 must not leak (lib-clean should have applied source 2.0.0)"
+else
+  ok "no base value 1.0.0 leaked; lib-clean applied source cleanly"
+fi
+
+section "policy  app-pol (nested pom) — per-key overrides auto-resolve"
+grep -qF "9.9.9" <<< "$_pol_head" && ok "lib-keep kept TARGET 9.9.9 (keep_target)" \
+  || fail "lib-keep should keep target 9.9.9"
+grep -qF "3.3.3" <<< "$_pol_head" && ok "plugin-keep kept TARGET 3.3.3 (keep_target, nested in build/plugins)" \
+  || fail "plugin-keep should keep target 3.3.3"
+if grep -qF "8.8.8" <<< "$_pol_head"; then fail "lib-take 8.8.8 should be overwritten (take_source)"; \
+  else ok "lib-take took SOURCE (target 8.8.8 gone)"; fi
+if grep -qF "4.4.4" <<< "$_pol_head"; then fail "plugin-take 4.4.4 should be overwritten (take_source)"; \
+  else ok "plugin-take took SOURCE (target 4.4.4 gone)"; fi
+
+section "policy  app-pol (nested pom) — un-policied divergences stay conflicts"
+grep -qF "7.7.7"   <<< "$_pol_head" && ok "lib-manual target 7.7.7 preserved in a real conflict" || fail "lib-manual 7.7.7 should remain"
+grep -qF "5.0.0"   <<< "$_pol_head" && ok "project version target 5.0.0 preserved in a real conflict" || fail "project version 5.0.0 should remain"
+grep -qF "custom"  <<< "$_pol_head" && ok "profile feature.flag target 'custom' preserved (nested in profiles)" || fail "feature.flag 'custom' should remain"
+
+section "policy  app-pol (nested pom) — resolved/unresolved counts"
+_auto_keep=$(grep -cF "kept TARGET" <<< "$_pol_out" || true)
+_auto_take=$(grep -cF "took SOURCE" <<< "$_pol_out" || true)
+_manual_cnt=$(grep -cF "<<<<<<<" <<< "$_pol_head" || true)
+echo -e "  ${CYAN}auto-resolved kept-target=$_auto_keep  took-source=$_auto_take  |  manual conflicts remaining=$_manual_cnt${NC}"
+[[ "$_auto_keep" -eq 2 ]] && ok "exactly 2 keep-target auto-resolutions (lib-keep, plugin-keep)" \
+  || fail "expected 2 keep-target auto-resolutions, got $_auto_keep"
+[[ "$_auto_take" -eq 2 ]] && ok "exactly 2 take-source auto-resolutions (lib-take, plugin-take)" \
+  || fail "expected 2 take-source auto-resolutions, got $_auto_take"
+[[ "$_manual_cnt" -eq 3 ]] && ok "exactly 3 conflicts left for manual review (project ver, lib-manual, feature.flag)" \
+  || fail "expected 3 remaining manual conflicts, got $_manual_cnt"
+[[ $_pol_rc -eq 0 ]] && ok "run exit 0 (app-pol committed and pushed with markers)" \
+  || fail "run should exit 0 (got $_pol_rc)"
+unset _pol_out _pol_rc _pol_head _auto_keep _auto_take _manual_cnt
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary

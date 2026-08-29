@@ -31,6 +31,15 @@ fi
 #   New files keep source values and are flagged in the PR description.
 #
 #   Protected ConfigMap keys always keep the target's existing value in a merge.
+#
+#   Divergent keys (a key the source changed between refs where the target has a
+#   different value) are handled by the optional "resolution" block in repos.json:
+#     "default": manual (leave <<< markers, default) | ours (keep target) | theirs
+#     "keep_target": [patterns]  auto-resolve matching keys to the target value
+#     "take_source": [patterns]  auto-resolve matching keys to the source value
+#   Auto-resolved keys are listed in the PR body; unmatched divergences follow
+#   the default.  A pattern matches a conflict by substring of the changed line
+#   or its enclosing block (e.g. a dependency artifactId, or a YAML key name).
 
 set -euo pipefail
 # ERR trap installed as a function so it can be toggled off around the per-target
@@ -260,6 +269,56 @@ _cf_protected_keys() {
       i=index($0,"\""); if (!i) next; rest=substr($0,i+1)
       j=index(rest,"\""); if (!j) next
       printf "%s%s", (sep?"|":""), substr(rest,1,j-1); sep=1
+    }
+  ' "$CONFIG_FILE"
+}
+
+# ── conflict-resolution policy config ─────────────────────────────────────────
+# A top-level "resolution" object controls how divergent keys (a key the source
+# changed between the two refs AND the target had customised to a different value)
+# are handled:
+#   "default":     "manual" (leave <<<<<<< markers, the default) | "ours" | "theirs"
+#   "keep_target": [patterns]  → auto-resolve matching keys to the TARGET value
+#   "take_source": [patterns]  → auto-resolve matching keys to the SOURCE value
+# A pattern matches if it is a substring of the conflict's changed line or any of
+# the few lines of context above it (so "lib-03" matches the <version> inside
+# that dependency block, and "replicas" matches a replicas: line directly).
+
+# Default policy string (manual|ours|theirs)
+_cf_resolution_default() {
+  awk '
+    /"resolution"[[:space:]]*:/ { inres=1 }
+    inres && /"default"[[:space:]]*:/ {
+      line=$0; sub(/^[^:]*:[[:space:]]*"/, "", line); sub(/".*/, "", line)
+      print line; exit
+    }
+  ' "$CONFIG_FILE"
+}
+
+# Newline-separated patterns from resolution.<subkey> (keep_target|take_source).
+# Handles both inline ["a","b"] and multi-line arrays.
+_cf_resolution_list() {
+  awk -v want="$1" '
+    /"resolution"[[:space:]]*:/ { inres=1 }
+    inres && $0 ~ ("\"" want "\"[[:space:]]*:") {
+      in_a=1
+      rest=$0; sub(/^.*\[/, "", rest)
+      while (1) {
+        i=index(rest,"\""); if (!i) break; rest=substr(rest,i+1)
+        j=index(rest,"\""); if (!j) break
+        print substr(rest,1,j-1); rest=substr(rest,j+1)
+      }
+      if (index($0,"]")) in_a=0
+      next
+    }
+    in_a {
+      if (index($0,"]")) { in_a=0 }
+      rest=$0
+      while (1) {
+        i=index(rest,"\""); if (!i) break; rest=substr(rest,i+1)
+        j=index(rest,"\""); if (!j) break
+        print substr(rest,1,j-1); rest=substr(rest,j+1)
+      }
     }
   ' "$CONFIG_FILE"
 }
@@ -559,6 +618,88 @@ neutralize_configmap_keys() {
   ' "$target" "$theirs" > "$theirs.tmp" && mv "$theirs.tmp" "$theirs"
 }
 
+# Auto-resolve conflict hunks in a diff3-marked merge result by policy.
+#
+#   $1 merged_file  — file containing diff3 conflict markers (edited in place)
+#   $2 report_file  — auto-resolution decisions are appended here (for the PR)
+#   $3 tgt_path     — logical path, used in the report
+#
+# Each conflict hunk is matched (by substring) against its own changed lines plus
+# a few lines of preceding context.  keep_target patterns → target value wins;
+# take_source patterns → source value wins; otherwise the global default applies
+# (manual = keep as a standard two-way conflict).  Prints the number of conflicts
+# left unresolved (manual) to stdout.
+resolve_conflicts() {
+  local merged="$1" report="$2" tgt_path="$3"
+  local tmp cnt manual
+  tmp=$(mktemp "$WORK_DIR/.resolve_XXXXXX")
+  cnt=$(mktemp "$WORK_DIR/.rescnt_XXXXXX")
+  awk -v KEEP="$RES_KEEP" -v TAKE="$RES_TAKE" -v DEF="$RES_DEFAULT" \
+      -v REPORT="$report" -v FNAME="$tgt_path" '
+    function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+    function xmlval(s,  v){ v=trim(s); sub(/^<[^>]*>/, "", v); sub(/<\/[^>]*>[[:space:]]*$/, "", v); return v }
+    function anymatch(patstr, ctx,   n,a,i){
+      if (patstr=="") return 0
+      n=split(patstr, a, "|")
+      for (i=1;i<=n;i++) if (a[i]!="" && index(ctx, a[i])>0) return 1
+      return 0
+    }
+    function pushhist(line,  j){ hist[++hn]=line; if (hn>8) { for(j=1;j<hn;j++) hist[j]=hist[j+1]; hn-- } }
+    function report(decision,  key,ov,tv,bv,j){
+      key=""
+      for (j=hn;j>=1;j--) if (hist[j] ~ /artifactId|<name>|^[[:space:]]*[A-Za-z_.-]+[[:space:]]*[:=]/) { key=trim(hist[j]); break }
+      ov=xmlval(O[1]); tv=xmlval(T[1]); bv=xmlval(B[1])
+      if (key=="") key=trim(O[1])
+      printf("- `%s` — %s  (base=`%s` source=`%s` target=`%s`) => %s\n",
+             FNAME, key, bv, tv, ov, decision) >> REPORT
+    }
+    BEGIN { manual=0; st=""; hn=0 }
+    /^<<<<<<< / { st="ours"; no=0; nb=0; nt=0; delete O; delete B; delete T; next }
+    /^\|\|\|\|\|\|\| / { st="base"; next }
+    /^=======$/ { st="theirs"; next }
+    /^>>>>>>> / {
+      # Build match context scoped to the CURRENT element: the changed lines
+      # plus preceding lines back to the nearest block boundary (a line that
+      # starts with a closing tag or is blank).  This stops a rule for one
+      # dependency from matching a neighbouring block conflict.
+      ctx=""
+      for (i=1;i<=no;i++) ctx=ctx O[i] "\n"
+      for (i=1;i<=nt;i++) ctx=ctx T[i] "\n"
+      for (i=hn;i>=1;i--) {
+        hs=hist[i]; gsub(/^[[:space:]]+/, "", hs)
+        if (hs ~ /^<\// || hs=="") break
+        ctx=ctx hist[i] "\n"
+      }
+      pol=DEF
+      if      (anymatch(KEEP, ctx)) pol="ours"
+      else if (anymatch(TAKE, ctx)) pol="theirs"
+      if (pol=="ours") {
+        for (i=1;i<=no;i++) { print O[i]; pushhist(O[i]) }
+        report("kept TARGET")
+      } else if (pol=="theirs") {
+        for (i=1;i<=nt;i++) { print T[i]; pushhist(T[i]) }
+        report("took SOURCE")
+      } else {
+        print "<<<<<<< target (ours)"
+        for (i=1;i<=no;i++) print O[i]
+        print "======="
+        for (i=1;i<=nt;i++) print T[i]
+        print ">>>>>>> source"
+        manual++
+      }
+      st=""; next
+    }
+    st=="ours"   { O[++no]=$0; next }
+    st=="base"   { B[++nb]=$0; next }
+    st=="theirs" { T[++nt]=$0; next }
+    { print; pushhist($0) }
+    END { print manual > "/dev/stderr" }
+  ' "$merged" > "$tmp" 2>"$cnt"
+  mv "$tmp" "$merged"
+  manual=$(cat "$cnt" 2>/dev/null); rm -f "$cnt"
+  printf '%s' "${manual:-0}"
+}
+
 # Three-way merge a modified file into the target repo.
 #
 # base   = source file at FROM_REF with substitutions applied
@@ -615,7 +756,9 @@ three_way_merge_file() {
   cp "$tgt_abs" "$ours_save"
 
   local rc=0
-  git merge-file \
+  # --diff3 keeps the base section in each conflict so the resolver can report
+  # base/source/target values and decide policy accurately.
+  git merge-file --diff3 \
     -L "target (ours)" \
     -L "base (${FROM_REF})" \
     -L "source (${TO_REF})" \
@@ -625,11 +768,21 @@ three_way_merge_file() {
   #   0        → clean merge, no conflicts
   #   1..127   → merged with conflict markers; the value is the CONFLICT COUNT
   #   255 (-1) → internal error (e.g. unreadable input)
-  # A file with two or more conflict hunks therefore exits 2, 3, …; those are
-  # ordinary conflicts, NOT errors, and must still register index stages.
-  if [[ $rc -ge 1 && $rc -le 127 ]]; then
-    # Conflict markers written to tgt_abs.
-    # Register git index stages 1/2/3 so "git mergetool" can open the file.
+  if [[ $rc -gt 127 ]]; then
+    log_error "git merge-file error ($rc): $tgt_path"
+    rm -f "$base" "$theirs" "$ours_save"
+    return 2
+  fi
+
+  # Auto-resolve conflicts by policy.  `manual` = hunks left as real conflicts.
+  local manual=0
+  if [[ $rc -ge 1 ]]; then
+    manual=$(resolve_conflicts "$tgt_abs" "${RESOLUTION_REPORT:-/dev/null}" "$tgt_path")
+  fi
+
+  if [[ "${manual:-0}" -ge 1 ]]; then
+    # Unresolved conflicts remain — register git index stages 1/2/3 so
+    # "git mergetool" can open the file.
     local base_hash ours_hash theirs_hash
     base_hash=$(git   -C "$tgt_dir" hash-object -w "$base")
     ours_hash=$(git   -C "$tgt_dir" hash-object -w "$ours_save")
@@ -643,10 +796,10 @@ three_way_merge_file() {
 
   rm -f "$base" "$theirs" "$ours_save"
 
-  if   [[ $rc -eq 0 ]];   then return 0   # clean
-  elif [[ $rc -le 127 ]]; then return 1   # 1..127 conflicts → needs resolution
-  else log_error "git merge-file error ($rc): $tgt_path"; return 2
-  fi
+  # return 1 only when unresolved (manual) conflicts remain; a fully
+  # auto-resolved (or clean) file is committable and the caller git-adds it.
+  if [[ "${manual:-0}" -ge 1 ]]; then return 1; fi
+  return 0
 }
 
 # ── Bitbucket PR creation ─────────────────────────────────────────────────────
@@ -702,6 +855,13 @@ BASE_BRANCH=$(_cf_str base_branch);      BASE_BRANCH="${BASE_BRANCH:-main}"
 PR_TITLE_PREFIX=$(_cf_str title_prefix); PR_TITLE_PREFIX="${PR_TITLE_PREFIX:-chore(sync): }"
 APP_COUNT=$(_cf_app_count)
 PROTECTED_CM_KEYS=$(_cf_protected_keys)
+
+# Conflict-resolution policy: global default + per-key override pattern lists.
+RES_DEFAULT=$(_cf_resolution_default); RES_DEFAULT="${RES_DEFAULT:-manual}"
+case "$RES_DEFAULT" in manual|ours|theirs) ;; *) RES_DEFAULT="manual" ;; esac
+# Pattern lists collapsed to a single '|'-separated string for the awk resolver.
+RES_KEEP=$(_cf_resolution_list keep_target | paste -sd'|' - 2>/dev/null || true)
+RES_TAKE=$(_cf_resolution_list take_source | paste -sd'|' - 2>/dev/null || true)
 
 [[ "$APP_COUNT" -gt 0 ]] || { log_error "No apps found in $CONFIG_FILE"; exit 1; }
 
@@ -1178,6 +1338,10 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
     SEALED_NOTES=()
     IMAGE_NOTES=()
     CONFLICT_FILES=()
+    # Per-target file that three_way_merge_file appends policy auto-resolution
+    # decisions to (one line per divergent key).  Fed into the PR body.
+    RESOLUTION_REPORT="$WORK_DIR/.resreport-$TARGET_NAME"
+    : > "$RESOLUTION_REPORT"
 
     if [[ "$_effective_mode" == "copy" ]]; then
       sync_copy_mode
@@ -1409,6 +1573,22 @@ $(for _cf in "${CONFLICT_FILES[@]}"; do printf '%s\n' "- \`$_cf\`"; done)
 
 These files contain \`<<<<<<<\` conflict markers. Edit them to resolve, then commit."
 
+    # Divergent keys auto-resolved by policy (keep_target / take_source / default).
+    RESOLUTION_SECTION=""
+    if [[ -s "$RESOLUTION_REPORT" ]]; then
+      log_warn "$TARGET_NAME: auto-resolved divergent keys by policy:"
+      while IFS= read -r _rl; do [[ -n "$_rl" ]] && log_warn "  $_rl"; done < "$RESOLUTION_REPORT"
+      RESOLUTION_SECTION="
+
+### Auto-resolved divergences (policy)
+
+The source changed these keys between the two refs and the target had a different
+value.  Each was resolved automatically by the configured policy — review and
+override any you disagree with:
+
+$(cat "$RESOLUTION_REPORT")"
+    fi
+
     _changed_md="${CHANGED_FILES_MD:-}"
     PR_BODY="## Deploy Sync
 
@@ -1422,7 +1602,7 @@ Automated sync from \`${SOURCE_REPO}\`
 | **Timestamp** | \`${TIMESTAMP}\` |
 
 ### Changed files
-${_changed_md}${SEALED_SECTION}${IMAGE_SECTION}${CONFLICT_SECTION}
+${_changed_md}${SEALED_SECTION}${IMAGE_SECTION}${CONFLICT_SECTION}${RESOLUTION_SECTION}
 
 ---
 *Auto-generated by sync-deploy.sh — review before merging.*"
