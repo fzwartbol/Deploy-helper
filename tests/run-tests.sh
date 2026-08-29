@@ -80,6 +80,11 @@ mkdir -p "$REMOTES"
 git config --global \
   "url.file://${REMOTES}/.insteadOf" \
   "https://testuser:testtoken@bitbucket.org/testspace/"
+# Also redirect the SSH form so a run with no BITBUCKET_USER/TOKEN (which makes
+# _bb_url fall back to git@bitbucket.org:...) still resolves to the local bares.
+git config --global \
+  --add "url.file://${REMOTES}/.insteadOf" \
+  "git@bitbucket.org:testspace/"
 
 # ── helpers to build repos ────────────────────────────────────────────────────
 _git_cfg() {
@@ -1183,6 +1188,129 @@ with_work "app-f-app" "" app_f_initial
 # Generate test repos.json pointing to our local testspace/ repos
 # Uses the new grouped "apps" structure
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SOURCE MC REPO  (testspace/source-mc-app)  [multi-conflict regression]
+# v1.0.0 → deployment.yaml with replicas/LOG_LEVEL/TIMEOUT
+# v1.1.0 → all three values changed → applied onto a target that customised the
+#          same three values produces >= 2 conflict hunks (git merge-file rc>=2).
+# Regression for: rc>1 from git merge-file being misread as a hard error, which
+# committed raw <<<<<<< markers instead of registering index stages 1/2/3.
+# ─────────────────────────────────────────────────────────────────────────────
+make_bare "source-mc-app"
+
+source_mc_v1() {
+  cat > deployment.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-app
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  template:
+    spec:
+      containers:
+        - name: main
+          env:
+            - name: LOG_LEVEL
+              value: info
+            - name: REGION
+              value: eu-west
+            - name: TIMEOUT
+              value: "30"
+YAML
+}
+with_work "source-mc-app" "v1.0.0" source_mc_v1
+
+source_mc_v2() {
+  cat > deployment.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-app
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  template:
+    spec:
+      containers:
+        - name: main
+          env:
+            - name: LOG_LEVEL
+              value: debug
+            - name: REGION
+              value: eu-west
+            - name: TIMEOUT
+              value: "60"
+YAML
+}
+with_work "source-mc-app" "v1.1.0" source_mc_v2
+
+# TARGET MC REPO: app-mc — customised replicas/LOG_LEVEL/TIMEOUT (all differ
+# from both source v1 and v2) so the three-way merge conflicts in >= 2 places.
+make_bare "app-mc-app"
+app_mc_initial() {
+  cat > deployment.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-mc
+spec:
+  replicas: 5
+  strategy:
+    type: RollingUpdate
+  template:
+    spec:
+      containers:
+        - name: main
+          env:
+            - name: LOG_LEVEL
+              value: warn
+            - name: REGION
+              value: eu-west
+            - name: TIMEOUT
+              value: "99"
+YAML
+}
+with_work "app-mc-app" "" app_mc_initial
+
+# NOTE: app-fail-app is intentionally NOT created (no make_bare) so cloning it
+# fails — used to verify a failed target reports "Failed" and exits 1 WITHOUT
+# printing a spurious "[FATAL] aborted" line from the ERR trap.
+
+# TARGET NC REPO: app-nc — content identical to source-mc v1 (after app-nc name
+# subs), so the v1->v2 change merges CLEANLY (no conflict).  Used to verify that
+# a successful target with NO Bitbucket credentials (empty PR_URL) is still
+# reported as PASS — regression for `set -e` treating the final `[[ -n PR_URL ]]`
+# test as the subshell's (failing) exit status.
+make_bare "app-nc-app"
+app_nc_initial() {
+  cat > deployment.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-nc
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  template:
+    spec:
+      containers:
+        - name: main
+          env:
+            - name: LOG_LEVEL
+              value: info
+            - name: REGION
+              value: eu-west
+            - name: TIMEOUT
+              value: "30"
+YAML
+}
+with_work "app-nc-app" "" app_nc_initial
+
 cat > "$T/repos.test.json" <<'EOF'
 {
   "pr": {
@@ -1325,6 +1453,34 @@ cat > "$T/repos.test.json" <<'EOF'
           "java_package": "com.app.f",
           "java_path":    "com/app/f"
         }
+      }
+    },
+    {
+      "name": "source-mc",
+      "app": {
+        "repo": "testspace/source-mc-app",
+        "substitutions": { "app_name": "source-app" }
+      }
+    },
+    {
+      "name": "app-mc",
+      "app": {
+        "repo": "testspace/app-mc-app",
+        "substitutions": { "app_name": "app-mc" }
+      }
+    },
+    {
+      "name": "app-fail",
+      "app": {
+        "repo": "testspace/app-fail-app",
+        "substitutions": { "app_name": "app-fail" }
+      }
+    },
+    {
+      "name": "app-nc",
+      "app": {
+        "repo": "testspace/app-nc-app",
+        "substitutions": { "app_name": "app-nc" }
       }
     }
   ]
@@ -1707,6 +1863,114 @@ else
   fail "expected sync/app-diff-from-v1.0.0-to-v1.1.0, got $_branch_f"
 fi
 unset _branch_f
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO: multi-conflict merge + failed-target summary
+#   source-mc → app-mc (>= 2 conflict hunks) and app-fail (clone fails).
+#   Regression for two bugs:
+#     1. git merge-file rc>=2 (conflict COUNT, not an error) was misread as a
+#        hard error → file committed with raw <<<<<<< markers, no index stages.
+#     2. a failed target tripped the ERR trap → spurious "[FATAL] aborted" line
+#        even though remaining targets pushed fine.
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (multi-conflict: source-mc → app-mc,app-fail, v1.0.0 → v1.1.0)${NC}"
+
+set +e
+_mc_out=$(bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-mc \
+  --type    app \
+  --targets app-mc,app-fail \
+  --from    v1.0.0 \
+  --to      v1.1.0 2>&1)
+_mc_rc=$?
+set -e
+
+MC="$WORK_DIR/app-mc"
+
+section "multi-conflict  app-mc — 2+ conflict hunks handled as conflict, not error"
+has "$MC/deployment.yaml" "<<<<<<<" "working tree has conflict markers (non-interactive keeps them)"
+# Regression: rc>=2 must NOT be logged as a git merge-file error
+if grep -qF "git merge-file error" <<< "$_mc_out"; then
+  fail "multi-conflict must not be reported as a git merge-file error"
+else
+  ok "multi-conflict not misreported as a git merge-file error"
+fi
+
+section "multi-conflict  app-mc — conflict committed (non-interactive commit succeeds)"
+# Regression for the commit path: previously `git add` could not clear the
+# injected index stages 1/2/3, so `git commit` refused ("unmerged files") and
+# nothing was committed — silently, because the failure was swallowed.  The
+# fix force-removes the stages then re-adds, so the marker file is committed.
+_mc_head=$(git -C "$MC" cat-file blob "HEAD:deployment.yaml" 2>/dev/null || true)
+if [[ -n "$_mc_head" ]] && grep -qF "<<<<<<<" <<< "$_mc_head"; then
+  ok "committed HEAD:deployment.yaml exists and contains conflict markers"
+else
+  fail "conflict file must be committed with markers (commit must not silently fail)"
+fi
+grep -qF "replicas: 5" <<< "$_mc_head" && ok "committed file shows target value replicas: 5 (ours side of marker)" \
+  || fail "committed file should contain target value replicas: 5"
+grep -qF "replicas: 2" <<< "$_mc_head" && ok "committed file shows source v2 value replicas: 2 (theirs side of marker)" \
+  || fail "committed file should contain source v2 value replicas: 2"
+_mc_subj=$(git -C "$MC" log -1 --pretty=%s 2>/dev/null || true)
+grep -qF "chore(sync)" <<< "$_mc_subj" && ok "a sync commit was actually created on the branch" \
+  || fail "expected a chore(sync) commit on the sync branch (got: '$_mc_subj')"
+unset _mc_head _mc_subj
+
+section "multi-conflict  failed target — reported without spurious [FATAL]"
+grep -qF "Failed" <<< "$_mc_out" && ok "summary reports the failed target (app-fail)" \
+  || fail "summary should report Failed target app-fail"
+if grep -qF "[FATAL] aborted" <<< "$_mc_out"; then
+  fail "must NOT print '[FATAL] aborted' when a target fails (ERR trap misfire)"
+else
+  ok "no spurious '[FATAL] aborted' line on partial failure"
+fi
+[[ $_mc_rc -eq 1 ]] && ok "exit code 1 (a target failed)" \
+  || fail "exit code should be 1 when a target fails (got $_mc_rc)"
+unset _mc_out _mc_rc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO: successful target with NO Bitbucket credentials (empty PR_URL)
+#   Regression: with `set -e` active in the per-target subshell, the final
+#   `[[ -n "$PR_URL" ]] && log_info` became the subshell's exit status; an empty
+#   PR_URL (no credentials → no PR created) then wrongly marked the target FAILED
+#   even though the commit and push both succeeded.
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}Running sync-deploy.sh  (no-credentials clean merge: source-mc → app-nc)${NC}"
+
+set +e
+_nc_out=$(env -u BITBUCKET_USER -u BITBUCKET_TOKEN bash "$SYNC_SCRIPT" \
+  --config  "$T/repos.test.json" \
+  --source  source-mc \
+  --type    app \
+  --targets app-nc \
+  --from    v1.0.0 \
+  --to      v1.1.0 2>&1)
+_nc_rc=$?
+set -e
+
+NCDIR="$WORK_DIR/app-nc"
+
+section "no-credentials  app-nc — successful target reported as PASS"
+[[ $_nc_rc -eq 0 ]] && ok "exit code 0 (target succeeded without credentials)" \
+  || fail "exit code should be 0 (got $_nc_rc); no-PR must not fail a pushed target"
+grep -qF "Succeeded" <<< "$_nc_out" && ok "run reports a succeeded target" \
+  || fail "run should report app-nc as succeeded"
+if grep -qF "FAILED: app-nc" <<< "$_nc_out"; then
+  fail "app-nc must NOT be marked FAILED when only the PR step is skipped"
+else
+  ok "app-nc not wrongly marked FAILED"
+fi
+# The clean merge must actually be committed (no conflict, source v2 values win)
+_nc_head=$(git -C "$NCDIR" cat-file blob "HEAD:deployment.yaml" 2>/dev/null || true)
+grep -qF "replicas: 2" <<< "$_nc_head" && ok "clean merge committed source v2 value replicas: 2" \
+  || fail "clean-merge result should contain source v2 replicas: 2"
+if grep -qF "<<<<<<<" <<< "$_nc_head"; then
+  fail "clean merge must not contain conflict markers"
+else
+  ok "clean merge committed without conflict markers"
+fi
+unset _nc_out _nc_rc _nc_head
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary

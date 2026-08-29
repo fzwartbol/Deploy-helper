@@ -33,7 +33,11 @@ fi
 #   Protected ConfigMap keys always keep the target's existing value in a merge.
 
 set -euo pipefail
-trap 'printf "[FATAL] aborted at line %d\n" "$LINENO" >&2' ERR
+# ERR trap installed as a function so it can be toggled off around the per-target
+# subshell (whose failure is expected and handled) without duplicating the text.
+_fatal_trap()       { printf "[FATAL] aborted at line %s (exit %s): %s\n" "$1" "$2" "$3" >&2; }
+_install_err_trap() { trap 'rc=$?; _fatal_trap "$LINENO" "$rc" "$BASH_COMMAND"' ERR; }
+_install_err_trap
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/repos.json"
@@ -617,7 +621,13 @@ three_way_merge_file() {
     -L "source (${TO_REF})" \
     "$tgt_abs" "$base" "$theirs" || rc=$?
 
-  if [[ $rc -eq 1 ]]; then
+  # git merge-file exit status:
+  #   0        → clean merge, no conflicts
+  #   1..127   → merged with conflict markers; the value is the CONFLICT COUNT
+  #   255 (-1) → internal error (e.g. unreadable input)
+  # A file with two or more conflict hunks therefore exits 2, 3, …; those are
+  # ordinary conflicts, NOT errors, and must still register index stages.
+  if [[ $rc -ge 1 && $rc -le 127 ]]; then
     # Conflict markers written to tgt_abs.
     # Register git index stages 1/2/3 so "git mergetool" can open the file.
     local base_hash ours_hash theirs_hash
@@ -633,8 +643,9 @@ three_way_merge_file() {
 
   rm -f "$base" "$theirs" "$ours_save"
 
-  if   [[ $rc -eq 1 ]]; then return 1
-  elif [[ $rc -gt 1 ]]; then log_error "git merge-file error ($rc): $tgt_path"; return 2
+  if   [[ $rc -eq 0 ]];   then return 0   # clean
+  elif [[ $rc -le 127 ]]; then return 1   # 1..127 conflicts → needs resolution
+  else log_error "git merge-file error ($rc): $tgt_path"; return 2
   fi
 }
 
@@ -1145,6 +1156,15 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
     _effective_mode="diff"
   fi
 
+  # Run the per-target work in a STANDALONE subshell (not in an &&/|| or
+  # if-condition).  In a "tested" subshell bash suppresses the inner `set -e`,
+  # so a failed clone or a rejected `git push` would be swallowed and the target
+  # wrongly reported as succeeded.  As a standalone command the inner `set -e`
+  # stays active.  We drop the outer errexit AND the ERR trap around it so an
+  # expected target failure neither aborts the whole run nor prints a spurious
+  # "[FATAL]" line; both are restored immediately afterward.
+  set +e
+  trap - ERR
   (
     set -e
     TARGET_DIR="$WORK_DIR/$TARGET_NAME"
@@ -1250,13 +1270,19 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
               if [[ $merge_rc -eq 1 ]]; then
                 CONFLICT_FILES+=("$tgt_file")
                 # Index stages 1/2/3 are already registered — do not git add here
+                HAS_CHANGES=true
+              elif [[ $merge_rc -ge 2 ]]; then
+                # Hard error from git merge-file — fail this target instead of
+                # committing a file that may still contain conflict markers.
+                log_error "M $tgt_file — merge failed (rc=$merge_rc); aborting $TARGET_NAME"
+                exit 1
               else
                 if has_image_lines "$TARGET_DIR/$tgt_file" 2>/dev/null; then
                   IMAGE_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — image tags preserved from target")
                 fi
                 git -C "$TARGET_DIR" add "$tgt_file"
+                HAS_CHANGES=true
               fi
-              HAS_CHANGES=true
             fi
             ;;
 
@@ -1338,8 +1364,13 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
         fi
       else
         log_warn "Conflicts in $TARGET_NAME (non-interactive) — committing with markers"
-        log_warn "Resolve: git fetch origin && git checkout $SYNC_BRANCH && git mergetool"
+        log_warn "Resolve later: git fetch origin && git checkout $SYNC_BRANCH, edit the marked files, then commit"
         for _cf in "${CONFLICT_FILES[@]}"; do
+          # The working-tree file carries git-merge-file conflict markers and has
+          # index stages 1/2/3 registered.  `git add` alone leaves those higher
+          # stages in place, so `git commit` refuses with "unmerged files".
+          # Drop all stages, then re-add the marker file as a normal stage-0 blob.
+          git -C "$TARGET_DIR" update-index --force-remove "$_cf"
           git -C "$TARGET_DIR" add "$_cf"
         done
       fi
@@ -1398,13 +1429,33 @@ ${_changed_md}${SEALED_SECTION}${IMAGE_SECTION}${CONFLICT_SECTION}
 
     PR_URL=$(create_bitbucket_pr "$TARGET_REPO" "$SYNC_BRANCH" \
       "${PR_TITLE_PREFIX}sync from ${SOURCE_REPO##*/} (${TO_REF})" "$PR_BODY")
-    [[ -n "${PR_URL:-}" ]] && log_info "PR: $PR_URL"
+    # Use `if`, not `&&`: as the final statement in this subshell a false test
+    # would become the subshell's exit status and (with `set -e` active) wrongly
+    # mark the target FAILED — e.g. whenever no PR was created (no credentials).
+    if [[ -n "${PR_URL:-}" ]]; then log_info "PR: $PR_URL"; fi
 
-  ) && PASS+=("$TARGET_NAME") || { log_error "FAILED: $TARGET_NAME"; FAIL+=("$TARGET_NAME"); }
+  )
+  _target_rc=$?
+  _install_err_trap
+  set -e
+  if [[ $_target_rc -eq 0 ]]; then
+    PASS+=("$TARGET_NAME")
+  else
+    log_error "FAILED: $TARGET_NAME"
+    FAIL+=("$TARGET_NAME")
+  fi
 done
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 log_section "Done"
 [[ ${#PASS[@]} -gt 0 ]] && log_info  "Succeeded (${#PASS[@]}): ${PASS[*]}"
 [[ ${#FAIL[@]} -gt 0 ]] && log_error "Failed    (${#FAIL[@]}): ${FAIL[*]}"
-[[ ${#FAIL[@]} -eq 0 ]]
+
+# Exit code reflects whether any target failed.  Use an `if` (whose condition is
+# exempt from the ERR trap) plus an explicit exit so a normal "some targets
+# failed" outcome does not print a spurious "[FATAL] aborted" line.
+if [[ ${#FAIL[@]} -eq 0 ]]; then
+  exit 0
+else
+  exit 1
+fi
