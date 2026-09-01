@@ -534,10 +534,7 @@ copy_and_apply() {
   fi
   mkdir -p "$(dirname "$tgt_dir/$tgt_rel")"
   cp "$src_abs" "$tgt_dir/$tgt_rel"
-  log_info "copy_and_apply: src=$src_rel"
-  log_info "copy_and_apply: sed=[$sed_script]"
   apply_subs "$tgt_dir/$tgt_rel" "$sed_script"
-  log_info "copy_and_apply result (first 3 lines): $(head -3 "$tgt_dir/$tgt_rel" | tr '\n' '|')"
 }
 
 # Restore image-related YAML lines in FILE from ORIGINAL.
@@ -590,19 +587,10 @@ neutralize_configmap_keys() {
   ' "$target" "$theirs" > "$theirs.tmp" && mv "$theirs.tmp" "$theirs"
 }
 
-# Three-way merge a modified file into the target repo.
-#
-# base   = source file at FROM_REF with substitutions applied
-# theirs = source file at TO_REF   with substitutions applied
-# ours   = current target file (written in-place by git merge-file)
-#
-# For existing target files: image-tag lines and protected ConfigMap values
-# in THEIRS are replaced with BASE values before merging, so git merge-file
-# always keeps the target's own values.  Conflicts get markers written.
-#
-# For new files (no target yet): THEIRS is written directly (first-time copy).
-#
-# Returns: 0=clean merge, 1=conflict markers written, 2+=hard error
+# Merge a modified file's tag1->tag2 delta into the target, in place.
+# base=source@FROM_REF, theirs=source@TO_REF (both +subs), ours=target file.
+# Image tags and protected ConfigMap keys are neutralised so they keep target
+# values. New files are copied verbatim. Returns 0=clean, 1=conflict, 2=error.
 three_way_merge_file() {
   local orig_src="$1" tgt_path="$2" tgt_dir="$3" sed_script="$4"
 
@@ -629,10 +617,8 @@ three_way_merge_file() {
   apply_subs "$theirs" "$sed_script"
 
   if [[ ! -f "$tgt_abs" ]]; then
-    # Target doesn't have this file yet — first-time copy.
+    # Target lacks this file — first-time copy of source@tag2.
     mkdir -p "$(dirname "$tgt_abs")"
-    log_info "3wm first-time copy: src=$src_path → tgt=$tgt_path"
-    log_info "3wm first-time copy content: $(head -6 "$theirs" | tr '\n' '|')"
     cp "$theirs" "$tgt_abs"
     rm -f "$base" "$theirs" "$ours_save"
     return 0
@@ -1039,25 +1025,29 @@ if [[ "$FILTER_TARGETS" == "all" ]]; then
     for ((_i=0; _i<_nt; _i++)); do
       printf '  %d) %-24s  (%s)\n' "$((_i+1))" "${_tgt_names[$_i]}" "${_tgt_repos[$_i]}"
     done
-    printf '\nSelect: ENTER or "a" = ALL, or numbers (space-separated) for a subset: '
+    printf '\nSelect: ENTER/a = ALL, or numbers to pick several (e.g. "1 3", "1,3", "2-4"): '
     read -r _picks 2>/dev/null || _picks=""
 
+    _sel=()
     if [[ -z "$_picks" || "$_picks" == "a" || "$_picks" == "all" ]]; then
       _sel=("${_tgt_names[@]}")
     else
-      _sel=()
-      for _p in $_picks; do
-        [[ "$_p" =~ ^[0-9]+$ ]] && ((_p>=1 && _p<=_nt)) && _sel+=("${_tgt_names[$((_p-1))]}")
+      for _tok in ${_picks//,/ }; do
+        if [[ "$_tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+          for ((_k=${BASH_REMATCH[1]}; _k<=${BASH_REMATCH[2]}; _k++)); do
+            ((_k>=1 && _k<=_nt)) && _sel+=("${_tgt_names[$((_k-1))]}")
+          done
+        elif [[ "$_tok" =~ ^[0-9]+$ ]] && ((_tok>=1 && _tok<=_nt)); then
+          _sel+=("${_tgt_names[$((_tok-1))]}")
+        fi
       done
       [[ ${#_sel[@]} -eq 0 ]] && { echo "Invalid — using all."; _sel=("${_tgt_names[@]}"); }
     fi
 
-    _oifs="$IFS"; IFS=','
-    FILTER_TARGETS="${_sel[*]}"
-    IFS="$_oifs"
+    _oifs="$IFS"; IFS=','; FILTER_TARGETS="${_sel[*]}"; IFS="$_oifs"
     echo "-> $FILTER_TARGETS"
     echo ""
-    unset _picks _p _sel _oifs
+    unset _picks _tok _k _sel _oifs
   fi
   unset _tgt_names _tgt_repos _nt
 fi
@@ -1261,8 +1251,6 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
     git -C "$TARGET_DIR" checkout -B "$SYNC_BRANCH"
 
     SED_SCRIPT=$(build_sed_script "$SOURCE_SUBS" "$TARGET_SUBS")
-    log_info "SED_SCRIPT for $TARGET_NAME:"
-    log_info "  $SED_SCRIPT"
     HAS_CHANGES=false
     SEALED_NOTES=()
     IMAGE_NOTES=()
@@ -1280,15 +1268,12 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
           # ── Deleted ───────────────────────────────────────────────────────────
           D)
             tgt_file=$(_sub_path "$file1")
-            log_info "D  src=$file1  →  tgt=$tgt_file"
             if [[ -f "$TARGET_DIR/$tgt_file" ]]; then
-              log_info "D $tgt_file"
+              log_info "D  $tgt_file"
               git -C "$TARGET_DIR" rm -f "$tgt_file"
               HAS_CHANGES=true
             else
-              log_warn "D $tgt_file — not found in target"
-              log_warn "  checked: $TARGET_DIR/$tgt_file"
-              log_warn "  parent dir: $(ls "$(dirname "$TARGET_DIR/$tgt_file")" 2>/dev/null | tr '\n' '|' || echo '<dir missing>')"
+              log_warn "D  $tgt_file — not found in target, skipping"
             fi
             ;;
 
@@ -1350,19 +1335,16 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
           # ── Modified ──────────────────────────────────────────────────────────
           M)
             tgt_file=$(_sub_path "$file1")
-            log_info "M  src=$file1  →  tgt=$tgt_file"
+            log_info "M  $file1 → $tgt_file"
             if is_sealed_secret "$SOURCE_DIR/$file1"; then
               SEALED_NOTES+=("- \`[MODIFIED]\` \`$tgt_file\` — **skipped** (cluster-specific encryption; re-seal manually if value changed)")
             else
               merge_rc=0
               three_way_merge_file "$file1" "$tgt_file" "$TARGET_DIR" "$SED_SCRIPT" || merge_rc=$?
               if [[ $merge_rc -eq 1 ]]; then
-                CONFLICT_FILES+=("$tgt_file")
-                # Index stages 1/2/3 are already registered — do not git add here
+                CONFLICT_FILES+=("$tgt_file")   # stages 1/2/3 already registered
                 HAS_CHANGES=true
               elif [[ $merge_rc -ge 2 ]]; then
-                # Hard error from git merge-file — fail this target instead of
-                # committing a file that may still contain conflict markers.
                 log_error "M $tgt_file — merge failed (rc=$merge_rc); aborting $TARGET_NAME"
                 exit 1
               else
@@ -1379,9 +1361,7 @@ for ((_ti=0; _ti<APP_COUNT; _ti++)); do
           A|C|*)
             src_file="${file2:-$file1}"
             tgt_file=$(_sub_path "$src_file")
-            log_info "A  src=$src_file  →  tgt=$tgt_file"
-
-            log_info "A  is_sealed_secret($src_file) → $(is_sealed_secret "$SOURCE_DIR/$src_file" && echo YES || echo no)"
+            log_info "A  $src_file → $tgt_file"
             if is_sealed_secret "$SOURCE_DIR/$src_file"; then
               src_name=$(get_sealed_secret_name "$SOURCE_DIR/$src_file")
               src_other=$(find_sealed_secret_by_name \
